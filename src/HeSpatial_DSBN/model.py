@@ -63,7 +63,7 @@ def apply_multidomain_bn(x: tf.Tensor, domain_id: tf.Tensor, name: str) -> tf.Te
 
 
 # =============================================================================
-# SENSOR-SPECIFIC ADAPTOR (Heterogeneous Sensor-Specific Projection)
+# SENSOR-SPECIFIC ADAPTER (Heterogeneous Sensor-Specific Projection)
 # =============================================================================
 
 class SensorAdapter(layers.Layer):
@@ -86,6 +86,67 @@ class SensorAdapter(layers.Layer):
     def call(self, inputs: tf.Tensor) -> tf.Tensor:
         x = self.conv_proj(inputs)
         return self.ln(x)
+
+    def get_config(self) -> dict:
+        cfg = super().get_config()
+        cfg.update({"proj_channels": self.proj_channels})
+        return cfg
+
+
+class MultiSensorAdapter(layers.Layer):
+    """
+    Multi-Sensor Adapter routing heterogeneous sensor inputs (Hall, Coil, Diffensor)
+    through dedicated sensor projection branches to a unified feature space.
+    """
+    def __init__(
+        self,
+        num_sensors: int = config.NUM_SENSORS,
+        proj_channels: int = config.ADAPTER_PROJ_CHANNELS,
+        name: str = "multi_sensor_adapter",
+        **kwargs
+    ):
+        super().__init__(name=name, **kwargs)
+        self.num_sensors = num_sensors
+        self.proj_channels = proj_channels
+        self.adapters = [
+            SensorAdapter(proj_channels=proj_channels, name=f"{name}_sensor_{s}")
+            for s in range(num_sensors)
+        ]
+
+    def call(self, inputs: Union[tf.Tensor, List[tf.Tensor]], training=None) -> tf.Tensor:
+        if isinstance(inputs, (list, tuple)):
+            x, domain_or_sensor_id = inputs
+        else:
+            x = inputs
+            domain_or_sensor_id = tf.constant(0, dtype=tf.int32)
+
+        s_val = tf.cast(tf.reduce_min(domain_or_sensor_id), tf.int32)
+        # If domain_id in [0..5], map to sensor_id in [0..2] via integer division by 2
+        sensor_id = tf.cond(
+            tf.greater_equal(s_val, self.num_sensors),
+            lambda: tf.math.floordiv(s_val, 2),
+            lambda: s_val
+        )
+        sensor_id = tf.clip_by_value(sensor_id, 0, self.num_sensors - 1)
+
+        def route_adapter(idx: int):
+            if idx >= self.num_sensors - 1:
+                return self.adapters[self.num_sensors - 1](x)
+            return tf.cond(
+                tf.equal(sensor_id, idx),
+                lambda: self.adapters[idx](x),
+                lambda: route_adapter(idx + 1)
+            )
+
+        return route_adapter(0)
+
+    def get_config(self) -> dict:
+        cfg = super().get_config()
+        cfg.update({
+            "num_sensors": self.num_sensors,
+            "proj_channels": self.proj_channels,
+        })
+        return cfg
 
 
 # =============================================================================
@@ -146,13 +207,19 @@ def build_hespatial_encoder(
     filters_start: int = config.FILTERS_START,
     latent_dim: int = config.LATENT_DIM,
     dropout_rate: float = config.DROPOUT_RATE,
+    num_sensors: int = config.NUM_SENSORS,
     name: str = "hespatial_encoder",
 ) -> tf.keras.Model:
-    """Builds Shared Spatial Context Encoder."""
+    """Builds Shared Spatial Context Encoder with Sensor-Specific Adapters and DSBN."""
     inp = layers.Input(shape=input_shape, name="encoder_input")
     domain_id = layers.Input(shape=(), dtype="int32", name="domain_id")
     
-    x = layers.LayerNormalization(name="ln_in")(inp)
+    # 1. Sensor-Specific Adapter: Projects heterogeneous sensor waveforms to unified feature space
+    sensor_adapter = MultiSensorAdapter(num_sensors=num_sensors, proj_channels=filters_start, name="sensor_adapter")
+    x = sensor_adapter([inp, domain_id])
+    
+    # 2. Shared Context Feature Extractor
+    x = layers.LayerNormalization(name="ln_in")(x)
     x = layers.Conv1D(filters_start, 1, padding="same", name="proj", activation="swish")(x)
 
     x = _res_block_sepconv1d(x, domain_id, filters_start, 7, 1, dropout_rate, "enc_b0", stride=2)

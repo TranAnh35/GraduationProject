@@ -6,6 +6,8 @@ Standalone module - no external dependencies.
 
 from __future__ import annotations
 from dataclasses import dataclass
+import glob
+import os
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from nptdms import TdmsFile
@@ -36,15 +38,17 @@ def load_tdms_data(file_path: str) -> Tuple[np.ndarray, int, int, int]:
 
     group2 = tdms_file["Waveform"]
     data = group2.channels()[0][:]
-    X_scan = np.reshape(data, (-1, samples)).astype(np.float32)
+    num_pts = sX * sY
+    X_scan = np.reshape(data[:num_pts * samples], (num_pts, samples)).astype(np.float32)
 
-    # Downsample if samples > 500
-    if samples > 500:
-        idx = np.arange(0, X_scan.shape[1], 4)[:config.TIME_SAMPLES]
+    # Downsample if samples > config.TIME_SAMPLES
+    if samples > config.TIME_SAMPLES:
+        step = max(1, samples // config.TIME_SAMPLES)
+        idx = np.arange(0, samples, step)[:config.TIME_SAMPLES]
         X_scan = X_scan[:, idx]
         samples = X_scan.shape[1]
 
-    return X_scan[:-1, :, None], sX, sY, samples
+    return X_scan[:, :, None], sX, sY, samples
 
 
 def reshape_raster(data_2d: np.ndarray, sX: int) -> np.ndarray:
@@ -53,20 +57,163 @@ def reshape_raster(data_2d: np.ndarray, sX: int) -> np.ndarray:
     """
     sY = data_2d.shape[0] // sX
     T = data_2d.shape[1]
-    r = data_2d[: sY * sX].reshape(sY, sX, T)
+    r = data_2d[: sY * sX].reshape(sY, sX, T).copy()
     r[1::2] = r[1::2, ::-1]  # Flip odd rows for serpentine scan reversal
     return r
 
 
+def load_tdms_raster(file_path: str, target_t: int = config.TIME_SAMPLES) -> Tuple[np.ndarray, int, int, int]:
+    """
+    Load TDMS file directly into a 3D raster array of shape (sY, sX, T) with baseline cleaning.
+    """
+    tdms_file = TdmsFile.read(file_path)
+    group1 = tdms_file["Freq_Sampling_SizeX_SizeY"]
+    info = group1.channels()[0]
+    f = info[:][0]
+    sampling = info[:][1]
+    sX = int(info[:][2])
+    sY = int(info[:][3])
+    samples = int(sampling / f)
+
+    group2 = tdms_file["Waveform"]
+    data = group2.channels()[0][:]
+    num_pts = sX * sY
+    X_scan = np.reshape(data[:num_pts * samples], (num_pts, samples)).astype(np.float32)
+
+    # Downsample to target_t if necessary
+    if samples > target_t:
+        step = max(1, samples // target_t)
+        idx = np.arange(0, samples, step)[:target_t]
+        X_scan = X_scan[:, idx]
+        samples = X_scan.shape[1]
+
+    raster = reshape_raster(X_scan, sX)
+    # Baseline DC offset subtraction
+    raster = raster - np.mean(raster, axis=-1, keepdims=True)
+    return raster, sY, sX, samples
+
+
+def get_tdms_file_path(sensor: str, material: str, crack_size: str = "1mm", data_dir: str = config.DATA_DIR) -> Optional[str]:
+    """Find path to TDMS file given sensor, material and crack size."""
+    sensor_dir = "diff" if sensor.lower().startswith("diff") else sensor.lower()
+    mat_dir = "al" if material.lower().startswith("al") else "steel"
+    mat_label = "AL" if mat_dir == "al" else "steel"
+    
+    filename = f"{sensor_dir}_crack_{mat_label}_{crack_size}.tdms"
+    path = os.path.join(data_dir, sensor_dir, mat_dir, filename)
+    if os.path.exists(path):
+        return path
+    
+    # Fallback search
+    pattern = os.path.join(data_dir, sensor_dir, mat_dir, f"*{crack_size}*.tdms")
+    matches = glob.glob(pattern)
+    return matches[0] if matches else None
+
+
 def get_default_normal_ranges(material_name: str) -> List[Tuple[int, int]]:
-    """Get defect-free normal scanning ranges for pseudo-normal initialization."""
+    """Get defect-free normal scanning ranges for normal background sampling."""
     mat = material_name.lower()
-    if mat == "al" or mat == "aluminum":
+    if mat in ["al", "aluminum"]:
         return [(0, 15), (65, 140), (185, 255), (300, 320)]
-    elif mat == "steel" or mat == "carbon_steel":
+    elif mat in ["steel", "carbon_steel"]:
         return [(10, 45), (70, 90), (120, 140), (175, 206)]
     else:
         return [(0, 20)]
+
+
+def get_normal_centers(raster: np.ndarray, material_name: str = "al", mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Extract centers of normal (defect-free) regions for training normal reconstruction.
+    """
+    sY, sX = raster.shape[0], raster.shape[1]
+    if mask is not None:
+        normal_mask = ~mask.astype(bool)
+        centers = np.argwhere(normal_mask).astype(np.int32)
+        if len(centers) > 0:
+            return centers
+
+    # Fallback to default normal range bands
+    ranges = get_default_normal_ranges(material_name)
+    normal_mask = np.zeros((sY, sX), dtype=bool)
+    for y_start, y_end in ranges:
+        ys = min(y_start, sY)
+        ye = min(y_end, sY)
+        if ye > ys:
+            normal_mask[ys:ye, :] = True
+
+    if not np.any(normal_mask):
+        # If ranges fall outside sY, take first 25% and last 25% rows
+        q = max(1, sY // 4)
+        normal_mask[:q, :] = True
+        normal_mask[-q:, :] = True
+
+    return np.argwhere(normal_mask).astype(np.int32)
+
+
+def generate_synthetic_pect_raster(
+    sY: int = 40, sX: int = 40, T: int = config.TIME_SAMPLES, num_defects: int = 4, seed: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate synthetic PECT raster scan (sY, sX, T) and Ground-Truth defect mask for testing.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    raster = np.zeros((sY, sX, T), dtype=np.float32)
+    mask = np.zeros((sY, sX), dtype=bool)
+
+    t = np.linspace(0, 1, T, dtype=np.float32)
+    base_wave = np.sin(2 * np.pi * 5 * t) * np.exp(-3 * t)
+
+    for y in range(sY):
+        for x in range(sX):
+            noise = np.random.normal(0, 0.05, size=(T,)).astype(np.float32)
+            raster[y, x, :] = base_wave + noise
+
+    # Add artificial defects
+    for d in range(num_defects):
+        cy = np.random.randint(5, max(6, sY - 5))
+        cx = np.random.randint(5, max(6, sX - 5))
+        rad = np.random.randint(2, 4)
+        for dy in range(-rad, rad + 1):
+            for dx in range(-rad, rad + 1):
+                if dy**2 + dx**2 <= rad**2:
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < sY and 0 <= nx < sX:
+                        mask[ny, nx] = True
+                        defect_signal = 0.5 * np.exp(-5 * t) * np.cos(2 * np.pi * 12 * t)
+                        raster[ny, nx, :] += defect_signal
+
+    return raster, mask
+
+
+def load_dataset_raster(
+    sensor: str,
+    material: str,
+    crack_size: str = "1mm",
+    use_synthetic: bool = False,
+    sY: int = 40,
+    sX: int = 40,
+    T: int = config.TIME_SAMPLES,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load real TDMS raster or generate synthetic raster if real data is unavailable/requested.
+    Returns: (raster (sY, sX, T), mask (sY, sX))
+    """
+    if not use_synthetic:
+        path = get_tdms_file_path(sensor, material, crack_size)
+        if path and os.path.exists(path):
+            try:
+                raster, r_sY, r_sX, r_T = load_tdms_raster(path, target_t=T)
+                # Create defect mask by finding high-energy/prominent anomaly regions
+                diff_feat = np.max(np.abs(np.diff(raster, axis=-1)), axis=-1)
+                thresh = np.percentile(diff_feat, 95)
+                mask = diff_feat > thresh
+                return raster, mask
+            except Exception as e:
+                print(f"  ⚠️ Failed to load TDMS file {path}: {e}. Falling back to synthetic raster.")
+    
+    return generate_synthetic_pect_raster(sY, sX, T)
 
 
 # =============================================================================

@@ -3,3 +3,5 @@ output/
 plot/
 web/
 __pycache__/
+
+.kilo/

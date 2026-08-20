@@ -33,6 +33,21 @@ ACTIVATION = "swish"                # Swish activation across all conv layers
 ADAPTER_PROJ_CHANNELS = 16          # Projection depth for Sensor-Specific Adapters
 SENSOR_TYPES = ["hall", "coil", "diffensor"]
 MATERIAL_TYPES = ["al", "steel"]
+NUM_SENSORS = len(SENSOR_TYPES)      # 3 sensor modalities
+
+SENSOR_MAP: Dict[str, int] = {
+    "hall": 0,
+    "coil": 1,
+    "diffensor": 2,
+    "diff": 2,
+}
+
+MATERIAL_MAP: Dict[str, int] = {
+    "al": 0,
+    "aluminum": 0,
+    "steel": 1,
+    "carbon_steel": 1,
+}
 
 # Total domains (3 Sensors x 2 Materials = 6 combined domains)
 NUM_DOMAINS = len(SENSOR_TYPES) * len(MATERIAL_TYPES)
@@ -43,6 +58,8 @@ DOMAIN_MAP: Dict[Tuple[str, str], int] = {
     ("coil", "steel"): 3,
     ("diffensor", "al"): 4,
     ("diffensor", "steel"): 5,
+    ("diff", "al"): 4,
+    ("diff", "steel"): 5,
 }
 
 # =============================================================================
@@ -73,8 +90,9 @@ DSBN_ENABLED = True
 DOMAIN_HIDDEN = 64                  # Hidden units in GRL Domain Head
 
 # =============================================================================
-# 6 CROSS-SENSOR BENCHMARK TRANSFER TASKS
+# TRANSFER BENCHMARK TASKS
 # =============================================================================
+# 1. Joint Cross-Sensor and Cross-Material Transfer Tasks (6 tasks)
 TRANSFER_TASKS: Dict[str, Dict[str, str]] = {
     "Task_1": {"src_sensor": "hall", "src_mat": "al", "tgt_sensor": "coil", "tgt_mat": "steel"},
     "Task_2": {"src_sensor": "coil", "src_mat": "steel", "tgt_sensor": "hall", "tgt_mat": "al"},
@@ -84,10 +102,40 @@ TRANSFER_TASKS: Dict[str, Dict[str, str]] = {
     "Task_6": {"src_sensor": "diffensor", "src_mat": "steel", "tgt_sensor": "coil", "tgt_mat": "al"},
 }
 
+# 2. Pure Cross-Material Transfer Tasks (6 tasks)
+CROSS_MATERIAL_TASKS: Dict[str, Dict[str, str]] = {
+    "CM_1": {"src_sensor": "hall", "src_mat": "al", "tgt_sensor": "hall", "tgt_mat": "steel"},
+    "CM_2": {"src_sensor": "hall", "src_mat": "steel", "tgt_sensor": "hall", "tgt_mat": "al"},
+    "CM_3": {"src_sensor": "coil", "src_mat": "al", "tgt_sensor": "coil", "tgt_mat": "steel"},
+    "CM_4": {"src_sensor": "coil", "src_mat": "steel", "tgt_sensor": "coil", "tgt_mat": "al"},
+    "CM_5": {"src_sensor": "diffensor", "src_mat": "al", "tgt_sensor": "diffensor", "tgt_mat": "steel"},
+    "CM_6": {"src_sensor": "diffensor", "src_mat": "steel", "tgt_sensor": "diffensor", "tgt_mat": "al"},
+}
+
+# 3. Pure Cross-Sensor Transfer Tasks (12 tasks)
+CROSS_SENSOR_TASKS: Dict[str, Dict[str, str]] = {
+    # Aluminum Material
+    "CS_AL_1": {"src_sensor": "hall", "src_mat": "al", "tgt_sensor": "coil", "tgt_mat": "al"},
+    "CS_AL_2": {"src_sensor": "coil", "src_mat": "al", "tgt_sensor": "hall", "tgt_mat": "al"},
+    "CS_AL_3": {"src_sensor": "hall", "src_mat": "al", "tgt_sensor": "diffensor", "tgt_mat": "al"},
+    "CS_AL_4": {"src_sensor": "diffensor", "src_mat": "al", "tgt_sensor": "hall", "tgt_mat": "al"},
+    "CS_AL_5": {"src_sensor": "coil", "src_mat": "al", "tgt_sensor": "diffensor", "tgt_mat": "al"},
+    "CS_AL_6": {"src_sensor": "diffensor", "src_mat": "al", "tgt_sensor": "coil", "tgt_mat": "al"},
+    # Steel Material
+    "CS_ST_1": {"src_sensor": "hall", "src_mat": "steel", "tgt_sensor": "coil", "tgt_mat": "steel"},
+    "CS_ST_2": {"src_sensor": "coil", "src_mat": "steel", "tgt_sensor": "hall", "tgt_mat": "steel"},
+    "CS_ST_3": {"src_sensor": "hall", "src_mat": "steel", "tgt_sensor": "diffensor", "tgt_mat": "steel"},
+    "CS_ST_4": {"src_sensor": "diffensor", "src_mat": "steel", "tgt_sensor": "hall", "tgt_mat": "steel"},
+    "CS_ST_5": {"src_sensor": "coil", "src_mat": "steel", "tgt_sensor": "diffensor", "tgt_mat": "steel"},
+    "CS_ST_6": {"src_sensor": "diffensor", "src_mat": "steel", "tgt_sensor": "coil", "tgt_mat": "steel"},
+}
+
 # =============================================================================
 # DIRECTORY PATHS
 # =============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, "..", ".."))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_DIR = os.path.join(BASE_DIR, "logs")

@@ -16,25 +16,36 @@ import tensorflow as tf
 # =============================================================================
 
 @tf.custom_gradient
-def grad_reverse(x: tf.Tensor, lambda_value: float = 1.0):
+def grad_reverse(x: tf.Tensor, lambda_val: tf.Tensor):
     """Reverses gradient sign during backward pass: dL/dx = -lambda * dy."""
     def custom_grad(dy):
-        return -lambda_value * dy, None
+        return -lambda_val * dy, None
     return tf.identity(x), custom_grad
 
 
 class GradientReversalLayer(tf.keras.layers.Layer):
-    """Gradient Reversal Layer (GRL) for domain adversarial training."""
-    def __init__(self, lambda_value: float = 1.0, **kwargs):
-        super().__init__(**kwargs)
-        self.lambda_value = lambda_value
+    """Gradient Reversal Layer (GRL) for domain adversarial training with dynamic lambda schedule."""
+    def __init__(self, lambda_value: float = 1.0, name: str = "grl", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.lambda_val = tf.Variable(
+            initial_value=float(lambda_value),
+            trainable=False,
+            dtype=tf.float32,
+            name=f"{name}_lambda"
+        )
+
+    def set_lambda(self, val: float):
+        """Dynamically update GRL reversal strength."""
+        self.lambda_val.assign(float(val))
 
     def call(self, x: tf.Tensor, training=None) -> tf.Tensor:
-        return grad_reverse(x, self.lambda_value)
+        if training:
+            return grad_reverse(x, self.lambda_val)
+        return tf.identity(x)
 
     def get_config(self) -> dict:
         cfg = super().get_config()
-        cfg.update({"lambda_value": self.lambda_value})
+        cfg.update({"lambda_value": float(self.lambda_val.numpy()) if hasattr(self.lambda_val, 'numpy') else 1.0})
         return cfg
 
 
@@ -161,6 +172,7 @@ class HeSpatialDSBNLoss:
         alpha_t: float = 0.2,
         k_ratio: float = 0.5,
         svdd_center: tf.Tensor = None,
+        current_lambda_grl: float = None,
     ) -> Dict[str, tf.Tensor]:
         
         # 1. Source Reconstruction Loss
@@ -196,12 +208,13 @@ class HeSpatialDSBNLoss:
             loss_adv = tf.constant(0.0)
 
         # Total Weighted Loss
+        w_grl = current_lambda_grl if current_lambda_grl is not None else self.lambda_grl
         total_loss = (
             loss_rec_s
             + alpha_t * loss_rec_t
             + self.lambda_svdd * loss_svdd
             + self.lambda_mmd * loss_mmd
-            + self.lambda_grl * loss_adv
+            + w_grl * loss_adv
         )
 
         return {
