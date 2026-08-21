@@ -1,11 +1,13 @@
 """
-PECT Dataset and TDMS File Loading.
-Reads TDMS scan files following reference dataloader implementation and wraps into PyTorch Dataset.
+PECT Dataset and TDMS File Loading with Memory Mapping & Resolution-Agnostic Support (Section 2, implement.md).
+Reads TDMS scan files, applies raster scan mapping and Min-Max per-file normalization.
+Supports Clip-as-Sample extraction with np.memmap / Lazy Loading for <500MB RAM consumption.
 """
 
 import os
 import glob
 import re
+import hashlib
 from typing import List, Dict, Optional, Tuple, Any, Union
 import numpy as np
 import torch
@@ -18,7 +20,7 @@ from .preprocessing import reshape_raster, normalize_per_file
 def parse_metadata_from_path(file_path: str) -> Dict[str, Any]:
     """
     Parse experiment metadata (sensor, waveform, defect type, liftoff) from file path and filename.
-    Metadata is used for grouping, split, and downstream evaluation, NOT forward pass input (Section 3).
+    Metadata is used for grouping, split, and downstream evaluation, NOT forward pass input (Section 1.2).
     """
     norm_path = os.path.normpath(file_path).replace("\\", "/")
     parts = norm_path.split("/")
@@ -77,7 +79,7 @@ def read_tdms_scan(
     file_path: str,
     target_time_samples: int = 500,
     raster: bool = True,
-    target_spatial_size: Optional[Tuple[int, int]] = (300, 300),
+    target_spatial_size: Optional[Tuple[int, int]] = None,
     normalization: str = "min_max",
     eps: float = 1e-8
 ) -> np.ndarray:
@@ -89,7 +91,7 @@ def read_tdms_scan(
         file_path: Path to .tdms file
         target_time_samples: Number of temporal points per response (default: 500)
         raster: Whether to reconstruct 2D spatial grid from raster scan
-        target_spatial_size: Target (H, W) spatial dimensions to slice/pad
+        target_spatial_size: Optional target (H, W) spatial dimensions to slice/pad (None keeps native size)
         normalization: 'min_max', 'standard', or 'none'
         eps: Small constant for numerical stability
 
@@ -151,7 +153,7 @@ def read_tdms_scan(
 
     data_2d = data_2d.astype(np.float32)
 
-    # Apply per-file normalization
+    # Apply per-file normalization (Section 2.1)
     if normalization != "none":
         data_2d = normalize_per_file(data_2d, method=normalization, eps=eps)
 
@@ -160,7 +162,7 @@ def read_tdms_scan(
 
 class PECTDataset(Dataset):
     """
-    PyTorch Dataset for PECT acquisition files.
+    PyTorch Dataset for full PECT acquisition files.
     Each sample is a full acquisition [H, W, 500].
     """
 
@@ -169,7 +171,7 @@ class PECTDataset(Dataset):
         file_paths: List[str],
         time_samples: int = 500,
         raster_correction: bool = True,
-        spatial_size: Optional[Tuple[int, int]] = (300, 300),
+        spatial_size: Optional[Tuple[int, int]] = None,
         normalization: str = "min_max",
         cache_in_memory: bool = False,
         eps: float = 1e-8
@@ -210,12 +212,124 @@ class PECTDataset(Dataset):
         return tensor_data, self.metadata_list[idx]
 
 
+class PECTClipDataset(Dataset):
+    """
+    PyTorch Dataset for Clip-as-Sample training (Section 2.2, implement.md).
+    Slices each acquisition into temporal clips of shape [H, W, T_c] (T_c = 16).
+    Supports Memory Mapping (np.memmap) to maintain RAM usage < 500MB (Section 2.3).
+    """
+    def __init__(
+        self,
+        file_paths: List[str],
+        clip_length: int = 16,
+        clip_stride: int = 8,
+        time_samples: int = 500,
+        raster_correction: bool = True,
+        spatial_size: Optional[Tuple[int, int]] = None,
+        normalization: str = "min_max",
+        use_memmap: bool = True,
+        cache_dir: Optional[str] = ".cache/pect_mmap",
+        eps: float = 1e-8
+    ):
+        super().__init__()
+        self.file_paths = file_paths
+        self.clip_length = clip_length
+        self.clip_stride = clip_stride
+        self.time_samples = time_samples
+        self.raster_correction = raster_correction
+        self.spatial_size = spatial_size
+        self.normalization = normalization
+        self.use_memmap = use_memmap
+        self.cache_dir = cache_dir
+        self.eps = eps
+
+        if self.use_memmap and self.cache_dir is not None:
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.metadata_list = [parse_metadata_from_path(fp) for fp in self.file_paths]
+        self.clip_index: List[Tuple[int, int]] = []
+        self._mmap_files: Dict[int, Any] = {}
+        self._file_shapes: Dict[int, Tuple[int, int, int]] = {}
+
+        # Build index and optional memory-mapped binary cache
+        for f_idx, fp in enumerate(self.file_paths):
+            num_clips = max(1, (self.time_samples - self.clip_length) // self.clip_stride + 1)
+            for c_idx in range(num_clips):
+                start_t = c_idx * self.clip_stride
+                self.clip_index.append((f_idx, start_t))
+
+            if self.use_memmap and self.cache_dir is not None:
+                h_name = hashlib.md5(fp.encode('utf-8')).hexdigest()
+                cache_path = os.path.join(self.cache_dir, f"{h_name}.dat")
+                meta_path = os.path.join(self.cache_dir, f"{h_name}.meta")
+
+                if not os.path.exists(cache_path) or not os.path.exists(meta_path):
+                    data_np = read_tdms_scan(
+                        file_path=fp,
+                        target_time_samples=self.time_samples,
+                        raster=self.raster_correction,
+                        target_spatial_size=self.spatial_size,
+                        normalization=self.normalization,
+                        eps=self.eps
+                    )
+                    shape = data_np.shape
+                    with open(meta_path, "w") as f:
+                        f.write(f"{shape[0]},{shape[1]},{shape[2]}")
+                    fp_mmap = np.memmap(cache_path, dtype='float32', mode='w+', shape=shape)
+                    fp_mmap[:] = data_np[:]
+                    fp_mmap.flush()
+                    del fp_mmap
+                
+                with open(meta_path, "r") as f:
+                    shape_parts = [int(x) for x in f.read().strip().split(",")]
+                    self._file_shapes[f_idx] = (shape_parts[0], shape_parts[1], shape_parts[2])
+
+    def __len__(self) -> int:
+        return len(self.clip_index)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        file_idx, start_t = self.clip_index[idx]
+        fp = self.file_paths[file_idx]
+
+        if self.use_memmap and self.cache_dir is not None and file_idx in self._file_shapes:
+            h_name = hashlib.md5(fp.encode('utf-8')).hexdigest()
+            cache_path = os.path.join(self.cache_dir, f"{h_name}.dat")
+            shape = self._file_shapes[file_idx]
+
+            # Read slice directly via memory mapping without loading full tensor to RAM
+            mmap_arr = np.memmap(cache_path, dtype='float32', mode='r', shape=shape)
+            end_t = min(start_t + self.clip_length, shape[-1])
+            clip_np = np.array(mmap_arr[:, :, start_t:end_t], copy=True)
+            clip_data = torch.from_numpy(clip_np).float()
+        else:
+            data_np = read_tdms_scan(
+                file_path=fp,
+                target_time_samples=self.time_samples,
+                raster=self.raster_correction,
+                target_spatial_size=self.spatial_size,
+                normalization=self.normalization,
+                eps=self.eps
+            )
+            end_t = min(start_t + self.clip_length, data_np.shape[-1])
+            clip_data = torch.from_numpy(data_np[:, :, start_t:end_t]).float()
+
+        # Replicate pad if temporal points are fewer than clip_length
+        if clip_data.shape[-1] < self.clip_length:
+            pad_len = self.clip_length - clip_data.shape[-1]
+            clip_data = torch.nn.functional.pad(clip_data, (0, pad_len), mode='replicate')
+
+        meta = dict(self.metadata_list[file_idx])
+        meta["clip_start_t"] = start_t
+
+        return clip_data, meta
+
+
 def collate_pect_batch(batch: List[Tuple[torch.Tensor, Dict[str, Any]]]) -> Dict[str, Any]:
     """
-    Custom collate function for batching PECT acquisitions.
+    Custom collate function for batching PECT clips or acquisitions.
     Returns:
         {
-            'data': torch.Tensor [B, H, W, 500],
+            'data': torch.Tensor [B, H, W, T_c],
             'metadata': List[Dict[str, Any]]
         }
     """

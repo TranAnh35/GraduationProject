@@ -1,6 +1,7 @@
 """
-Predictor for PECT-JEPA (Module H, Section 13).
-Predicts target latent representations from encoded context and target positional embeddings.
+Predictor for PECT-JEPA v0.2 (Module 5, implement.md).
+Predicts target latent representations from Target Queries (e_mask + target_pos)
+and Context Keys/Values (H_context).
 Target token content is never visible to the Predictor.
 """
 
@@ -14,7 +15,9 @@ from .attention import MultiheadSelfAttention, MultiheadCrossAttention, MLP
 class PredictorBlock(nn.Module):
     """
     Predictor Transformer Block:
-    Target queries attend to themselves (Self-Attention) and to Context latents (Cross-Attention).
+    1. Self-Attention among Target Queries
+    2. Cross-Attention from Target Queries to H_context
+    3. Feed-Forward MLP
     """
     def __init__(
         self,
@@ -24,7 +27,7 @@ class PredictorBlock(nn.Module):
         dropout: float = 0.0
     ):
         super().__init__()
-        # Self-attention among target queries
+        # 1. Self-Attention on target queries
         self.norm_self = nn.LayerNorm(embed_dim)
         self.self_attn = MultiheadSelfAttention(
             embed_dim=embed_dim,
@@ -32,7 +35,7 @@ class PredictorBlock(nn.Module):
             dropout=dropout
         )
 
-        # Cross-attention to context memory
+        # 2. Cross-Attention to context memory
         self.norm_cross_q = nn.LayerNorm(embed_dim)
         self.norm_cross_kv = nn.LayerNorm(embed_dim)
         self.cross_attn = MultiheadCrossAttention(
@@ -41,7 +44,7 @@ class PredictorBlock(nn.Module):
             dropout=dropout
         )
 
-        # MLP
+        # 3. Feed-Forward MLP
         self.norm_mlp = nn.LayerNorm(embed_dim)
         self.mlp = MLP(
             in_features=embed_dim,
@@ -50,10 +53,10 @@ class PredictorBlock(nn.Module):
         )
 
     def forward(self, target_queries: torch.Tensor, H_context: torch.Tensor) -> torch.Tensor:
-        # 1. Self-attention on target queries
+        # 1. Self-Attention on target queries
         q = target_queries + self.self_attn(self.norm_self(target_queries))
 
-        # 2. Cross-attention: queries attend to context
+        # 2. Cross-Attention: target queries attend to context
         q_norm = self.norm_cross_q(q)
         kv_norm = self.norm_cross_kv(H_context)
         q = q + self.cross_attn(query=q_norm, key_value=kv_norm)
@@ -65,12 +68,12 @@ class PredictorBlock(nn.Module):
 
 class Predictor(nn.Module):
     """
-    Module H: Predictor (Section 13).
+    Module 5: Predictor (implement.md).
     Inputs:
-        - H_context: [B, N_ctx, D] (encoded visible context)
-        - target_pos: [B, N_tgt, D] (positional embeddings for target tokens)
+        - H_context: [B, N_ctx, D] (encoded visible context tokens)
+        - target_pos: [B, N_tgt, D] (3D positional embeddings of masked target locations)
     Output:
-        - H_pred: [B, N_tgt, D] (predicted target latents)
+        - H_pred: [B, N_tgt, D] (predicted target representations)
     """
     def __init__(
         self,
@@ -84,7 +87,7 @@ class Predictor(nn.Module):
         self.embed_dim = embed_dim
         self.depth = depth
 
-        # Learnable mask token to initialize target query vectors
+        # Learnable mask token e_mask to initialize target query vectors
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
@@ -109,17 +112,16 @@ class Predictor(nn.Module):
         """
         Args:
             H_context: [B, N_ctx, D] encoded context representations
-            target_pos: [B, N_tgt, D] positional embeddings of masked target locations
+            target_pos: [B, N_tgt, D] 3D positional embeddings of target tokens
 
         Returns:
             H_pred: [B, N_tgt, D] predicted target latents
         """
         B, N_tgt, D = target_pos.shape
 
-        # Initialize queries: mask_token + target_positional_embeddings
+        # Initialize Target Queries: Q = e_mask + target_pos
         target_queries = self.mask_token.expand(B, N_tgt, -1) + target_pos
 
-        # Process through predictor blocks
         q = target_queries
         for block in self.blocks:
             q = block(q, H_context)

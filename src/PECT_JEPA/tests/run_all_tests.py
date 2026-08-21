@@ -1,11 +1,12 @@
 """
-PECT-JEPA Test Suite Runner.
-Runs all verification tests specified in Section 22:
-- 22.1 Shape test
-- 22.2 Mask test
-- 22.3 Gradient & EMA test
-- 22.4 Small Overfit test
-- 22.5 Information Leakage test
+PECT-JEPA v0.2 Test Suite Runner (implement.md, Section 4).
+Executes the 6 mandatory verification unit tests:
+1. test_shape.py (Tensor shape consistency [1, 300, 300, 16] -> [1, 37, 37, 16, 128])
+2. test_mask.py (Frame-by-frame block integrity & disjointness)
+3. test_information_leakage.py (No target content leakage)
+4. test_gradient.py (Gradient flow & Target Encoder isolation)
+5. test_overfit.py (Monotonic loss decrease on 1 clip)
+6. test_full_scale_forward.py (Full-scale clip benchmark 300x300x16)
 """
 
 import unittest
@@ -19,10 +20,10 @@ if root_dir not in sys.path:
 
 from src.PECT_JEPA.tests.test_shape import TestShapes
 from src.PECT_JEPA.tests.test_mask import TestMask
-from src.PECT_JEPA.tests.test_gradient import TestGradient
 from src.PECT_JEPA.tests.test_information_leakage import TestInformationLeakage
+from src.PECT_JEPA.tests.test_gradient import TestGradient
 from src.PECT_JEPA.tests.test_overfit import TestOverfit
-from src.PECT_JEPA.tests.test_real_tdms import TestRealTDMS
+from src.PECT_JEPA.tests.test_full_scale_forward import TestFullScaleForward
 
 
 def run_tests():
@@ -31,13 +32,13 @@ def run_tests():
 
     suite.addTests(loader.loadTestsFromTestCase(TestShapes))
     suite.addTests(loader.loadTestsFromTestCase(TestMask))
-    suite.addTests(loader.loadTestsFromTestCase(TestGradient))
     suite.addTests(loader.loadTestsFromTestCase(TestInformationLeakage))
+    suite.addTests(loader.loadTestsFromTestCase(TestGradient))
     suite.addTests(loader.loadTestsFromTestCase(TestOverfit))
-    suite.addTests(loader.loadTestsFromTestCase(TestRealTDMS))
+    suite.addTests(loader.loadTestsFromTestCase(TestFullScaleForward))
 
     print("=" * 70)
-    print("RUNNING PECT-JEPA VERIFICATION TEST SUITE (Section 22)")
+    print("RUNNING PECT-JEPA v0.2 UNIT TEST SUITE (implement.md)")
     print("=" * 70)
 
     runner = unittest.TextTestRunner(verbosity=2)
@@ -45,7 +46,7 @@ def run_tests():
 
     print("=" * 70)
     if result.wasSuccessful():
-        print("ALL TESTS PASSED SUCCESSFULLY! Ready for PECT-JEPA training.")
+        print("ALL 6 TESTS PASSED SUCCESSFULLY! PECT-JEPA v0.2 refactoring verified.")
     else:
         print(f"TESTS FAILED: {len(result.failures)} failures, {len(result.errors)} errors.")
     print("=" * 70)

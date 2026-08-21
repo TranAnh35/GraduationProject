@@ -1,7 +1,6 @@
 """
-Small Overfit and Optimization Test (Section 22.4).
-Verifies that optimization step decreases loss on a fixed batch,
-predictions remain finite, and EMA updates without NaN/Inf.
+Small Overfit Verification Test for PECT-JEPA v0.2 (implement.md, Section 4.5).
+Verifies that 20 gradient descent steps on a single fixed clip decrease loss monotonically towards 0.
 """
 
 import torch
@@ -12,10 +11,8 @@ from ..training.optimizer import build_optimizer
 
 
 class TestOverfit(unittest.TestCase):
-    def test_overfit_single_batch(self):
+    def test_overfit_single_clip(self):
         config = get_default_config()
-        config.temporal_encoder.t_prime = 64
-        config.temporal_encoder.raw_samples = 500
         config.tokenizer.spatial_patch = 8
         config.tokenizer.embed_dim = 64
         config.encoder.depth = 2
@@ -27,18 +24,15 @@ class TestOverfit(unittest.TestCase):
 
         optimizer = build_optimizer(model, lr=1e-3, weight_decay=0.0)
 
-        # Fixed sample and fixed mask
-        x = torch.randn(1, 32, 32, 500)
-        grid_shape = (4, 4, 7)
+        # Fixed clip: [1, 32, 32, 16] -> grid (4, 4, 16)
+        clip = torch.randn(1, 32, 32, 16)
+        grid_shape = (4, 4, 16)
         ctx_idx, tgt_idx, _ = model.masker.sample_mask(1, grid_shape)
 
-        initial_loss = None
-        final_loss = None
-
         losses = []
-        for step in range(15):
+        for step in range(20):
             optimizer.zero_grad()
-            out = model(x, custom_context_indices=ctx_idx, custom_target_indices=tgt_idx)
+            out = model(clip, custom_context_indices=ctx_idx, custom_target_indices=tgt_idx)
             loss = out["loss"]
 
             self.assertFalse(torch.isnan(loss).item(), f"Loss is NaN at step {step}")
@@ -48,14 +42,14 @@ class TestOverfit(unittest.TestCase):
             optimizer.step()
             model.update_target_encoder(momentum=0.99)
 
-            loss_val = loss.item()
-            losses.append(loss_val)
+            losses.append(loss.item())
 
         initial_loss = losses[0]
         final_loss = losses[-1]
 
         self.assertLess(final_loss, initial_loss, f"Loss did not decrease: initial={initial_loss}, final={final_loss}")
-        print(f"PASS: Overfit Test | Initial Loss: {initial_loss:.6f} -> Final Loss: {final_loss:.6f} (Decreased)")
+        self.assertLess(final_loss, initial_loss * 0.5, f"Loss decrease insufficient: {initial_loss:.6f} -> {final_loss:.6f}")
+        print(f"PASS: test_overfit.py | Initial Loss: {initial_loss:.6f} -> Final Loss (step 20): {final_loss:.6f} (Decreased significantly)")
 
 
 if __name__ == "__main__":

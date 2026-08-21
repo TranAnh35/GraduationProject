@@ -1,7 +1,7 @@
 """
-PECT-JEPA Model Architecture (Section 5, 14, 24).
-Integrates Multi-scale Temporal Encoder, Tokenizer, Dynamic Spatio-Temporal Masking,
-Context Encoder, EMA Target Encoder, and Predictor.
+PECT-JEPA Model Architecture for v0.2 (Section 2, implement.md).
+Integrates Frame-by-Frame Tokenizer, Dynamic Frame-by-Frame Block Masking,
+Token-Dropping Context Encoder, EMA Target Encoder, Predictor, and JEPA Loss.
 """
 
 import copy
@@ -10,7 +10,6 @@ import torch.nn as nn
 from typing import Dict, Tuple, Optional, Any
 
 from ..configs.config import PECTJEPAConfig
-from .temporal_encoder import MultiScaleTemporalEncoder
 from .tokenizer import SpatioTemporalTokenizer
 from .context_encoder import ContextEncoder
 from .target_encoder import TargetEncoder
@@ -21,7 +20,8 @@ from ..losses.jepa_loss import JEPALoss
 
 class PECT_JEPA(nn.Module):
     """
-    Complete PECT-JEPA Self-Supervised Model.
+    Complete PECT-JEPA Self-Supervised Model (v0.2).
+    Input: [B, H, W, T_c] (e.g. [B, 300, 300, 16]).
     """
     def __init__(self, config: Optional[PECTJEPAConfig] = None):
         super().__init__()
@@ -30,62 +30,44 @@ class PECT_JEPA(nn.Module):
             config = get_default_config()
         self.config = config
 
-        # Module A: Multi-scale Temporal Encoder
-        self.temporal_encoder = MultiScaleTemporalEncoder(
-            raw_samples=config.temporal_encoder.raw_samples,
-            t_prime=config.temporal_encoder.t_prime,
-            kernel_sizes=config.temporal_encoder.conv_kernel_sizes,
-            dilations=config.temporal_encoder.conv_dilations,
-            hidden_dim=config.temporal_encoder.hidden_dim,
-            transformer_blocks=config.temporal_encoder.transformer_blocks,
-            transformer_heads=config.temporal_encoder.transformer_heads,
-            dropout=config.temporal_encoder.dropout,
-            out_dim=1
-        )
-
-        # Modules B & C: Temporal Clip & Spatio-Temporal Tokenizer
+        # Module 1: Spatio-Temporal Tokenizer (frame-by-frame)
         self.tokenizer = SpatioTemporalTokenizer(
             spatial_patch=config.tokenizer.spatial_patch,
             clip_length=config.clip.temporal_length,
-            stride=config.clip.stride,
             embed_dim=config.tokenizer.embed_dim,
             pos_embed_type=config.tokenizer.pos_embed_type,
             dropout=config.tokenizer.dropout
         )
 
-        # Module D: Dynamic Spatio-Temporal Block Masker
+        # Module 2: Dynamic Frame-by-Frame Block Masker
         self.masker = DynamicSpatioTemporalBlockMasker(
             spatial_block_h=config.mask.spatial_block_h,
             spatial_block_w=config.mask.spatial_block_w,
-            temporal_block_t=config.mask.temporal_block_t,
-            num_blocks=config.mask.num_blocks,
-            min_mask_ratio=config.mask.min_mask_ratio,
-            max_mask_ratio=config.mask.max_mask_ratio
+            num_masked_frames=getattr(config.mask, "num_masked_frames", 8),
+            min_masked_frames=getattr(config.mask, "min_masked_frames", 4),
+            max_masked_frames=getattr(config.mask, "max_masked_frames", 10)
         )
 
-        # Module F: Context Encoder
+        # Module 3: Context Encoder (Token Dropping)
         self.context_encoder = ContextEncoder(
             embed_dim=config.tokenizer.embed_dim,
             depth=config.encoder.depth,
             num_heads=config.encoder.num_heads,
             mlp_ratio=config.encoder.mlp_ratio,
-            dropout=config.encoder.dropout,
-            attention_type=config.encoder.attention_type
+            dropout=config.encoder.dropout
         )
 
-        # Module G: EMA Target Encoder
+        # Module 4: EMA Target Encoder
         self.target_encoder = TargetEncoder(
             embed_dim=config.tokenizer.embed_dim,
             depth=config.encoder.depth,
             num_heads=config.encoder.num_heads,
             mlp_ratio=config.encoder.mlp_ratio,
-            dropout=config.encoder.dropout,
-            attention_type=config.encoder.attention_type
+            dropout=config.encoder.dropout
         )
-        # Initialize target encoder with context encoder weights
         self._init_target_encoder()
 
-        # Module H: Predictor
+        # Module 5: Predictor
         self.predictor = Predictor(
             embed_dim=config.tokenizer.embed_dim,
             depth=config.predictor.depth,
@@ -94,7 +76,7 @@ class PECT_JEPA(nn.Module):
             dropout=config.predictor.dropout
         )
 
-        # Loss function
+        # Module 6: JEPA Loss
         self.loss_fn = JEPALoss(
             loss_type=config.loss.loss_type,
             eps=config.loss.eps
@@ -114,34 +96,37 @@ class PECT_JEPA(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        clip: torch.Tensor,
         custom_context_indices: Optional[torch.Tensor] = None,
         custom_target_indices: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through PECT-JEPA (Section 14).
+        Forward pass through PECT-JEPA (Section 2, implement.md).
 
         Args:
-            x: Input acquisition tensor [B, H, W, 500]
+            clip: Input clip tensor [B, H, W, T_c] (e.g. [B, 300, 300, 16])
 
         Returns:
             Dict containing:
                 - 'loss': scalar prediction loss
-                - 'H_pred': [B, N_tgt, D] predicted target latents
-                - 'H_target': [B, N_tgt, D] target latents from EMA Target Encoder
-                - 'H_context': [B, N_ctx, D] encoded context latents
-                - 'grid_shape': (H_t, W_t, K_t)
+                - 'H_pred': [B, N_tgt, D] predicted target representations
+                - 'H_target': [B, N_tgt, D] target representations from EMA Target Encoder
+                - 'H_context': [B, N_ctx, D] encoded context representations
+                - 'grid_shape': (H_t, W_t, T_c)
+                - 'context_indices': [B, N_ctx]
+                - 'target_indices': [B, N_tgt]
         """
-        B = x.shape[0]
-        device = x.device
+        orig_ndim = clip.ndim
+        if orig_ndim == 3:
+            clip = clip.unsqueeze(0)
 
-        # 1. Multi-scale Temporal Encoder -> [B, H, W, T']
-        x_latent = self.temporal_encoder(x)
+        B = clip.shape[0]
+        device = clip.device
 
-        # 2. Spatio-Temporal Tokenizer -> [B, M, D], [1, M, D], (H_t, W_t, K_t)
-        tokens, pos_embed, grid_shape = self.tokenizer(x_latent)
+        # 1. Spatio-Temporal Tokenizer -> tokens [B, M, D], pos_embed [1, M, D], grid (H_t, W_t, T_c)
+        tokens, pos_embed, grid_shape = self.tokenizer(clip)
 
-        # 3. Dynamic Masking -> context_indices, target_indices
+        # 2. Dynamic Frame-by-Frame Block Masking -> context_indices, target_indices
         if custom_context_indices is not None and custom_target_indices is not None:
             context_indices = custom_context_indices
             target_indices = custom_target_indices
@@ -152,38 +137,37 @@ class PECT_JEPA(nn.Module):
                 device=device
             )
 
-        # 4. Context & Target Token Partitioning
+        # 3. Context & Target Token Partitioning (Token Dropping)
         batch_idx = torch.arange(B, device=device).unsqueeze(1)
         pos_expanded = pos_embed.expand(B, -1, -1)
 
-        # Context tokens and positions
+        # Context tokens and 3D positions
         context_tokens = tokens[batch_idx, context_indices]  # [B, N_ctx, D]
         context_pos = pos_expanded[batch_idx, context_indices]  # [B, N_ctx, D]
 
-        # Target tokens and positions
+        # Target tokens and 3D positions
         target_tokens = tokens[batch_idx, target_indices]  # [B, N_tgt, D]
         target_pos = pos_expanded[batch_idx, target_indices]  # [B, N_tgt, D]
 
-        # 5. Context Encoder -> H_context (Supports factorized spatio-temporal attention)
+        # 4. Context Encoder (Encodes ONLY visible context tokens)
         H_context = self.context_encoder(
             context_tokens=context_tokens,
-            context_pos=context_pos,
-            context_indices=context_indices,
-            grid_shape=grid_shape
-        )
+            context_pos=context_pos
+        )  # [B, N_ctx, D]
 
-        # 6. Predictor -> H_pred (Target token values are NOT passed to Predictor!)
-        H_pred = self.predictor(H_context, target_pos)
+        # 5. Predictor (Predicts target latents from H_context and target_pos)
+        H_pred = self.predictor(
+            H_context=H_context,
+            target_pos=target_pos
+        )  # [B, N_tgt, D]
 
-        # 7. EMA Target Encoder -> H_target (Detached from gradients)
+        # 6. EMA Target Encoder (Encodes target tokens, detached)
         H_target = self.target_encoder(
             target_tokens=target_tokens,
-            target_pos=target_pos,
-            target_indices=target_indices,
-            grid_shape=grid_shape
-        )
+            target_pos=target_pos
+        )  # [B, N_tgt, D]
 
-        # 8. Compute JEPA Loss
+        # 7. JEPA Loss
         loss = self.loss_fn(H_pred, H_target)
 
         return {
@@ -199,48 +183,38 @@ class PECT_JEPA(nn.Module):
     @torch.no_grad()
     def extract_features(
         self,
-        x: torch.Tensor,
+        clip: torch.Tensor,
         pool_temporal: bool = False
     ) -> torch.Tensor:
         """
-        Extract full latent representations for downstream evaluation (Section 17).
+        Extract full latent representations for downstream evaluation.
         Operates on frozen pretrained encoder with all tokens visible.
 
         Args:
-            x: Input acquisition tensor [B, H, W, 500] (or [H, W, 500])
-            pool_temporal: Whether to average over temporal clips K_t (default: False)
+            clip: Input clip tensor [B, H, W, T_c] (or [H, W, T_c])
+            pool_temporal: Whether to average over temporal frames T_c (default: False)
 
         Returns:
             Latent token tensor:
-                If pool_temporal=False: [B, H_t, W_t, K_t, D]
+                If pool_temporal=False: [B, H_t, W_t, T_c, D]
                 If pool_temporal=True:  [B, H_t, W_t, D]
         """
-        orig_ndim = x.ndim
+        orig_ndim = clip.ndim
         if orig_ndim == 3:
-            x = x.unsqueeze(0)
+            clip = clip.unsqueeze(0)
 
-        B = x.shape[0]
-        device = x.device
+        B = clip.shape[0]
+        # 1. Tokenization
+        tokens, pos_embed, (H_t, W_t, T_c) = self.tokenizer(clip)
 
-        # 1. Temporal Encoding
-        x_latent = self.temporal_encoder(x)
-
-        # 2. Tokenization
-        tokens, pos_embed, (H_t, W_t, K_t) = self.tokenizer(x_latent)
-
-        # 3. Context Encoder with all tokens visible (indices 0..M-1)
-        total_tokens = H_t * W_t * K_t
-        all_indices = torch.arange(total_tokens, device=device).unsqueeze(0).expand(B, -1)
-
+        # 2. Context Encoder with all tokens visible
         H_all = self.context_encoder(
             context_tokens=tokens,
-            context_pos=pos_embed.expand(B, -1, -1),
-            context_indices=all_indices,
-            grid_shape=(H_t, W_t, K_t)
+            context_pos=pos_embed.expand(B, -1, -1)
         )  # [B, M, D]
 
-        # Reshape to 3D token grid: [B, H_t, W_t, K_t, D]
-        grid_latents = H_all.view(B, H_t, W_t, K_t, self.config.tokenizer.embed_dim)
+        # Reshape to 3D token grid: [B, H_t, W_t, T_c, D]
+        grid_latents = H_all.view(B, H_t, W_t, T_c, self.config.tokenizer.embed_dim)
 
         if pool_temporal:
             grid_latents = torch.mean(grid_latents, dim=3)  # [B, H_t, W_t, D]

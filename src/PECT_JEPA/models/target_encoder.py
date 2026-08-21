@@ -1,22 +1,23 @@
 """
-EMA Target Encoder for PECT-JEPA (Module G, Section 12).
+EMA Target Encoder for PECT-JEPA v0.2 (Module 4, implement.md).
 Encodes masked target tokens to generate prediction target latents H_target.
-Parameters are frozen from autograd and updated exclusively via Exponential Moving Average.
+Parameters are frozen from autograd (requires_grad = False) and updated exclusively via EMA.
 """
 
 import copy
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional
 
 from .context_encoder import ContextEncoder
 
 
 class TargetEncoder(nn.Module):
     """
-    Module G: EMA Target Encoder.
-    Encodes masked target tokens into target latents H_target.
-    Updated via EMA from Context Encoder parameters.
+    Module 4: EMA Target Encoder (implement.md).
+    Architecture clone of ContextEncoder.
+    Processes masked target tokens [B, N_tgt, D] and target positional embeddings [B, N_tgt, D].
+    Updated exclusively via EMA from ContextEncoder.
     """
     def __init__(
         self,
@@ -24,8 +25,7 @@ class TargetEncoder(nn.Module):
         depth: int = 4,
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        attention_type: str = "factorized"
+        dropout: float = 0.0
     ):
         super().__init__()
         self.encoder = ContextEncoder(
@@ -33,10 +33,9 @@ class TargetEncoder(nn.Module):
             depth=depth,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            attention_type=attention_type
+            dropout=dropout
         )
-        # Freeze parameters from gradient computation (Section 12.5)
+        # Freeze parameters from gradient computation
         for param in self.encoder.parameters():
             param.requires_grad = False
 
@@ -44,33 +43,27 @@ class TargetEncoder(nn.Module):
     def forward(
         self,
         target_tokens: torch.Tensor,
-        target_pos: Optional[torch.Tensor] = None,
-        target_indices: Optional[torch.Tensor] = None,
-        grid_shape: Optional[Tuple[int, int, int]] = None
+        target_pos: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
             target_tokens: [B, N_tgt, D] masked target tokens
-            target_pos: [B, N_tgt, D] positional embeddings for target tokens
-            target_indices: [B, N_tgt] token indices of target positions
-            grid_shape: (H_t, W_t, K_t)
+            target_pos: [B, N_tgt, D] 3D positional embeddings for target tokens
 
         Returns:
             H_target: [B, N_tgt, D] target latent representations (detached)
         """
         H_target = self.encoder(
             context_tokens=target_tokens,
-            context_pos=target_pos,
-            context_indices=target_indices,
-            grid_shape=grid_shape
+            context_pos=target_pos
         )
         return H_target.detach()
 
     @torch.no_grad()
     def update_ema(self, context_encoder: ContextEncoder, momentum: float):
         """
-        Exponential Moving Average parameter update (Section 12.3):
-        phi_target = m * phi_target + (1 - m) * phi_context
+        Exponential Moving Average parameter update:
+        theta_T <- m * theta_T + (1 - m) * theta_C
         """
         for param_t, param_c in zip(self.encoder.parameters(), context_encoder.parameters()):
             param_t.data.mul_(momentum).add_(param_c.data, alpha=1.0 - momentum)

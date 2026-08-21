@@ -1,6 +1,5 @@
 """
-Configuration definitions for PECT-JEPA.
-Implements the configurable parameter structure defined in Section 20 of PECT_JEPA_Implementation_Spec_v0.1.md.
+Configuration definitions for PECT-JEPA v0.2 (implement.md).
 """
 
 from dataclasses import dataclass, field, asdict
@@ -13,16 +12,19 @@ import os
 class DataConfig:
     data_dir: str = "data"
     time_samples: int = 500
+    clip_length: int = 16  # T_c = 16
+    clip_stride: int = 8
     normalization: str = "min_max"  # 'min_max', 'standard', 'none'
     raster_correction: bool = True
-    spatial_size: Optional[Tuple[int, int]] = (300, 300)  # None or (H, W) to crop/pad uniformly
-    cache_in_memory: bool = False
+    spatial_size: Optional[Tuple[int, int]] = None  # None: Resolution-agnostic (native file size)
+    use_memmap: bool = True
+    cache_dir: str = ".cache/pect_mmap"
     eps: float = 1e-8
 
 
 @dataclass
 class TemporalEncoderConfig:
-    t_prime: int = 64  # Latent temporal positions: candidate 64 or 128
+    t_prime: int = 64
     raw_samples: int = 500
     conv_branches: int = 3
     conv_kernel_sizes: List[int] = field(default_factory=lambda: [5, 9, 15])
@@ -35,50 +37,47 @@ class TemporalEncoderConfig:
 
 @dataclass
 class ClipConfig:
-    temporal_length: int = 16  # Tc = 16
-    stride: int = 8  # clip_stride: 8, 12, or 16
+    temporal_length: int = 16  # T_c = 16
+    stride: int = 8
 
 
 @dataclass
 class TokenizerConfig:
-    spatial_patch: int = 8  # Ps: candidate 4, 8, or 16
-    embed_dim: int = 128  # D: token embedding dimension
-    pos_embed_type: str = "learnable"  # 'learnable', 'sinusoidal'
+    spatial_patch: int = 8  # P_s = 8
+    embed_dim: int = 128  # D = 128
+    pos_embed_type: str = "sinusoidal"  # 'sinusoidal' or 'sinusoidal_projected'
     dropout: float = 0.0
 
 
 @dataclass
 class MaskConfig:
-    mask_type: str = "spatiotemporal_block"
-    spatial_block_h: int = 4  # Bh: tokens in height
-    spatial_block_w: int = 4  # Bw: tokens in width
-    temporal_block_t: int = 1  # Bt: clips in temporal axis
-    num_blocks: int = 4  # Number of target blocks sampled per sample
-    min_mask_ratio: float = 0.2
-    max_mask_ratio: float = 0.6
+    mask_type: str = "frame_by_frame_block"
+    spatial_block_h: int = 8  # B_h = 8
+    spatial_block_w: int = 8  # B_w = 8
+    num_masked_frames: Optional[int] = 8  # K = 8 frames
+    min_masked_frames: int = 4
+    max_masked_frames: int = 10
     dynamic: bool = True
 
 
 @dataclass
 class EncoderConfig:
-    attention_type: str = "factorized"  # 'factorized', 'window', 'full'
     depth: int = 4
     num_heads: int = 4
     mlp_ratio: float = 4.0
     dropout: float = 0.0
-    window_size: Tuple[int, int] = (4, 4)  # For window attention
 
 
 @dataclass
 class TargetEncoderConfig:
-    ema_momentum: float = 0.996  # Starting EMA momentum m
-    ema_momentum_end: float = 1.0  # Optional cosine scheduler end momentum
+    ema_momentum: float = 0.996
+    ema_momentum_end: float = 1.0
     use_momentum_schedule: bool = True
 
 
 @dataclass
 class PredictorConfig:
-    depth: int = 2  # Lightweight predictor: 2-4 Transformer blocks
+    depth: int = 2
     num_heads: int = 4
     mlp_ratio: float = 4.0
     dropout: float = 0.0
@@ -101,7 +100,7 @@ class TrainingConfig:
     epochs: int = 50
     grad_clip: float = 1.0
     mixed_precision: bool = True
-    device: str = "cuda"  # 'cuda' or 'cpu'
+    device: str = "cuda"
     save_dir: str = "checkpoints/pect_jepa"
     log_interval: int = 10
     val_interval: int = 1
@@ -151,5 +150,4 @@ class PECTJEPAConfig:
 
 
 def get_default_config() -> PECTJEPAConfig:
-    """Returns default PECT-JEPA v0.1 configuration."""
     return PECTJEPAConfig()

@@ -16,7 +16,7 @@ if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
 from src.PECT_JEPA.configs.config import get_default_config, PECTJEPAConfig
-from src.PECT_JEPA.data.dataset import PECTDataset, find_all_tdms_files, collate_pect_batch
+from src.PECT_JEPA.data.dataset import PECTDataset, PECTClipDataset, find_all_tdms_files, collate_pect_batch
 from src.PECT_JEPA.data.split import split_by_files
 from src.PECT_JEPA.models.jepa import PECT_JEPA
 from src.PECT_JEPA.training.trainer import JEPATrainer
@@ -81,21 +81,29 @@ def main():
     )
     print(f"Split: {len(train_files)} train files, {len(val_files)} val files, {len(test_files)} test files")
 
-    # 3. Create Datasets and DataLoaders
-    train_dataset = PECTDataset(
+    # 3. Create Datasets and DataLoaders (Clip-as-Sample, T_c = 16)
+    train_dataset = PECTClipDataset(
         file_paths=train_files,
+        clip_length=config.clip.temporal_length,
+        clip_stride=config.clip.stride,
         time_samples=config.temporal_encoder.raw_samples,
         raster_correction=config.data.raster_correction,
         spatial_size=config.data.spatial_size,
-        normalization=config.data.normalization
+        normalization=config.data.normalization,
+        cache_in_memory=True
     )
-    val_dataset = PECTDataset(
+    val_dataset = PECTClipDataset(
         file_paths=val_files,
+        clip_length=config.clip.temporal_length,
+        clip_stride=config.clip.stride,
         time_samples=config.temporal_encoder.raw_samples,
         raster_correction=config.data.raster_correction,
         spatial_size=config.data.spatial_size,
-        normalization=config.data.normalization
+        normalization=config.data.normalization,
+        cache_in_memory=True
     )
+
+    print(f"Total training clips: {len(train_dataset)} | Total validation clips: {len(val_dataset)}")
 
     train_loader = DataLoader(
         train_dataset,

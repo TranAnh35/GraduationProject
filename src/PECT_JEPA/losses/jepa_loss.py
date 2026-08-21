@@ -1,6 +1,6 @@
 """
-JEPA Loss Functions (Section 15).
-Implements normalized L2 / MSE latent prediction loss.
+JEPA Loss Functions for PECT-JEPA v0.2 (Module 6, implement.md).
+Implements normalized L2 / MSE latent prediction loss, cosine distance, and smooth L1 loss.
 """
 
 import torch
@@ -10,8 +10,8 @@ import torch.nn.functional as F
 
 class JEPALoss(nn.Module):
     """
-    JEPA Latent Prediction Loss (Section 15).
-    Computes distance between predicted target latents and EMA target latents.
+    Module 6: JEPA Latent Prediction Loss (implement.md).
+    Computes distance between predicted target latents and EMA target latents in normalized feature space.
     """
     def __init__(self, loss_type: str = "normalized_l2", eps: float = 1e-8):
         super().__init__()
@@ -25,8 +25,8 @@ class JEPALoss(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            predicted_target: [B, N_tgt, D] predicted target latent from Predictor
-            target_latent: [B, N_tgt, D] target latent from EMA Target Encoder
+            predicted_target: [B, N_tgt, D] predicted target representations from Predictor
+            target_latent: [B, N_tgt, D] target representations from EMA Target Encoder
 
         Returns:
             Scalar loss value
@@ -35,7 +35,7 @@ class JEPALoss(nn.Module):
             f"Shape mismatch: {predicted_target.shape} vs {target_latent.shape}"
 
         if self.loss_type == "normalized_l2":
-            # Normalize along feature dimension D (Section 15.2)
+            # Normalized L2 distance along feature dimension D
             p = F.normalize(predicted_target, p=2, dim=-1, eps=self.eps)
             t = F.normalize(target_latent, p=2, dim=-1, eps=self.eps)
             loss = torch.mean((p - t) ** 2)

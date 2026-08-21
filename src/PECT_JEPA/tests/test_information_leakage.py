@@ -1,7 +1,8 @@
 """
-Information Leakage Test (Section 22.5).
-Explicitly verifies that the Predictor never receives target token content/values,
-and only receives visible context latents and target positional embeddings.
+Information Leakage Test for PECT-JEPA v0.2 (implement.md, Section 4.3).
+Verifies:
+- Randomly altering raw pixel values in the Target region produces ZERO change in H_context and H_pred.
+- Predictor depends ONLY on context representations and target positional queries (no content leakage).
 """
 
 import torch
@@ -11,47 +12,47 @@ from ..configs.config import get_default_config
 
 
 class TestInformationLeakage(unittest.TestCase):
-    def test_predictor_inputs(self):
+    def test_predictor_and_context_no_leakage(self):
         config = get_default_config()
-        config.temporal_encoder.t_prime = 64
-        config.temporal_encoder.raw_samples = 500
         config.tokenizer.spatial_patch = 8
         config.tokenizer.embed_dim = 64
+        config.encoder.depth = 2
+        config.predictor.depth = 2
         config.training.device = "cpu"
 
         model = PECT_JEPA(config)
         model.eval()
 
-        # Create two inputs where target region has different values, but context region is identical
-        B, H, W, L = 1, 32, 32, 500
-        x1 = torch.ones(B, H, W, L)
-        x2 = torch.ones(B, H, W, L)
+        # Create two inputs: clip1 and clip2
+        B, H, W, T_c = 1, 32, 32, 16
+        clip1 = torch.ones(B, H, W, T_c)
+        clip2 = torch.ones(B, H, W, T_c)
 
-        # Perturb a specific region (say patch 0..8, 0..8)
-        x2[:, :8, :8, :] += 5.0
+        # Token grid: H_t = 4, W_t = 4, T_c = 16 -> total 256 tokens
+        # Define fixed mask: target is patch (0, 0) at all 16 frames -> indices [0, 16, 32, ...]
+        tgt_indices = torch.tensor([[t * 16 for t in range(16)]], dtype=torch.long)
+        ctx_indices = torch.tensor([[i for i in range(256) if i not in tgt_indices[0].tolist()]], dtype=torch.long)
 
-        # Define fixed mask where target is exactly the perturbed patch
-        # Patch grid is 4x4x7. Target = patch (0, 0, :) -> indices [0, 1, 2, 3, 4, 5, 6]
-        tgt_indices = torch.tensor([[0, 1, 2, 3, 4, 5, 6]], dtype=torch.long)
-        ctx_indices = torch.tensor([[i for i in range(7, 4 * 4 * 7)]], dtype=torch.long)
+        # Alter raw pixels ONLY in the target region (spatial pixels 0..7, 0..7) in clip2
+        clip2[:, :8, :8, :] += 50.0
 
-        # Forward pass on both with fixed custom context/target indices
-        out1 = model(x1, custom_context_indices=ctx_indices, custom_target_indices=tgt_indices)
-        out2 = model(x2, custom_context_indices=ctx_indices, custom_target_indices=tgt_indices)
+        # Forward pass on both with the same fixed mask
+        out1 = model(clip1, custom_context_indices=ctx_indices, custom_target_indices=tgt_indices)
+        out2 = model(clip2, custom_context_indices=ctx_indices, custom_target_indices=tgt_indices)
 
-        # Context latents should be identical because context input region is identical
+        # 1. Context representations must be identical (Context is unaffected by target changes)
         ctx_diff = torch.sum(torch.abs(out1["H_context"] - out2["H_context"])).item()
-        self.assertAlmostEqual(ctx_diff, 0.0, places=4, msg="Context representations differ for identical context input!")
+        self.assertAlmostEqual(ctx_diff, 0.0, places=5, msg="H_context changed when target region was altered!")
 
-        # Predicted target latents MUST be identical because Predictor ONLY sees H_context and target_pos (not target content!)
+        # 2. Predicted target representations must be 100% IDENTICAL (No Target Content Leakage to Predictor!)
         pred_diff = torch.sum(torch.abs(out1["H_pred"] - out2["H_pred"])).item()
-        self.assertAlmostEqual(pred_diff, 0.0, places=4, msg="Predictor leaked target content! Predictions must depend ONLY on context!")
+        self.assertAlmostEqual(pred_diff, 0.0, places=5, msg="H_pred leaked target content! Must depend ONLY on context!")
 
-        # Meanwhile, target encoder latents MUST differ because target encoder receives the actual target tokens
-        tgt_encoder_diff = torch.sum(torch.abs(out1["H_target"] - out2["H_target"])).item()
-        self.assertGreater(tgt_encoder_diff, 0.1, "Target encoder failed to distinguish different target content!")
+        # 3. Meanwhile, Target Encoder output MUST differ because it encodes the actual target content
+        tgt_diff = torch.sum(torch.abs(out1["H_target"] - out2["H_target"])).item()
+        self.assertGreater(tgt_diff, 0.1, "Target Encoder failed to perceive the altered target content!")
 
-        print(f"PASS: No-Information-Leakage Test | Pred diff: {pred_diff:.6f} (isolated) | Target Enc diff: {tgt_encoder_diff:.4f}")
+        print(f"PASS: test_information_leakage.py | H_ctx diff: {ctx_diff:.7f} | H_pred diff: {pred_diff:.7f} (No Leakage!) | H_target diff: {tgt_diff:.4f}")
 
 
 if __name__ == "__main__":
