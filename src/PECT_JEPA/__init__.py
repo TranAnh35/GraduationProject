@@ -1,19 +1,10 @@
 """
-PECT-JEPA: Self-Supervised Joint Embedding Predictive Architecture for Pulsed Eddy Current Testing.
+PECT-JEPA package containing two independent research directions:
+1. Spatio-Temporal 3D PECT-JEPA (spatiotomporal_3d)
+2. 1D Temporal PECT-JEPA / TS-JEPA (temporal_1d)
 """
 
-from .models.jepa import PECT_JEPA
-from .configs.config import PECTJEPAConfig, get_default_config
-from .data.dataset import PECTDataset, read_tdms_scan
-from .training.trainer import JEPATrainer
+from .spatiotomporal_3d.models.jepa import PECT_JEPA
+from .temporal_1d.models.jepa_1d import PECT_JEPA_1D
 
-__version__ = "0.1.0"
-
-__all__ = [
-    "PECT_JEPA",
-    "PECTJEPAConfig",
-    "get_default_config",
-    "PECTDataset",
-    "read_tdms_scan",
-    "JEPATrainer",
-]
+__all__ = ["PECT_JEPA", "PECT_JEPA_1D"]

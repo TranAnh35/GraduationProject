@@ -1,0 +1,3 @@
+"""
+GraduationProject source root package.
+"""
