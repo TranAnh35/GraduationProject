@@ -2,6 +2,6 @@
 Masking modules for 1D Temporal PECT-JEPA.
 """
 
-from .temporal_mask import Dynamic1DBlockMasker
+from .temporal_mask import MultiStrategy1DMasker, Dynamic1DBlockMasker, VALID_STRATEGIES
 
-__all__ = ["Dynamic1DBlockMasker"]
+__all__ = ["MultiStrategy1DMasker", "Dynamic1DBlockMasker", "VALID_STRATEGIES"]

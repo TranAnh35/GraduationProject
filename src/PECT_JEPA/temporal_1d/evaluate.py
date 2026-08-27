@@ -43,13 +43,22 @@ def evaluate_cross_sensor_1d(
     model.to(dev)
     model.eval()
 
-    sample_dataset = PECT1DDataset(file_paths=all_file_paths, time_samples=model.config.time_samples, use_memmap=False)
+    ev_pad_to = (
+        model.config.raw_padded_length
+        if getattr(model.config, "tokenizer_mode", "resampled") == "raw"
+        else None
+    )
+    sample_dataset = PECT1DDataset(
+        file_paths=all_file_paths, time_samples=model.config.time_samples,
+        use_memmap=False, pad_to=ev_pad_to, pad_mode=model.config.pad_mode)
     train_files, test_files = split_cross_sensor(sample_dataset.metadata_list, test_sensor=test_sensor)
 
     print(f"\n[1D Cross-Sensor Evaluation: Target={test_sensor}] {len(train_files)} train files, {len(test_files)} test files")
 
-    train_ds = PECT1DDataset(file_paths=train_files, time_samples=model.config.time_samples, use_memmap=False)
-    test_ds = PECT1DDataset(file_paths=test_files, time_samples=model.config.time_samples, use_memmap=False)
+    train_ds = PECT1DDataset(file_paths=train_files, time_samples=model.config.time_samples,
+                             use_memmap=False, pad_to=ev_pad_to, pad_mode=model.config.pad_mode)
+    test_ds = PECT1DDataset(file_paths=test_files, time_samples=model.config.time_samples,
+                            use_memmap=False, pad_to=ev_pad_to, pad_mode=model.config.pad_mode)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_1d_batch)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_1d_batch)

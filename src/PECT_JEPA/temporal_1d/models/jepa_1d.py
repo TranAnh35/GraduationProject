@@ -1,10 +1,10 @@
 """
-Complete 1D Temporal PECT-JEPA Model Architecture (implement.md, Section 4.8).
-Integrates 1D Tokenizer, Dynamic 1D Masker, Context Encoder 1D, EMA Target Encoder 1D, Predictor 1D, and Normalized L2 Loss.
+Complete 1D Temporal PECT-JEPA Model (Stage A, physics-customized).
+Integrates the log-time two-channel Tokenizer, Multi-Strategy Masker,
+Context Encoder, EMA Target Encoder, Predictor and anti-collapse JEPA Loss.
 """
 
-import copy
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
@@ -13,40 +13,51 @@ from .tokenizer_1d import TemporalTokenizer1D
 from .context_encoder_1d import ContextEncoder1D
 from .target_encoder_1d import TargetEncoder1D
 from .predictor_1d import Predictor1D
-from ..masking.temporal_mask import Dynamic1DBlockMasker
+from ..masking.temporal_mask import MultiStrategy1DMasker
 from ..losses.jepa_loss import JEPALoss1D
 
 
 class PECT_JEPA_1D(nn.Module):
     """
-    Complete 1D Temporal PECT-JEPA Self-Supervised Model (TS-JEPA).
-    Input: [B, T=500] 1D transient waveform.
+    Physics-customized 1D Temporal PECT-JEPA Self-Supervised Model (TS-JEPA).
+
+    Input: [B, 2, T'=128] two-channel log-time waveform
+           (built by data.preprocessing.build_two_channel_input / PECT1DDataset).
     """
+
     def __init__(self, config: Optional[Temporal1DConfig] = None):
         super().__init__()
         if config is None:
             config = get_default_config_1d()
         self.config = config
 
-        # Module 1: 1D Temporal Tokenizer
+        # Module 1: Two-channel Tokenizer (A2)
+        # 'resampled' (B1/B2): log-time input [B, 2, log_time_samples=128]
+        # 'raw' (B0 baseline): padded raw input [B, 2, raw_padded_length=512]
+        tok_mode = getattr(config, "tokenizer_mode", "resampled")
+        tok_len = (
+            config.raw_padded_length if tok_mode == "raw" else config.log_time_samples
+        )
         self.tokenizer = TemporalTokenizer1D(
-            time_samples=config.time_samples,
-            patch_length=config.patch_length,
-            stride=config.stride,
+            log_time_samples=tok_len,
+            num_patches=config.num_patches,
+            num_channels=config.num_channels,
             embed_dim=config.embed_dim,
             pos_embed_type=config.pos_embed_type,
-            dropout=config.dropout
+            t_total_ms=config.t_total_ms,
+            t_start_frac=config.t_start_frac,
+            dropout=config.dropout,
+            mode=tok_mode,
         )
 
-        # Module 2: Dynamic 1D Temporal Masker
-        self.masker = Dynamic1DBlockMasker(
+        # Module 2: Multi-strategy physics-informed Masker (A3)
+        self.masker = MultiStrategy1DMasker(
             num_patches=config.num_patches,
-            mask_strategy=config.mask_strategy,
-            mask_ratio=config.mask_ratio,
-            num_visible_early=config.num_visible_early
+            strategy_probs=config.strategy_probs,
+            num_visible=config.num_visible,
         )
 
-        # Module 3: 1D Context Encoder
+        # Module 3: Context Encoder (transformer blocks reused)
         self.context_encoder = ContextEncoder1D(
             embed_dim=config.embed_dim,
             depth=config.encoder_depth,
@@ -55,7 +66,7 @@ class PECT_JEPA_1D(nn.Module):
             dropout=config.dropout
         )
 
-        # Module 4: 1D EMA Target Encoder
+        # Module 4: EMA Target Encoder
         self.target_encoder = TargetEncoder1D(
             embed_dim=config.embed_dim,
             depth=config.encoder_depth,
@@ -65,7 +76,7 @@ class PECT_JEPA_1D(nn.Module):
         )
         self._init_target_encoder()
 
-        # Module 5: 1D Predictor
+        # Module 5: Predictor (mask-token queries + cross-attention)
         self.predictor = Predictor1D(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,
@@ -74,10 +85,13 @@ class PECT_JEPA_1D(nn.Module):
             dropout=config.dropout
         )
 
-        # Module 6: JEPA Loss
+        # Module 6: JEPA Loss with anti-collapse (A4)
         self.loss_fn = JEPALoss1D(
             loss_type=config.loss_type,
-            eps=config.eps
+            eps=config.eps,
+            var_weight=config.var_weight,
+            cov_weight=config.cov_weight,
+            var_gamma=config.var_gamma,
         )
 
     def _init_target_encoder(self):
@@ -96,120 +110,86 @@ class PECT_JEPA_1D(nn.Module):
         self,
         x: torch.Tensor,
         custom_context_indices: Optional[torch.Tensor] = None,
-        custom_target_indices: Optional[torch.Tensor] = None
+        custom_target_indices: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through 1D Temporal PECT-JEPA.
-
         Args:
-            x: Input 1D waveform tensor [B, T=500] (or [T=500])
+            x: [B, 2, T'] two-channel log-time input (or [2, T'] single sample)
+            custom_context_indices / custom_target_indices: optional [B, N] overrides
 
-        Returns:
-            Dict containing:
-                - 'loss': scalar prediction loss
-                - 'H_pred': [B, N_tgt, D] predicted target latents
-                - 'H_target': [B, N_tgt, D] target latents from EMA Target Encoder
-                - 'H_context': [B, N_ctx, D] encoded context latents
-                - 'context_indices': [B, N_ctx]
-                - 'target_indices': [B, N_tgt]
+        Returns dict: loss (+ components), H_pred, H_target, H_context,
+                      context_indices, target_indices, mask_1d, strategy_ids.
         """
-        if x.ndim == 1:
-            x = x.unsqueeze(0)  # [1, T]
-
+        if x.ndim == 2:
+            x = x.unsqueeze(0)  # [1, 2, T']
         B = x.shape[0]
         device = x.device
 
-        # 1. 1D Tokenizer -> tokens [B, 16, D], pos_embed [1, 16, D]
-        tokens, pos_embed = self.tokenizer(x)
+        # 1. Tokenization -> tokens [B, N, D], pos [B, N, D], [1, N, D]
+        tokens, pos_expanded, pos_embed = self.tokenizer(x)
 
-        # 2. Dynamic 1D Masking -> context_indices, target_indices
+        # 2. Multi-strategy masking
         if custom_context_indices is not None and custom_target_indices is not None:
-            context_indices = custom_context_indices
-            target_indices = custom_target_indices
+            context_indices = custom_context_indices.to(device)
+            target_indices = custom_target_indices.to(device)
+            mask_1d = torch.zeros(B, self.config.num_patches, dtype=torch.bool, device=device)
+            mask_1d.scatter_(1, target_indices, True)
+            strategy_ids = torch.full((B,), -1, dtype=torch.long, device=device)
         else:
-            context_indices, target_indices, _ = self.masker.sample_mask(
-                batch_size=B,
-                device=device
+            context_indices, target_indices, mask_1d, strategy_ids = self.masker.sample_mask(
+                batch_size=B, device=device
             )
 
-        # 3. Context & Target Token Partitioning (Token Dropping)
+        # 3. Token partitioning (context tokens are fully dropped)
         batch_idx = torch.arange(B, device=device).unsqueeze(1)
-        pos_expanded = pos_embed.expand(B, -1, -1)
+        context_tokens = tokens[batch_idx, context_indices]      # [B, N_ctx, D]
+        context_pos = pos_expanded[batch_idx, context_indices]
+        target_tokens = tokens[batch_idx, target_indices]        # [B, N_tgt, D]
+        target_pos = pos_expanded[batch_idx, target_indices]
 
-        # Context tokens and 1D positions
-        context_tokens = tokens[batch_idx, context_indices]  # [B, N_ctx, D]
-        context_pos = pos_expanded[batch_idx, context_indices]  # [B, N_ctx, D]
-
-        # Target tokens and 1D positions
-        target_tokens = tokens[batch_idx, target_indices]  # [B, N_tgt, D]
-        target_pos = pos_expanded[batch_idx, target_indices]  # [B, N_tgt, D]
-
-        # 4. Context Encoder (Encodes ONLY visible context patches)
+        # 4. Context Encoder (visible context only)
         H_context = self.context_encoder(
-            context_tokens=context_tokens,
-            context_pos=context_pos
-        )  # [B, N_ctx, D]
+            context_tokens=context_tokens, context_pos=context_pos
+        )
 
-        # 5. Predictor (Predicts target latents from H_context and target_pos)
-        H_pred = self.predictor(
-            H_context=H_context,
-            target_pos=target_pos
-        )  # [B, N_tgt, D]
+        # 5. Predictor (mask-token queries cross-attend to context)
+        H_pred = self.predictor(H_context=H_context, target_pos=target_pos)
 
-        # 6. EMA Target Encoder (Encodes target patches, detached)
+        # 6. EMA Target Encoder (detached)
         H_target = self.target_encoder(
-            target_tokens=target_tokens,
-            target_pos=target_pos
-        )  # [B, N_tgt, D]
+            target_tokens=target_tokens, target_pos=target_pos
+        )
 
-        # 7. JEPA Loss
-        loss = self.loss_fn(H_pred, H_target)
-
-        return {
-            "loss": loss,
+        # 7. JEPA Loss + anti-collapse components
+        loss_dict = self.loss_fn(H_pred, H_target)
+        loss_dict.update({
             "H_pred": H_pred,
             "H_target": H_target,
             "H_context": H_context,
             "context_indices": context_indices,
-            "target_indices": target_indices
-        }
+            "target_indices": target_indices,
+            "mask_1d": mask_1d,
+            "strategy_ids": strategy_ids,
+        })
+        return loss_dict
 
     @torch.no_grad()
-    def extract_features(
-        self,
-        x: torch.Tensor,
-        pool: bool = False
-    ) -> torch.Tensor:
+    def extract_features(self, x: torch.Tensor, pool: bool = False) -> torch.Tensor:
         """
-        Extract latent representations for downstream evaluation.
-        Operates on frozen encoder with all 16 patches visible.
+        Frozen-encoder features for downstream evaluation (all patches visible).
 
         Args:
-            x: Input 1D waveform [B, T=500] (or [T=500])
-            pool: Whether to average over the 16 patches (default: False)
-
-        Returns:
-            If pool=False: [B, 16, D]
-            If pool=True:  [B, D]
+            x: [B, 2, T'] (or [2, T'])
+            pool: mean over patches -> [B, D]; else [B, N, D]
         """
         orig_ndim = x.ndim
-        if orig_ndim == 1:
+        if orig_ndim == 2:
             x = x.unsqueeze(0)
-
         B = x.shape[0]
-        # 1. Tokenization
-        tokens, pos_embed = self.tokenizer(x)
-
-        # 2. Context Encoder with all patches visible
-        H_all = self.context_encoder(
-            context_tokens=tokens,
-            context_pos=pos_embed.expand(B, -1, -1)
-        )  # [B, 16, D]
-
+        tokens, pos_expanded, _ = self.tokenizer(x)
+        H = self.context_encoder(context_tokens=tokens, context_pos=pos_expanded)
         if pool:
-            H_all = torch.mean(H_all, dim=1)  # [B, D]
-
-        if orig_ndim == 1:
-            H_all = H_all.squeeze(0)
-
-        return H_all
+            H = torch.mean(H, dim=1)
+        if orig_ndim == 2:
+            H = H.squeeze(0)
+        return H

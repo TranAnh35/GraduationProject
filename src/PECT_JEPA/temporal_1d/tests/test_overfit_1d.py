@@ -1,20 +1,21 @@
 """
-Overfit Verification Test for 1D Temporal PECT-JEPA (implement.md, Section 5.5).
-Verifies that 20 gradient descent steps on a single fixed batch decrease loss monotonically towards 0.
+Overfit Verification Test for 1D Temporal PECT-JEPA (Stage A).
+Verifies that 20 gradient descent steps on a single fixed batch decrease loss
+significantly (latent prediction + anti-collapse terms included).
 """
 
 import torch
 import unittest
 from ..models.jepa_1d import PECT_JEPA_1D
 from ..configs.config import get_default_config_1d
+from ..data.preprocessing import build_two_channel_input
 from ..training.optimizer import build_optimizer_1d
+from .synth import make_waveforms
 
 
 class TestOverfit1D(unittest.TestCase):
     def test_overfit_single_batch_1d(self):
         config = get_default_config_1d()
-        config.patch_length = 32
-        config.stride = 31
         config.embed_dim = 64
         config.encoder_depth = 2
         config.predictor_depth = 2
@@ -25,9 +26,9 @@ class TestOverfit1D(unittest.TestCase):
 
         optimizer = build_optimizer_1d(model, lr=1e-3, weight_decay=0.0)
 
-        # Fixed batch of 4 waveforms
-        x = torch.randn(4, 500)
-        ctx_idx, tgt_idx, _ = model.masker.sample_mask(4)
+        # Fixed batch
+        x = torch.from_numpy(build_two_channel_input(make_waveforms(n=4, T=500, seed=11)))
+        ctx_idx, tgt_idx, _, _ = model.masker.sample_mask(4, seed=5)
 
         losses = []
         for step in range(20):
@@ -49,7 +50,8 @@ class TestOverfit1D(unittest.TestCase):
 
         self.assertLess(final_loss, initial_loss, f"Loss did not decrease: initial={initial_loss}, final={final_loss}")
         self.assertLess(final_loss, initial_loss * 0.5, f"Loss decrease insufficient: {initial_loss:.6f} -> {final_loss:.6f}")
-        print(f"PASS: test_overfit_1d.py | Initial Loss: {initial_loss:.6f} -> Final Loss (step 20): {final_loss:.6f} (Decreased significantly)")
+        print(f"PASS: test_overfit_1d.py | Initial Loss: {initial_loss:.6f} -> "
+              f"Final Loss (step 20): {final_loss:.6f} (Decreased significantly)")
 
 
 if __name__ == "__main__":

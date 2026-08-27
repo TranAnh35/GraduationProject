@@ -1,38 +1,27 @@
 """
-Shape & Tensor Consistency Tests for 1D Temporal PECT-JEPA (implement.md, Section 5.1).
-Verifies:
-- Input: [2, 500] -> Token sequence: [2, 16, 128]
-- H_context: [2, 5, 128]
-- H_pred: [2, 11, 128]
-- H_target: [2, 11, 128]
-- Finite scalar loss
+Shape & Tensor Consistency Tests for 1D Temporal PECT-JEPA (Stage A).
+Verifies (two-channel log-time input [2, 2, 128]):
+- tokens: [2, 16, 128], H_context: [2, 5, 128], H_pred: [2, 11, 128], H_target: [2, 11, 128]
+- loss components finite; extract_features pool/full shapes
 """
 
 import torch
 import unittest
 from ..models.jepa_1d import PECT_JEPA_1D
 from ..configs.config import get_default_config_1d
+from ..data.preprocessing import build_two_channel_input
+from .synth import make_waveforms
 
 
 class TestShape1D(unittest.TestCase):
     def test_forward_shape_1d(self):
         config = get_default_config_1d()
-        config.time_samples = 500
-        config.patch_length = 32
-        config.stride = 31
-        config.embed_dim = 128
-        config.mask_strategy = "late_decay"
-        config.num_visible_early = 5
-        config.encoder_depth = 4
-        config.predictor_depth = 2
         config.device = "cpu"
-
         model = PECT_JEPA_1D(config)
         model.eval()
 
-        # Batch of 2 waveforms
-        B, T = 2, 500
-        x = torch.randn(B, T)
+        raw = make_waveforms(n=2, T=500)
+        x = torch.from_numpy(build_two_channel_input(raw))  # [2, 2, 128]
 
         out = model(x)
 
@@ -43,7 +32,6 @@ class TestShape1D(unittest.TestCase):
         ctx_idx = out["context_indices"]
         tgt_idx = out["target_indices"]
 
-        # Assertions
         self.assertEqual(ctx_idx.shape, (2, 5), f"Context indices shape mismatch: {ctx_idx.shape}")
         self.assertEqual(tgt_idx.shape, (2, 11), f"Target indices shape mismatch: {tgt_idx.shape}")
         self.assertEqual(H_context.shape, (2, 5, 128), f"H_context shape mismatch: {H_context.shape}")
@@ -53,6 +41,8 @@ class TestShape1D(unittest.TestCase):
         self.assertFalse(torch.isnan(loss).item(), "Loss is NaN")
         self.assertFalse(torch.isinf(loss).item(), "Loss is Inf")
         self.assertTrue(loss.ndim == 0, "Loss should be scalar")
+        for k in ("loss_pred", "loss_var", "loss_cov"):
+            self.assertTrue(torch.isfinite(out[k]).all(), f"{k} not finite")
 
         # Feature extraction
         feats_unpooled = model.extract_features(x, pool=False)
@@ -60,7 +50,8 @@ class TestShape1D(unittest.TestCase):
         self.assertEqual(feats_unpooled.shape, (2, 16, 128))
         self.assertEqual(feats_pooled.shape, (2, 128))
 
-        print(f"PASS: test_shape_1d.py | Input: {x.shape} -> H_ctx: {H_context.shape}, H_pred: {H_pred.shape}, Loss: {loss.item():.4f}")
+        print(f"PASS: test_shape_1d.py | Input: {tuple(x.shape)} -> H_ctx: {H_context.shape}, "
+              f"H_pred: {H_pred.shape}, Loss: {loss.item():.4f}")
 
 
 if __name__ == "__main__":

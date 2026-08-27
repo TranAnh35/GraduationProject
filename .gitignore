@@ -3,5 +3,7 @@ output/
 plot/
 web/
 __pycache__/
+checkpoints/
 
 .kilo/
+.cache/

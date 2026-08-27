@@ -1,126 +1,157 @@
 """
-CLI Training Script for 1D Temporal PECT-JEPA (TS-JEPA).
+CLI Training Script for 1D Temporal PECT-JEPA (Stage A).
 Usage:
-    python -m src.PECT_JEPA.temporal_1d.train --data_dir data --epochs 50 --batch_size 512
+    python -m src.PECT_JEPA.temporal_1d.train --data_dir data --epochs 50
+    python -m src.PECT_JEPA.temporal_1d.train --data_dir data --max_files 4 --epochs 3   # pilot
 """
 
+import argparse
+import json
 import os
 import sys
-import argparse
+
 import torch
 from torch.utils.data import DataLoader
 
-# Add project root to sys.path
-root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-if root_dir not in sys.path:
-    sys.path.insert(0, root_dir)
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
-from src.PECT_JEPA.temporal_1d.configs.config import get_default_config_1d, Temporal1DConfig
-from src.PECT_JEPA.temporal_1d.data.dataset import PECT1DDataset, collate_1d_batch
-from src.PECT_JEPA.temporal_1d.data.split import split_by_files
-from src.PECT_JEPA.temporal_1d.data.preprocessing import find_all_tdms_files
+from src.PECT_JEPA.temporal_1d.configs.config import Temporal1DConfig
+from src.PECT_JEPA.temporal_1d.data.dataset import (
+    PECT1DDataset,
+    FileBalancedBatchSampler,
+    collate_1d_batch,
+)
+from src.PECT_JEPA.temporal_1d.data.preprocessing import (
+    find_all_tdms_files,
+    parse_metadata_from_path,
+)
 from src.PECT_JEPA.temporal_1d.models.jepa_1d import PECT_JEPA_1D
 from src.PECT_JEPA.temporal_1d.training.trainer import JEPATrainer1D
+from src.PECT_JEPA.temporal_1d.data.split import split_by_files
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train 1D Temporal PECT-JEPA Model")
-    parser.add_argument("--data_dir", type=str, default="data", help="Directory containing TDMS files")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of pretraining epochs")
-    parser.add_argument("--batch_size", type=int, default=512, help="Waveform batch size")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--patch_length", type=int, default=32, help="Patch length P")
-    parser.add_argument("--stride", type=int, default=31, help="Patch stride")
-    parser.add_argument("--embed_dim", type=int, default=128, help="Token embedding dimension D")
-    parser.add_argument("--mask_strategy", type=str, default="late_decay", choices=["late_decay", "random_patch"])
-    parser.add_argument("--save_dir", type=str, default="checkpoints/pect_jepa_1d", help="Checkpoint save directory")
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    return parser.parse_args()
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser("1D Temporal PECT-JEPA (Stage A) training")
+    p.add_argument("--data_dir", type=str, default="data")
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--k_per_file", type=int, default=8)
+    p.add_argument("--max_files", type=int, default=None)
+    p.add_argument("--normalization", type=str, default="peak_early",
+                   choices=["peak_early", "zscore", "min_max"])
+    p.add_argument("--num_patches", type=int, default=16)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--save_dir", type=str, default="checkpoints/pect_jepa_1d")
+    p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True)
+    return p
 
 
 def main():
-    args = parse_args()
+    args = build_arg_parser().parse_args()
+    torch.manual_seed(args.seed)
 
-    config = get_default_config_1d()
-    config.data_dir = args.data_dir
-    config.epochs = args.epochs
-    config.batch_size = args.batch_size
-    config.learning_rate = args.lr
-    config.patch_length = args.patch_length
-    config.stride = args.stride
-    config.embed_dim = args.embed_dim
-    config.mask_strategy = args.mask_strategy
-    config.save_dir = args.save_dir
-    config.device = args.device
-    config.seed = args.seed
-
-    torch.manual_seed(config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
-
-    print("=" * 65)
-    print("1D TEMPORAL PECT-JEPA (TS-JEPA) TRAINING")
-    print(f"Data Dir: {config.data_dir}")
-    print(f"Patches: {config.num_patches} (length {config.patch_length}, stride {config.stride}) | D: {config.embed_dim}")
-    print(f"Strategy: {config.mask_strategy} | Batch Size: {config.batch_size} | Epochs: {config.epochs}")
-    print("=" * 65)
-
-    all_files = find_all_tdms_files(config.data_dir)
-    print(f"Found {len(all_files)} TDMS files in {config.data_dir}")
-    if len(all_files) == 0:
-        print("ERROR: No TDMS files found. Please verify data path.")
-        return
-
-    train_files, val_files, test_files = split_by_files(
-        all_files,
-        train_ratio=0.8,
-        val_ratio=0.2,
-        seed=config.seed
+    config = Temporal1DConfig(
+        data_dir=args.data_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        k_per_file=args.k_per_file,
+        max_files=args.max_files,
+        normalization=args.normalization,
+        num_patches=args.num_patches,
+        device=args.device,
+        seed=args.seed,
+        save_dir=args.save_dir,
+        mixed_precision=args.mixed_precision,
     )
-    print(f"Split: {len(train_files)} train files, {len(val_files)} val files, {len(test_files)} test files")
 
-    train_dataset = PECT1DDataset(
+    # ---- Data -------------------------------------------------------------
+    all_files = find_all_tdms_files(config.data_dir)
+    if config.max_files is not None:
+        all_files = all_files[: config.max_files]
+    if not all_files:
+        raise FileNotFoundError(f"No TDMS files found under: {config.data_dir}")
+    print(f"Found {len(all_files)} TDMS files.")
+
+    metadata = [parse_metadata_from_path(fp) for fp in all_files]
+    for k in ("sensor", "waveform", "liftoff"):
+        print(f"  {k}: {sorted({m[k] for m in metadata})}")
+
+    train_files, val_files, _ = split_by_files(
+        all_files, train_ratio=0.8, val_ratio=0.2, seed=config.seed
+    )
+
+    tok_pad_to = config.raw_padded_length if config.tokenizer_mode == "raw" else None
+
+    train_set = PECT1DDataset(
         file_paths=train_files,
         time_samples=config.time_samples,
+        log_time_samples=config.log_time_samples,
+        t_start_frac=config.t_start_frac,
         normalization=config.normalization,
+        early_window_frac=config.early_window_frac,
+        raster_correction=config.raster_correction,
         use_memmap=config.use_memmap,
-        cache_dir=config.cache_dir
+        cache_dir=config.cache_dir,
+        eps=config.eps,
+        pad_to=tok_pad_to,
+        pad_mode=config.pad_mode,
     )
-    val_dataset = PECT1DDataset(
+    val_set = PECT1DDataset(
         file_paths=val_files,
         time_samples=config.time_samples,
+        log_time_samples=config.log_time_samples,
+        t_start_frac=config.t_start_frac,
         normalization=config.normalization,
+        early_window_frac=config.early_window_frac,
+        raster_correction=config.raster_correction,
         use_memmap=config.use_memmap,
-        cache_dir=config.cache_dir
+        cache_dir=config.cache_dir,
+        eps=config.eps,
+        pad_to=tok_pad_to,
+        pad_mode=config.pad_mode,
     )
+    print(f"Train: {len(train_files)} files / {len(train_set)} points | "
+          f"Val: {len(val_files)} files / {len(val_set)} points")
 
-    print(f"Total training waveforms: {len(train_dataset):,} | Total validation waveforms: {len(val_dataset):,}")
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=collate_1d_batch,
-        num_workers=0
-    )
+    if config.file_balanced:
+        train_sampler = FileBalancedBatchSampler(
+            train_set.file_point_counts,
+            batch_size=config.batch_size,
+            k_per_file=config.k_per_file,
+            seed=config.seed,
+        )
+        train_loader = DataLoader(
+            train_set, batch_sampler=train_sampler,
+            collate_fn=collate_1d_batch, num_workers=0,
+            pin_memory=(config.device == "cuda"),
+        )
+    else:
+        train_loader = DataLoader(
+            train_set, batch_size=config.batch_size, shuffle=True,
+            collate_fn=collate_1d_batch, num_workers=0,
+            pin_memory=(config.device == "cuda"),
+        )
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        collate_fn=collate_1d_batch,
-        num_workers=0
+        val_set, batch_size=min(config.batch_size, 128), shuffle=False,
+        collate_fn=collate_1d_batch, num_workers=0,
+        pin_memory=(config.device == "cuda"),
     )
 
+    # ---- Model & training ---------------------------------------------------
     model = PECT_JEPA_1D(config)
-    trainer = JEPATrainer1D(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        config=config
-    )
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model params (trainable): {n_params / 1e6:.2f}M")
 
-    trainer.train()
+    trainer = JEPATrainer1D(model, train_loader, val_loader, config)
+    history = trainer.train()
+
+    history_path = os.path.join(config.save_dir, "history_1d.json")
+    with open(history_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    print(f"Training history saved to {history_path}")
 
 
 if __name__ == "__main__":

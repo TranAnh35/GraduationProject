@@ -1,59 +1,51 @@
 """
-Mask Verification Tests for 1D Temporal PECT-JEPA (implement.md, Section 5.2).
+Masking Tests for 1D Temporal PECT-JEPA (Stage A3, multi-strategy).
 Verifies:
-1. Context Indices and Target Indices are strictly disjoint (Context ∩ Target = ∅).
-2. 'late_decay' strategy preserves first 5 patches as context, masks last 11 patches as target.
-3. 'random_patch' strategy dynamically samples random patches.
+- shapes & counts constant across strategies
+- context/target disjoint
+- all three strategies sampled; per-strategy semantics
+- reproducibility with seed; invalid probability config raises
 """
 
-import numpy as np
 import torch
 import unittest
-from ..masking.temporal_mask import Dynamic1DBlockMasker
+from ..masking.temporal_mask import MultiStrategy1DMasker
 
 
 class TestMask1D(unittest.TestCase):
-    def test_late_decay_mask(self):
-        masker = Dynamic1DBlockMasker(
-            num_patches=16,
-            mask_strategy="late_decay",
-            num_visible_early=5
-        )
-        B = 4
-        ctx, tgt, mask_1d = masker.sample_mask(B)
+    def test_mask_shapes_disjoint_and_strategies(self):
+        m = MultiStrategy1DMasker(num_patches=16, num_visible=5,
+                                  strategy_probs={"late_decay": 0.4,
+                                                  "random_patch": 0.3,
+                                                  "head_from_tail": 0.3})
+        ctx, tgt, mask, sid = m.sample_mask(batch_size=300, seed=0)
+        self.assertEqual(ctx.shape, (300, 5))
+        self.assertEqual(tgt.shape, (300, 11))
+        self.assertEqual(mask.shape, (300, 16))
+        for b in range(300):
+            self.assertEqual(len(set(ctx[b].tolist()) & set(tgt[b].tolist())), 0)
+            self.assertEqual(int(mask[b][tgt[b]].sum()), 11)
+        # all three strategies must appear
+        self.assertEqual(set(sid.tolist()), {0, 1, 2})
 
-        self.assertEqual(ctx.shape, (4, 5))
-        self.assertEqual(tgt.shape, (4, 11))
+        # strategy semantics: late_decay ctx=[0..4], head_from_tail ctx=[11..15]
+        for b in range(300):
+            if sid[b] == 0:
+                self.assertEqual(ctx[b].tolist(), [0, 1, 2, 3, 4])
+            elif sid[b] == 2:
+                self.assertEqual(ctx[b].tolist(), [11, 12, 13, 14, 15])
 
-        for b in range(B):
-            c_set = set(ctx[b].tolist())
-            t_set = set(tgt[b].tolist())
-            self.assertEqual(len(c_set.intersection(t_set)), 0, "Context and Target overlap!")
-            self.assertEqual(c_set, set(range(5)), "Context is not early 5 patches [0..4]")
-            self.assertEqual(t_set, set(range(5, 16)), "Target is not late 11 patches [5..15]")
+        # reproducibility
+        ctx2, tgt2, _, sid2 = m.sample_mask(batch_size=300, seed=0)
+        self.assertTrue(torch.equal(ctx, ctx2))
+        self.assertTrue(torch.equal(tgt, tgt2))
+        self.assertTrue(torch.equal(sid, sid2))
 
-        print("PASS: test_mask_1d.py (late_decay) | Context: [0..4] (5), Target: [5..15] (11) | Disjoint: OK")
+        print("PASS: test_mask_1d.py (multi-strategy) | Disjoint: OK | 3 strategies: OK | Seeded: OK")
 
-    def test_random_patch_mask(self):
-        masker = Dynamic1DBlockMasker(
-            num_patches=16,
-            mask_strategy="random_patch",
-            mask_ratio=0.70
-        )
-        B = 4
-        ctx1, tgt1, mask1 = masker.sample_mask(B)
-        ctx2, tgt2, mask2 = masker.sample_mask(B)
-
-        for b in range(B):
-            c_set = set(ctx1[b].tolist())
-            t_set = set(tgt1[b].tolist())
-            self.assertEqual(len(c_set.intersection(t_set)), 0, "Context and Target overlap!")
-            self.assertEqual(len(c_set) + len(t_set), 16)
-
-        # Dynamic check
-        diff = torch.sum(torch.abs(mask1.float() - mask2.float())).item()
-        self.assertGreater(diff, 0, "Random mask is static across sampling passes!")
-        print(f"PASS: test_mask_1d.py (random_patch) | Disjoint: OK | Dynamic diff: {diff}")
+    def test_invalid_probs_raise(self):
+        with self.assertRaises(ValueError):
+            MultiStrategy1DMasker(strategy_probs={"late_decay": 0.5})
 
 
 if __name__ == "__main__":
