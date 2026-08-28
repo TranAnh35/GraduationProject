@@ -13,6 +13,7 @@ from typing import List, Dict, Optional, Tuple, Any, Iterator
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from .preprocessing import (
     build_two_channel_input,
@@ -94,10 +95,17 @@ class PECT1DDataset(Dataset):
         if self.use_memmap:
             os.makedirs(self.cache_dir, exist_ok=True)
 
-        for f_idx, fp in enumerate(self.file_paths):
+        pbar = tqdm(
+            enumerate(self.file_paths),
+            total=len(self.file_paths),
+            desc="[Caching/Loading PECT 1D Files]",
+            dynamic_ncols=True,
+            leave=False
+        )
+        for f_idx, fp in pbar:
             self.metadata_list.append(parse_metadata_from_path(fp))
-            arr = self._load_file(fp)  # [n_points, 2, T']
-            n_points = arr.shape[0]
+            fname = os.path.basename(fp)
+            pbar.set_postfix({"file": fname[:22]})
 
             if self.use_memmap:
                 h = hashlib.md5(
@@ -106,15 +114,25 @@ class PECT1DDataset(Dataset):
                 ).hexdigest()
                 cache_path = os.path.join(self.cache_dir, f"{h}.dat")
                 meta_path = os.path.join(self.cache_dir, f"{h}.meta")
-                if not os.path.exists(cache_path) or not os.path.exists(meta_path):
+
+                if os.path.exists(cache_path) and os.path.exists(meta_path):
+                    with open(meta_path, "r") as f:
+                        shape = tuple(int(v) for v in f.read().strip().split(","))
+                    self._cache_paths[f_idx] = (cache_path, shape)
+                    n_points = shape[0]
+                else:
+                    arr = self._load_file(fp)  # [n_points, 2, T']
+                    n_points = arr.shape[0]
                     with open(meta_path, "w") as f:
                         f.write(",".join(str(v) for v in arr.shape))
                     mm = np.memmap(cache_path, dtype="float32", mode="w+", shape=arr.shape)
                     mm[:] = arr[:]
                     mm.flush()
                     del mm
-                self._cache_paths[f_idx] = (cache_path, tuple(arr.shape))
+                    self._cache_paths[f_idx] = (cache_path, tuple(arr.shape))
             else:
+                arr = self._load_file(fp)
+                n_points = arr.shape[0]
                 self._in_memory_files[f_idx] = arr
 
             self.file_point_counts.append(n_points)
@@ -217,13 +235,19 @@ class FileBalancedBatchSampler:
                 batch.extend(self._offsets[f] + p for p in pts)
             # top-up if some chosen files had fewer points than requested
             in_batch = set(batch)
-            while len(batch) < self.batch_size:
+            attempts = 0
+            while len(batch) < self.batch_size and attempts < 5000:
                 f = rng.randrange(n_files)
                 p = rng.randrange(self.file_point_counts[f])
                 idx = self._offsets[f] + p
                 if idx not in in_batch:
                     in_batch.add(idx)
                     batch.append(idx)
+                attempts += 1
+            while len(batch) < self.batch_size:
+                f = rng.randrange(n_files)
+                p = rng.randrange(self.file_point_counts[f])
+                batch.append(self._offsets[f] + p)
             yield batch
 
 

@@ -57,13 +57,13 @@ def parse_metadata_from_path(file_path: str) -> Dict[str, Any]:
         elif "square" in p_lower:
             waveform = "Square"
 
-    # Search liftoff in filename (e.g. z1, z2, z3, lf_1mm, etc.)
-    if "z1" in filename or "1mm" in filename:
-        liftoff = "1mm"
-    elif "z2" in filename or "2mm" in filename:
-        liftoff = "2mm"
-    elif "z3" in filename or "3mm" in filename:
-        liftoff = "3mm"
+    # Search liftoff in filename (z1, z2, z3)
+    if "z1" in filename or "z1" in norm_path.lower():
+        liftoff = "z1"
+    elif "z2" in filename or "z2" in norm_path.lower():
+        liftoff = "z2"
+    elif "z3" in filename or "z3" in norm_path.lower():
+        liftoff = "z3"
 
     return {
         "file_path": file_path,

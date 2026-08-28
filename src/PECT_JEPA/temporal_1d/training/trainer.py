@@ -98,6 +98,11 @@ class JEPATrainer1D:
                 out = self.model(x)
                 loss = out["loss"]
 
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[Warning] NaN/Inf loss detected at step {self.global_step}. Skipping batch update.", flush=True)
+                self.optimizer.zero_grad()
+                continue
+
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
@@ -109,7 +114,8 @@ class JEPATrainer1D:
             current_lr = self.lr_scheduler.step(self.global_step)
             self.global_step += 1
 
-            sums["loss"] += loss.item()
+            loss_val = float(loss.item())
+            sums["loss"] += loss_val
             for k in ("loss_pred", "loss_var", "loss_cov"):
                 sums[k] += float(out[k].item())
             n += 1

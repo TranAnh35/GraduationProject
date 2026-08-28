@@ -23,12 +23,19 @@ def split_by_files(
     rng.shuffle(shuffled)
 
     n_total = len(shuffled)
-    n_train = int(n_total * train_ratio)
-    n_val = int(n_total * val_ratio)
+    if n_total <= 1:
+        return shuffled, shuffled, []
+    
+    n_val = max(1, int(n_total * val_ratio))
+    n_train = max(1, n_total - n_val)
+    if n_train + n_val > n_total:
+        n_val = max(1, n_total - n_train)
 
     train_files = shuffled[:n_train]
-    val_files = shuffled[n_train : n_train + n_val]
-    test_files = shuffled[n_train + n_val :]
+    val_files = shuffled[n_train: n_train + n_val]
+    test_files = shuffled[n_train + n_val:]
+    if len(val_files) == 0:
+        val_files = [shuffled[-1]]
 
     return train_files, val_files, test_files
 
@@ -75,17 +82,17 @@ def split_cross_waveform(
 
 def split_cross_liftoff(
     metadata_list: List[Dict[str, Any]],
-    test_liftoff: str = "3mm"
+    test_liftoff: str = "z3"
 ) -> Tuple[List[str], List[str]]:
     """
-    Hold out test_liftoff for evaluation, train on other lift-off heights.
+    Hold out test_liftoff (e.g. 'z1', 'z2', 'z3') for evaluation, train on remaining lift-off levels.
     """
     train_files = []
     test_files = []
 
     for meta in metadata_list:
         fp = meta["file_path"]
-        if test_liftoff.lower() in meta["liftoff"].lower():
+        if meta["liftoff"].lower() == test_liftoff.lower() or test_liftoff.lower() in meta["liftoff"].lower():
             test_files.append(fp)
         else:
             train_files.append(fp)

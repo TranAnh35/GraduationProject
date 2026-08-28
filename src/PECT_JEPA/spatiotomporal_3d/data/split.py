@@ -70,7 +70,7 @@ def split_cross_waveform(
 
 def split_cross_liftoff(
     metadata_list: List[Dict[str, Any]],
-    test_liftoff: str = "3mm"
+    test_liftoff: str = "z3"
 ) -> Tuple[List[str], List[str]]:
     """
     Split files for Cross-Lift-off generalization evaluation (Section 18.4).

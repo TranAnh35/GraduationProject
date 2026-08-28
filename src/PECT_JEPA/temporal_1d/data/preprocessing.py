@@ -44,16 +44,12 @@ def parse_metadata_from_path(file_path: str) -> Dict[str, Any]:
             waveform = val
             break
 
-    # 3. Lift-off
+    # 3. Lift-off (z1, z2, z3)
     liftoff = "Unknown"
-    liftoff_match = re.search(r'(\d+mm)', norm_path, re.IGNORECASE)
-    if liftoff_match:
-        liftoff = liftoff_match.group(1).lower()
-    else:
-        for lo in ["3mm", "2mm", "1mm", "z1", "z2", "z3"]:
-            if lo in norm_path.lower():
-                liftoff = lo
-                break
+    for z in ["z1", "z2", "z3"]:
+        if z in filename.lower() or z in norm_path.lower():
+            liftoff = z
+            break
 
     # 4. Defect type
     defect = "Unknown"
@@ -106,44 +102,44 @@ def read_tdms_1d_waveforms(
     Returns:
         waveforms: np.ndarray of shape [N_waveforms, target_time_samples] (float32)
     """
-    tdms_file = TdmsFile.read(file_path)
-    groups = tdms_file.groups()
-    if len(groups) == 0:
-        raise ValueError(f"No groups found in TDMS file: {file_path}")
+    with TdmsFile.read(file_path) as tdms_file:
+        if "Freq_Sampling_SizeX_SizeY" in tdms_file:
+            infor = tdms_file["Freq_Sampling_SizeX_SizeY"].channels()[0][:]
+            f = float(infor[0])
+            sampling = float(infor[1])
+            sX = int(infor[2])
+            sY = int(infor[3])
+            samples = int(sampling / f)
+        else:
+            sX, sY, samples = 300, 300, 500
 
-    # Extract all channels
-    channels = groups[0].channels()
-    if len(channels) == 0:
-        raise ValueError(f"No channels found in TDMS group: {groups[0].name}")
+        if "Waveform" in tdms_file:
+            raw_data = tdms_file["Waveform"].channels()[0][:]
+        else:
+            groups = tdms_file.groups()
+            raw_data = groups[-1].channels()[0][:]
 
-    # Read channel arrays
-    raw_list = [ch.data[:] for ch in channels]
-    raw_2d = np.array(raw_list, dtype=np.float32)  # [n_channels, raw_time_samples]
+    n_waveforms = len(raw_data) // samples
+    data_2d = np.reshape(raw_data[:n_waveforms * samples], (n_waveforms, samples)).astype(np.float32)
 
-    # If shape is [sY * sX, T_raw], rearrange raster if needed
-    N_ch, T_raw = raw_2d.shape
+    # Downsample / resample temporal dimension if needed
+    if samples != target_time_samples:
+        indices = np.linspace(0, samples - 1, target_time_samples).astype(np.int64)
+        data_2d = data_2d[:, indices]
 
-    # Determine spatial grid if square scan (e.g. 300x300 = 90000 channels)
-    side = int(np.round(np.sqrt(N_ch)))
-    if side * side == N_ch and raster_correction:
-        cube = raw_2d.reshape(side, side, T_raw)
-        # Reverse odd rows
-        cube[1::2, :, :] = cube[1::2, ::-1, :]
-        raw_2d = cube.reshape(N_ch, T_raw)
+    # Rearrange bidirectional raster lines if spatial width sX is known
+    if raster_correction and sX > 0 and data_2d.shape[0] >= sX * 2:
+        n_rows = data_2d.shape[0] // sX
+        grid = data_2d[:n_rows * sX].reshape(n_rows, sX, target_time_samples)
+        grid[1::2, :, :] = grid[1::2, ::-1, :]
+        data_2d[:n_rows * sX] = grid.reshape(n_rows * sX, target_time_samples)
 
-    # Resample temporal dimension if needed
-    if T_raw != target_time_samples:
-        indices = np.linspace(0, T_raw - 1, target_time_samples).astype(np.int64)
-        raw_2d = raw_2d[:, indices]
-
-    # Legacy Min-Max normalization per-file (kept for ablation;
-    # the default Stage A pipeline uses build_two_channel_input instead)
     if normalization == "min_max":
-        f_min = float(np.min(raw_2d))
-        f_max = float(np.max(raw_2d))
-        raw_2d = (raw_2d - f_min) / (f_max - f_min + eps)
+        f_min = float(np.min(data_2d))
+        f_max = float(np.max(data_2d))
+        data_2d = (data_2d - f_min) / (f_max - f_min + eps)
 
-    return raw_2d.astype(np.float32)
+    return data_2d.astype(np.float32)
 
 
 def linear_time_grid_ms(
@@ -268,7 +264,10 @@ def normalize_waveforms(
         T = x.shape[-1]
         w = max(1, int(early_window_frac * T))
         peak = np.max(np.abs(x[..., :w]), axis=-1, keepdims=True)
-        return (x / (peak + eps)).astype(np.float32)
+        global_peak = np.max(np.abs(x), axis=-1, keepdims=True)
+        # Fallback to global peak if early window has negligible amplitude (e.g. Gaussian or Chirp)
+        effective_peak = np.where(peak > 0.05 * global_peak, peak, global_peak)
+        return (x / (effective_peak + eps)).astype(np.float32)
     elif normalization == "zscore":
         mu = x.mean(axis=-1, keepdims=True)
         sd = x.std(axis=-1, keepdims=True)
@@ -327,7 +326,13 @@ def build_two_channel_input(
     # context/target split (caught by test_leakage_1d).
     mu = ch1[..., :n_early].mean(axis=-1, keepdims=True)
     sd = ch1[..., :n_early].std(axis=-1, keepdims=True)
-    ch1 = (ch1 - mu) / (sd + eps)
+    # Lower-bound sd to prevent division-by-near-zero on flat baseline windows
+    sd = np.maximum(sd, 0.1)
+    ch1 = (ch1 - mu) / sd
+
+    # Numerical clip to strictly prevent FP16 overflow under mixed-precision AMP
+    ch0 = np.clip(ch0, -10.0, 10.0)
+    ch1 = np.clip(ch1, -10.0, 10.0)
 
     if pad_to is not None:
         # Pad CONTENT (time axis continues forward in the tokenizer's pos embed)

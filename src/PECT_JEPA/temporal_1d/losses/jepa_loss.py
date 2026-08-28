@@ -39,13 +39,14 @@ class JEPALoss1D(nn.Module):
     def latent_prediction_loss(
         self, H_pred: torch.Tensor, H_target: torch.Tensor
     ) -> torch.Tensor:
+        safe_eps = max(self.eps, 1e-5)
         if self.loss_type == "normalized_l2":
-            pred = F.normalize(H_pred, p=2, dim=-1, eps=self.eps)
-            tgt = F.normalize(H_target, p=2, dim=-1, eps=self.eps)
+            pred = F.normalize(H_pred, p=2, dim=-1, eps=safe_eps)
+            tgt = F.normalize(H_target, p=2, dim=-1, eps=safe_eps)
             return torch.mean(torch.sum((pred - tgt) ** 2, dim=-1))
         elif self.loss_type == "cosine":
-            pred = F.normalize(H_pred, p=2, dim=-1, eps=self.eps)
-            tgt = F.normalize(H_target, p=2, dim=-1, eps=self.eps)
+            pred = F.normalize(H_pred, p=2, dim=-1, eps=safe_eps)
+            tgt = F.normalize(H_target, p=2, dim=-1, eps=safe_eps)
             return torch.mean(1.0 - torch.sum(pred * tgt, dim=-1))
         elif self.loss_type == "smooth_l1":
             return F.smooth_l1_loss(H_pred, H_target)
@@ -56,7 +57,8 @@ class JEPALoss1D(nn.Module):
         """Mean over embedding dimensions D of max(0, gamma - std_batch)."""
         B, N, D = H_pred.shape
         z = H_pred.reshape(B * N, D)
-        std = torch.sqrt(z.var(dim=0) + self.eps)  # [D]
+        safe_eps = max(self.eps, 1e-5)
+        std = torch.sqrt(z.var(dim=0, unbiased=False) + safe_eps)  # [D]
         return torch.mean(F.relu(self.var_gamma - std))
 
     def covariance_penalty(self, H_pred: torch.Tensor) -> torch.Tensor:

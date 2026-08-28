@@ -21,7 +21,7 @@ from .anomaly import RepresentationAnomalyDetector
 def evaluate_cross_liftoff(
     model: PECT_JEPA,
     all_file_paths: List[str],
-    test_liftoff: str = "3mm",
+    test_liftoff: str = "z3",
     device: str = "cuda"
 ) -> Dict[str, Any]:
     """

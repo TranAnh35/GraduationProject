@@ -1,10 +1,9 @@
 """
 Downstream Evaluation Script for 1D Temporal PECT-JEPA (TS-JEPA).
-Evaluates representations on 1D waveforms with tqdm progress tracking:
-1. Anomaly Detection / Feature space separation
-2. Cross-Sensor evaluation
-3. Cross-Wave evaluation
-4. Cross-Lift-off evaluation
+Evaluates representations on 1D waveforms with rich tqdm progress tracking:
+1. Cross-Sensor Generalization
+2. Cross-Waveform Generalization
+3. Cross-Lift-off Generalization
 100% self-contained within temporal_1d.
 """
 
@@ -15,7 +14,7 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 # Add project root to sys.path
 root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -28,17 +27,21 @@ from src.PECT_JEPA.temporal_1d.data.dataset import PECT1DDataset, collate_1d_bat
 from src.PECT_JEPA.temporal_1d.data.preprocessing import find_all_tdms_files
 from src.PECT_JEPA.temporal_1d.data.split import split_cross_sensor, split_cross_waveform, split_cross_liftoff
 from src.PECT_JEPA.temporal_1d.evaluation.anomaly_1d import WaveformAnomalyDetector
-from src.PECT_JEPA.temporal_1d.evaluation.visualization_1d import plot_waveform_anomaly_map_1d, plot_latent_tsne_1d
+from src.PECT_JEPA.temporal_1d.evaluation.visualization_1d import plot_waveform_anomaly_map_1d
 
 
-def evaluate_cross_sensor_1d(
+def run_split_evaluation(
     model: PECT_JEPA_1D,
-    all_file_paths: List[str],
-    test_sensor: str = "TMR",
+    train_files: List[str],
+    test_files: List[str],
+    task_name: str,
+    target_domain: str,
     device: str = "cuda",
     batch_size: int = 512,
-    save_plots: bool = True
+    save_plots: bool = True,
+    use_memmap: bool = True
 ) -> Dict[str, Any]:
+    """Generic evaluation runner for a single train/test split."""
     dev = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
     model.to(dev)
     model.eval()
@@ -48,73 +51,86 @@ def evaluate_cross_sensor_1d(
         if getattr(model.config, "tokenizer_mode", "resampled") == "raw"
         else None
     )
-    sample_dataset = PECT1DDataset(
-        file_paths=all_file_paths, time_samples=model.config.time_samples,
-        use_memmap=False, pad_to=ev_pad_to, pad_mode=model.config.pad_mode)
-    train_files, test_files = split_cross_sensor(sample_dataset.metadata_list, test_sensor=test_sensor)
 
-    print(f"\n[1D Cross-Sensor Evaluation: Target={test_sensor}] {len(train_files)} train files, {len(test_files)} test files")
+    train_ds = PECT1DDataset(
+        file_paths=train_files, time_samples=model.config.time_samples,
+        log_time_samples=model.config.log_time_samples,
+        normalization=model.config.normalization,
+        use_memmap=use_memmap, cache_dir=model.config.cache_dir,
+        pad_to=ev_pad_to, pad_mode=model.config.pad_mode
+    )
+    test_ds = PECT1DDataset(
+        file_paths=test_files, time_samples=model.config.time_samples,
+        log_time_samples=model.config.log_time_samples,
+        normalization=model.config.normalization,
+        use_memmap=use_memmap, cache_dir=model.config.cache_dir,
+        pad_to=ev_pad_to, pad_mode=model.config.pad_mode
+    )
 
-    train_ds = PECT1DDataset(file_paths=train_files, time_samples=model.config.time_samples,
-                             use_memmap=False, pad_to=ev_pad_to, pad_mode=model.config.pad_mode)
-    test_ds = PECT1DDataset(file_paths=test_files, time_samples=model.config.time_samples,
-                            use_memmap=False, pad_to=ev_pad_to, pad_mode=model.config.pad_mode)
+    if len(train_ds) == 0 or len(test_ds) == 0:
+        return {"error": f"Empty dataset for {target_domain}"}
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_1d_batch)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_1d_batch)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_1d_batch, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_1d_batch, num_workers=0)
 
-    # 1. Fit clustering normal bank on source sensors
+    # 1. Extract and fit clustering prototype bank on train features
     train_features = []
     with torch.no_grad():
-        for batch in tqdm(train_loader, desc=f"Fitting Clustering Normal Bank ({test_sensor})", dynamic_ncols=True, leave=False):
+        for batch in tqdm(train_loader, desc=f"  [Train Feature Bank: {target_domain[:18]}]", dynamic_ncols=True, leave=False):
             x = batch["data"].to(dev)
-            feats = model.extract_features(x, pool=True)  # [B, D]
+            feats = model.extract_features(x, pool=True)
             train_features.append(feats.cpu())
 
-    if len(train_features) > 0:
-        train_tensor = torch.cat(train_features, dim=0)
-        # Unsupervised Latent Clustering
-        detector = WaveformAnomalyDetector(method="clustering", n_clusters=2)
-        detector.fit(train_tensor)
+    if len(train_features) == 0:
+        return {"error": "Failed to extract train features"}
 
-        test_scores = []
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc=f"Scoring Test Sensor ({test_sensor})", dynamic_ncols=True, leave=False):
-                x = batch["data"].to(dev)
-                feats = model.extract_features(x, pool=True)
-                scores = detector.score(feats)
-                test_scores.append(scores)
+    train_tensor = torch.cat(train_features, dim=0)
+    detector = WaveformAnomalyDetector(method="clustering", n_clusters=2)
+    detector.fit(train_tensor)
 
-        all_scores = np.concatenate(test_scores)
+    # 2. Score test domain waveforms
+    test_scores = []
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc=f"  [Scoring Target Domain: {target_domain[:18]}]", dynamic_ncols=True, leave=False):
+            x = batch["data"].to(dev)
+            feats = model.extract_features(x, pool=True)
+            scores = detector.score(feats)
+            test_scores.append(scores)
 
-        if save_plots and len(all_scores) >= 90000:
-            # First 90,000 points represent the first 300x300 scan
-            first_scan_scores = all_scores[:90000]
-            plot_path = f"results/plots/1d/cross_sensor/{test_sensor}_scan_1.png"
+    all_scores = np.concatenate(test_scores)
+
+    if save_plots and len(all_scores) >= 90000:
+        os.makedirs(f"results/plots/1d/{task_name}", exist_ok=True)
+        first_scan_scores = all_scores[:90000]
+        plot_path = f"results/plots/1d/{task_name}/{target_domain}_scan_1.png"
+        try:
             plot_waveform_anomaly_map_1d(
                 anomaly_scores=first_scan_scores,
                 grid_shape=(300, 300),
                 save_path=plot_path,
-                title=f"1D Temporal JEPA ({test_sensor}) - Native Point-Wise 300x300 Heatmap"
+                title=f"1D JEPA ({task_name}: {target_domain}) - 300x300 Anomaly Heatmap"
             )
+        except Exception:
+            pass
 
-        return {
-            "test_sensor": test_sensor,
-            "num_train_waveforms": len(train_ds),
-            "num_test_waveforms": len(test_ds),
-            "mean_anomaly_score": float(np.mean(all_scores))
-        }
-
-    return {"error": "No train features extracted"}
+    return {
+        "task": task_name,
+        "target": target_domain,
+        "num_train": len(train_ds),
+        "num_test": len(test_ds),
+        "mean_anomaly_score": float(np.mean(all_scores)),
+        "std_anomaly_score": float(np.std(all_scores)),
+    }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate 1D Temporal PECT-JEPA representations")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to 1D model checkpoint .pt")
     parser.add_argument("--data_dir", type=str, default="data", help="Directory containing TDMS files")
-    parser.add_argument("--task", type=str, default="all", choices=["all", "sensor"], help="Evaluation task")
+    parser.add_argument("--task", type=str, default="all", choices=["all", "sensor", "waveform", "liftoff"], help="Evaluation task")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
+    parser.add_argument("--save_plots", type=lambda v: v.lower() == "true", default=True, help="Save C-Scan heatmaps")
     return parser.parse_args()
 
 
@@ -142,16 +158,52 @@ def main():
         print("ERROR: No TDMS files found.")
         return
 
-    if args.task in ["all", "sensor"]:
-        print("\n" + "=" * 55)
-        print("RUNNING 1D CROSS-SENSOR EVALUATION")
-        print("=" * 55)
-        sensors = ["TMR", "Hall_Pot_Core", "Differential_Pot_Core", "Hall_Air_Core"]
-        for target_sensor in tqdm(sensors, desc="1D Cross-Sensor Tasks", dynamic_ncols=True):
-            res = evaluate_cross_sensor_1d(model, all_files, test_sensor=target_sensor, device=args.device, batch_size=args.batch_size)
-            print(f"Target Sensor: {target_sensor} | Mean Anomaly Score: {res.get('mean_anomaly_score', 'N/A')}")
+    # Index files once to parse metadata
+    sample_dataset = PECT1DDataset(
+        file_paths=all_files,
+        time_samples=model.config.time_samples,
+        use_memmap=True,
+        cache_dir=model.config.cache_dir,
+    )
+    meta_list = sample_dataset.metadata_list
 
-    print("\n--- 1D Evaluation Finished ---")
+    # ---------------- 1. Cross-Sensor Evaluation ----------------
+    if args.task in ["all", "sensor"]:
+        print("\n" + "=" * 65)
+        print("RUNNING 1D CROSS-SENSOR GENERALIZATION EVALUATION")
+        print("=" * 65)
+        sensors = sorted(list({m["sensor"] for m in meta_list if m["sensor"] != "Unknown"}))
+        for target in tqdm(sensors, desc="Cross-Sensor Benchmarks", dynamic_ncols=True):
+            train_f, test_f = split_cross_sensor(meta_list, test_sensor=target)
+            res = run_split_evaluation(model, train_f, test_f, "cross_sensor", target,
+                                       device=args.device, batch_size=args.batch_size, save_plots=args.save_plots)
+            print(f"  [Sensor: {target:<22}] Score: {res.get('mean_anomaly_score', 'N/A'):.5f} | Train: {res.get('num_train', 0)} | Test: {res.get('num_test', 0)}")
+
+    # ---------------- 2. Cross-Waveform Evaluation ----------------
+    if args.task in ["all", "waveform"]:
+        print("\n" + "=" * 65)
+        print("RUNNING 1D CROSS-WAVEFORM GENERALIZATION EVALUATION")
+        print("=" * 65)
+        waveforms = sorted(list({m["waveform"] for m in meta_list if m["waveform"] != "Unknown"}))
+        for target in tqdm(waveforms, desc="Cross-Waveform Benchmarks", dynamic_ncols=True):
+            train_f, test_f = split_cross_waveform(meta_list, test_waveform=target)
+            res = run_split_evaluation(model, train_f, test_f, "cross_waveform", target,
+                                       device=args.device, batch_size=args.batch_size, save_plots=args.save_plots)
+            print(f"  [Waveform: {target:<20}] Score: {res.get('mean_anomaly_score', 'N/A'):.5f} | Train: {res.get('num_train', 0)} | Test: {res.get('num_test', 0)}")
+
+    # ---------------- 3. Cross-Lift-off Evaluation ----------------
+    if args.task in ["all", "liftoff"]:
+        print("\n" + "=" * 65)
+        print("RUNNING 1D CROSS-LIFT-OFF GENERALIZATION EVALUATION")
+        print("=" * 65)
+        liftoffs = sorted(list({m["liftoff"] for m in meta_list if m["liftoff"] != "Unknown"}))
+        for target in tqdm(liftoffs, desc="Cross-Liftoff Benchmarks", dynamic_ncols=True):
+            train_f, test_f = split_cross_liftoff(meta_list, test_liftoff=target)
+            res = run_split_evaluation(model, train_f, test_f, "cross_liftoff", target,
+                                       device=args.device, batch_size=args.batch_size, save_plots=args.save_plots)
+            print(f"  [Lift-off: {target:<20}] Score: {res.get('mean_anomaly_score', 'N/A'):.5f} | Train: {res.get('num_train', 0)} | Test: {res.get('num_test', 0)}")
+
+    print("\n--- 1D Downstream Evaluation Finished ---")
 
 
 if __name__ == "__main__":

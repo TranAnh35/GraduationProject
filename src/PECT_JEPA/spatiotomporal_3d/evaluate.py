@@ -86,7 +86,7 @@ def main():
         print("\n" + "=" * 55)
         print("RUNNING CROSS-LIFT-OFF EVALUATION (Section 18.4)")
         print("=" * 55)
-        liftoffs = ["3mm", "2mm", "1mm"]
+        liftoffs = ["z1", "z2", "z3"]
         for target_liftoff in tqdm(liftoffs, desc="Cross-Liftoff Tasks", dynamic_ncols=True):
             res = evaluate_cross_liftoff(model, all_files, test_liftoff=target_liftoff, device=args.device)
             print(f"Target Lift-off: {target_liftoff} | Evaluated {res.get('num_test_files', 0)} files")
