@@ -8,6 +8,7 @@ Reuses v1 optimizer/schedulers. Adds:
 """
 
 import os
+import time
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from typing import Optional, Dict, Any
 import torch
@@ -18,6 +19,7 @@ from ..models.jepa_1d import PECT_JEPA_1D
 from ..configs.config import Temporal1DConfig
 from .optimizer import build_optimizer_1d, WarmupCosineLRScheduler1D, EMAScheduler1D
 from ..probing.probe_matrix import extract_pooled_features, effective_rank
+from ..utils.logger import PECTExperimentLogger
 
 
 class JEPATrainer1D:
@@ -28,12 +30,14 @@ class JEPATrainer1D:
         model: PECT_JEPA_1D,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
-        config: Optional[Temporal1DConfig] = None
+        config: Optional[Temporal1DConfig] = None,
+        logger: Optional[PECTExperimentLogger] = None
     ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config or model.config
+        self.logger = logger or PECTExperimentLogger(self.config)
 
         self.device = torch.device(
             self.config.device if torch.cuda.is_available() and self.config.device == "cuda" else "cpu"
@@ -99,25 +103,45 @@ class JEPATrainer1D:
                 loss = out["loss"]
 
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n[Warning] NaN/Inf loss detected at step {self.global_step}. Skipping batch update.", flush=True)
+                self.logger.warning(f"NaN/Inf loss detected at step {self.global_step}. Skipping batch update.")
                 self.optimizer.zero_grad()
                 continue
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip))
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             momentum = self.ema_scheduler.get_momentum(self.global_step)
             self.model.update_target_encoder(momentum=momentum)
             current_lr = self.lr_scheduler.step(self.global_step)
-            self.global_step += 1
 
             loss_val = float(loss.item())
+            loss_pred_val = float(out["loss_pred"].item())
+            loss_var_val = float(out["loss_var"].item())
+            loss_cov_val = float(out["loss_cov"].item())
+
+            # Log high-frequency step metrics to TensorBoard & CSV
+            self.logger.log_step(
+                step=self.global_step,
+                metrics={
+                    "loss": loss_val,
+                    "loss_pred": loss_pred_val,
+                    "loss_var": loss_var_val,
+                    "loss_cov": loss_cov_val,
+                    "lr": current_lr,
+                    "momentum": momentum,
+                    "grad_norm": grad_norm,
+                },
+                epoch=epoch + 1
+            )
+            self.global_step += 1
+
             sums["loss"] += loss_val
-            for k in ("loss_pred", "loss_var", "loss_cov"):
-                sums[k] += float(out[k].item())
+            sums["loss_pred"] += loss_pred_val
+            sums["loss_var"] += loss_var_val
+            sums["loss_cov"] += loss_cov_val
             n += 1
             pbar.set_postfix({
                 "loss": f"{sums['loss'] / n:.5f}",
@@ -128,6 +152,7 @@ class JEPATrainer1D:
             })
 
         return {k: v / max(1, n) for k, v in sums.items()}
+
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
         if self.val_loader is None or len(self.val_loader) == 0:
@@ -161,11 +186,14 @@ class JEPATrainer1D:
         torch.save(checkpoint, path)
 
     def train(self) -> Dict[str, Any]:
-        print(f"--- Starting 1D Temporal PECT-JEPA (Stage A) Training "
-              f"({self.total_epochs} epochs, device={self.device}) ---")
+        self.logger.info(
+            f"--- Starting 1D Temporal PECT-JEPA Training "
+            f"({self.total_epochs} epochs, {self.steps_per_epoch} steps/epoch, device={self.device}) ---"
+        )
         history: Dict[str, list] = {"train_loss": [], "val_loss": [], "effective_rank": []}
 
         for epoch in range(self.total_epochs):
+            t_start = time.time()
             if hasattr(self.train_loader, "batch_sampler") and hasattr(
                 self.train_loader.batch_sampler, "set_epoch"
             ):
@@ -174,23 +202,48 @@ class JEPATrainer1D:
             epoch_metrics = self.train_epoch(epoch)
             history["train_loss"].append(epoch_metrics["loss"])
 
+            val_metrics = {}
             if self.val_loader is not None and (epoch + 1) % self.config.val_interval == 0:
                 val_metrics = self.evaluate()
                 val_loss = val_metrics.get("val_loss", float("inf"))
+                eff_rank = val_metrics.get("effective_rank", 0.0)
                 history["val_loss"].append(val_loss)
-                history["effective_rank"].append(val_metrics.get("effective_rank", 0.0))
-                print(f"--> Epoch {epoch + 1} Evaluation - Val Loss: {val_loss:.6f} | "
-                      f"Effective Rank: {val_metrics.get('effective_rank', float('nan')):.1f}")
+                history["effective_rank"].append(eff_rank)
+                
+                self.logger.info(
+                    f"Epoch [{epoch + 1}/{self.total_epochs}] Evaluation: "
+                    f"Val Loss = {val_loss:.6f} | Effective Rank = {eff_rank:.2f}"
+                )
 
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     best_path = os.path.join(self.save_dir, "best_model_1d.pt")
                     self.save_checkpoint(best_path, epoch, val_metrics)
-                    print(f"Saved new best 1D model to {best_path}")
+                    # Also save in experiment run directory
+                    exp_best_path = os.path.join(self.logger.run_dir, "best_model_1d.pt")
+                    self.save_checkpoint(exp_best_path, epoch, val_metrics)
+                    self.logger.info(f"--> Saved new BEST model: Val Loss = {val_loss:.6f} to {best_path}")
+
+            # Log epoch metrics to TensorBoard, CSV, WandB
+            t_epoch = time.time() - t_start
+            epoch_log_dict = {
+                "train_loss": epoch_metrics["loss"],
+                "lr": self.lr_scheduler.get_lr(self.global_step),
+                "time_sec": t_epoch,
+                **val_metrics
+            }
+            self.logger.log_epoch(epoch + 1, epoch_log_dict, step=self.global_step)
+
+            # Optional weight histograms
+            if getattr(self.config, "log_histograms", False) and (epoch + 1) % 5 == 0:
+                self.logger.log_model_histograms(self.model, self.global_step)
 
             latest_path = os.path.join(self.save_dir, "latest_model_1d.pt")
             self.save_checkpoint(latest_path, epoch, epoch_metrics)
+            exp_latest_path = os.path.join(self.logger.run_dir, "latest_model_1d.pt")
+            self.save_checkpoint(exp_latest_path, epoch, epoch_metrics)
 
-        print("--- 1D Temporal PECT-JEPA Training Completed ---")
+        self.logger.info("--- 1D Temporal PECT-JEPA Training Completed ---")
+        self.logger.close()
         return history
 

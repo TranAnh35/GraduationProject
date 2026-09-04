@@ -82,9 +82,18 @@ class Temporal1DConfig:
     grad_clip: float = 1.0
     mixed_precision: bool = True
     device: str = "cuda"
+    # --------------------------------------------------- Experiment & Logging
+    exp_name: str = "jepa_1d_base"
+    log_dir: str = "experiments/1d"
     save_dir: str = "checkpoints/pect_jepa_1d"
     log_interval: int = 20
     val_interval: int = 1
+    use_tensorboard: bool = True
+    use_wandb: bool = False
+    wandb_project: str = "PECT_JEPA_1D"
+    wandb_entity: Optional[str] = None
+    log_histograms: bool = False
+    log_image_interval: int = 5
     seed: int = 42
 
     def to_dict(self) -> Dict[str, Any]:

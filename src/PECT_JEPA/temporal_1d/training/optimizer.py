@@ -5,7 +5,7 @@ Optimizer and Schedulers for 1D Temporal PECT-JEPA.
 import math
 import torch
 import torch.nn as nn
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 def build_optimizer_1d(
@@ -63,6 +63,15 @@ class WarmupCosineLRScheduler1D:
             param_group["lr"] = lr
 
         return lr
+
+    def get_lr(self, current_step: Optional[int] = None) -> float:
+        if current_step is None:
+            return self.optimizer.param_groups[0]["lr"]
+        if current_step < self.warmup_steps:
+            return self.base_lr * (current_step + 1) / max(1, self.warmup_steps)
+        progress = (current_step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        return self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
 class EMAScheduler1D:
