@@ -4,6 +4,11 @@ plot/
 web/
 __pycache__/
 checkpoints/
+experiments/
+results/
+*.zip
+*.pt
+*.pth
 
 .kilo/
 .cache/

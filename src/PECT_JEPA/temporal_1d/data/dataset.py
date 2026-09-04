@@ -165,9 +165,12 @@ class PECT1DDataset(Dataset):
         file_idx, point_idx = self.sample_index[idx]
 
         if file_idx in self._cache_paths:
-            cache_path, shape = self._cache_paths[file_idx]
-            mm = np.memmap(cache_path, dtype="float32", mode="r", shape=shape)
-            item = np.array(mm[point_idx], copy=True)
+            if not hasattr(self, "_mm_handles"):
+                self._mm_handles = {}
+            if file_idx not in self._mm_handles:
+                cache_path, shape = self._cache_paths[file_idx]
+                self._mm_handles[file_idx] = np.memmap(cache_path, dtype="float32", mode="r", shape=shape)
+            item = np.array(self._mm_handles[file_idx][point_idx], copy=True)
         elif self._data is not None:
             item = self._data[point_idx]
         else:
