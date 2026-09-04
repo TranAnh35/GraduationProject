@@ -35,6 +35,7 @@ class Temporal1DConfig:
     raw_padded_length: int = 512     # B0 only: padded length, must be divisible by num_patches
     raster_correction: bool = True   # Rearrange bidirectional raster lines (TDMS)
     use_memmap: bool = True
+    preload_ram: bool = False        # Preload memmap arrays into RAM for 100x speedup if RAM >= 8GB
     cache_dir: str = ".cache/pect_1d_mmap"
     eps: float = 1e-8
     max_files: Optional[int] = None  # Limit number of files (debug / pilot runs)

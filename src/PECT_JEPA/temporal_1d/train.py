@@ -47,9 +47,9 @@ from src.PECT_JEPA.temporal_1d.utils.logger import PECTExperimentLogger
 def get_optimal_num_workers(requested_workers: Any = "auto") -> int:
     """
     Dynamically determines the optimal num_workers based on HPC/environment constraints:
-    - If SLURM_CPUS_PER_TASK is set, respects allocated SLURM cpus (caps at allocated - 1).
+    - If SLURM_CPUS_PER_TASK is set, respects allocated SLURM cpus (caps at min(4, allocated - 1)).
     - If user specifies an integer (e.g. 0, 2, 4), uses it directly.
-    - If 'auto', safely chooses min(4, available_cpus // 2) to avoid hogging resources on shared nodes.
+    - If 'auto', safely chooses min(4, max(2, available_cpus // 2)).
     """
     if requested_workers is not None and str(requested_workers).lower() != "auto":
         try:
@@ -70,14 +70,9 @@ def get_optimal_num_workers(requested_workers: Any = "auto") -> int:
     try:
         available_cores = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
-        available_cores = os.cpu_count() or 2
+        available_cores = os.cpu_count() or 4
 
-    if available_cores <= 2:
-        return 0
-    elif available_cores <= 8:
-        return 2
-    else:
-        return 4
+    return min(4, max(2, available_cores // 2))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -87,6 +82,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=1024, help="Batch size (recommended: 512 - 1024 for JEPA)")
     p.add_argument("--k_per_file", type=int, default=16, help="Points per file in file-balanced batch sampler")
     p.add_argument("--num_workers", type=str, default="auto", help="Number of CPU workers (integer or 'auto')")
+    p.add_argument("--preload_ram", type=lambda v: v.lower() == "true", default=True,
+                   help="Preload cached data into RAM for 1000x faster batching without disk I/O (requires ~6GB RAM)")
     p.add_argument("--max_files", type=int, default=None, help="Limit number of TDMS files for debug")
     p.add_argument("--normalization", type=str, default="peak_early",
                    choices=["peak_early", "zscore", "min_max"])
@@ -118,6 +115,7 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         k_per_file=args.k_per_file,
+        preload_ram=args.preload_ram,
         max_files=args.max_files,
         normalization=args.normalization,
         num_patches=args.num_patches,
@@ -157,7 +155,7 @@ def main():
 
     tok_pad_to = config.raw_padded_length if config.tokenizer_mode == "raw" else None
 
-    logger.info(f"Indexing training dataset ({len(train_files)} files)...")
+    logger.info(f"Indexing training dataset ({len(train_files)} files, preload_ram={config.preload_ram})...")
     train_set = PECT1DDataset(
         file_paths=train_files,
         time_samples=config.time_samples,
@@ -167,13 +165,14 @@ def main():
         early_window_frac=config.early_window_frac,
         raster_correction=config.raster_correction,
         use_memmap=config.use_memmap,
+        preload_ram=config.preload_ram,
         cache_dir=config.cache_dir,
         eps=config.eps,
         pad_to=tok_pad_to,
         pad_mode=config.pad_mode,
     )
 
-    logger.info(f"Indexing validation dataset ({len(val_files)} files)...")
+    logger.info(f"Indexing validation dataset ({len(val_files)} files, preload_ram={config.preload_ram})...")
     val_set = PECT1DDataset(
         file_paths=val_files,
         time_samples=config.time_samples,
@@ -183,6 +182,7 @@ def main():
         early_window_frac=config.early_window_frac,
         raster_correction=config.raster_correction,
         use_memmap=config.use_memmap,
+        preload_ram=config.preload_ram,
         cache_dir=config.cache_dir,
         eps=config.eps,
         pad_to=tok_pad_to,

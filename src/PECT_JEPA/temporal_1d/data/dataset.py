@@ -48,7 +48,8 @@ class PECT1DDataset(Dataset):
         cache_dir: Optional[str] = ".cache/pect_1d_mmap",
         eps: float = 1e-8,
         pad_to: Optional[int] = None,
-        pad_mode: str = "edge"
+        pad_mode: str = "edge",
+        preload_ram: bool = False,
     ):
         super().__init__()
         self.time_samples = time_samples
@@ -58,6 +59,7 @@ class PECT1DDataset(Dataset):
         self.early_window_frac = early_window_frac
         self.raster_correction = raster_correction
         self.use_memmap = use_memmap and cache_dir is not None
+        self.preload_ram = preload_ram
         self.cache_dir = cache_dir
         self.eps = eps
         self.pad_to = pad_to          # None -> log-time resample; int -> B0 raw pad
@@ -138,6 +140,11 @@ class PECT1DDataset(Dataset):
             self.file_point_counts.append(n_points)
             for p in range(n_points):
                 self.sample_index.append((f_idx, p))
+
+        if self.use_memmap and self.preload_ram:
+            for f_idx, (c_path, shape) in self._cache_paths.items():
+                self._in_memory_files[f_idx] = np.fromfile(c_path, dtype=np.float32).reshape(shape)
+            self._cache_paths.clear()
 
     def _load_file(self, fp: str) -> np.ndarray:
         raw = read_tdms_1d_waveforms(
