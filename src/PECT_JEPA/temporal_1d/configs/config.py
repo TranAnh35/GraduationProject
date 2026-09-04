@@ -61,18 +61,18 @@ class Temporal1DConfig:
     predictor_depth: int = 2
     predictor_heads: int = 4
     mlp_ratio: float = 4.0
-    ema_momentum: float = 0.996
+    ema_momentum: float = 0.999
     ema_momentum_end: float = 1.0
     use_momentum_schedule: bool = True
 
     # ------------------------------------------------------------------- Loss
-    loss_type: str = "normalized_l2"   # JEPA term: 'normalized_l2' | 'cosine' | 'smooth_l1'
+    loss_type: str = "smooth_l1"       # Meta I-JEPA standard: 'smooth_l1' | 'l1' | 'l2'
     var_weight: float = 1.0            # VICReg-style variance hinge weight (A4)
-    cov_weight: float = 0.04           # Covariance decorrelation weight (A4)
+    cov_weight: float = 0.5            # VICReg quadratic covariance decorrelation weight (A4)
     var_gamma: float = 1.0             # Target std for the variance hinge
 
     # --------------------------------------------------------------- Training
-    batch_size: int = 256             # 4 GB VRAM friendly
+    batch_size: int = 1024            # High-throughput batch size for A5000 / GPU
     file_balanced: bool = True        # A5: file-balanced sampling
     k_per_file: int = 8               # Samples per file within one batch
     learning_rate: float = 3e-4

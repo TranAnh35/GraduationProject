@@ -89,6 +89,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    choices=["peak_early", "zscore", "min_max"])
     p.add_argument("--num_patches", type=int, default=16, help="Number of temporal token patches")
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
+    p.add_argument("--loss_type", type=str, default="smooth_l1", choices=["smooth_l1", "l1", "l2", "normalized_l2", "cosine"],
+                   help="JEPA latent prediction loss function (default: smooth_l1)")
+    p.add_argument("--cov_weight", type=float, default=0.5, help="VICReg covariance penalty weight (default: 0.5)")
+    p.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (default: 1.0)")
+    p.add_argument("--ema_momentum", type=float, default=0.999, help="Target encoder base EMA momentum (default: 0.999)")
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
@@ -120,6 +125,10 @@ def main():
         normalization=args.normalization,
         num_patches=args.num_patches,
         learning_rate=args.learning_rate,
+        loss_type=args.loss_type,
+        cov_weight=args.cov_weight,
+        var_weight=args.var_weight,
+        ema_momentum=args.ema_momentum,
         device=args.device,
         seed=args.seed,
         save_dir=args.save_dir,
