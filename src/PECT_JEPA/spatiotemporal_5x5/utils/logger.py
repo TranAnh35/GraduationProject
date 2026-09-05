@@ -165,7 +165,7 @@ class PECTExperimentLogger5x5:
             epoch_csv_path = os.path.join(self.run_dir, "metrics_epoch.csv")
             epoch_exists = os.path.exists(epoch_csv_path) and os.path.getsize(epoch_csv_path) > 0
             self.epoch_csv_file = open(epoch_csv_path, "a" if epoch_exists else "w", newline="", encoding="utf-8")
-            self.epoch_csv_cols = ["epoch", "train_loss", "val_loss", "effective_rank", "lr", "time_sec"]
+            self.epoch_csv_cols = ["epoch", "train_loss", "val_loss", "effective_rank", "probe_cnr", "lr", "time_sec"]
             self.epoch_csv_writer = csv.DictWriter(self.epoch_csv_file, fieldnames=self.epoch_csv_cols)
             if not epoch_exists:
                 self.epoch_csv_writer.writeheader()

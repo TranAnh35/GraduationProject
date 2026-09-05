@@ -4,6 +4,7 @@ Verifies that FP16 inputs do not overflow in VICReg covariance/variance,
 and that validation does not poison total_loss if an individual batch produces NaN.
 """
 
+import os
 import unittest
 import torch
 import numpy as np
@@ -96,6 +97,56 @@ class TestNumericalStability(unittest.TestCase):
         self.assertGreater(val_metrics["val_loss"], 0.0)
         self.assertIn("effective_rank", val_metrics)
         trainer.logger.close()
+
+    def test_downstream_probe_execution(self):
+        """Verify that downstream probe extracts C-scan, computes CNR, and saves heatmap."""
+        import tempfile
+        import shutil
+
+        temp_dir = tempfile.mkdtemp()
+        config = Spatiotemporal5x5Config(
+            grid_size=5,
+            in_channels=128,
+            embed_dim=32,
+            encoder_depth=1,
+            predictor_depth=1,
+            epochs=1,
+            batch_size=4,
+            device="cpu",
+            log_dir=temp_dir,
+            save_dir=os.path.join(temp_dir, "checkpoints"),
+            use_tensorboard=False,
+            use_wandb=False,
+        )
+        model = PECT_JEPA_5x5(config)
+        trainer = Trainer5x5(
+            model=model,
+            config=config,
+            train_loader=[],
+            val_loader=None,
+        )
+
+        # Mock a small C-scan grid [15, 15, 128]
+        trainer.probe_grid = np.random.randn(15, 15, 128).astype(np.float32)
+        # Add a synthetic defect in the center
+        trainer.probe_grid[6:9, 6:9, :] += 3.0
+        trainer.probe_fname = "mock_defect_scan"
+
+        probe_res = trainer.run_downstream_probe(epoch=1)
+
+        self.assertIsNotNone(probe_res)
+        self.assertIn("contrast_ratio_cnr", probe_res)
+        self.assertGreater(probe_res["contrast_ratio_cnr"], 0.0)
+
+        # Check that heatmap was created
+        probe_dir = os.path.join(trainer.logger.run_dir, "probe_heatmaps")
+        self.assertTrue(os.path.isdir(probe_dir))
+        heatmaps = os.listdir(probe_dir)
+        self.assertEqual(len(heatmaps), 1)
+        self.assertTrue(heatmaps[0].endswith(".png"))
+
+        trainer.logger.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

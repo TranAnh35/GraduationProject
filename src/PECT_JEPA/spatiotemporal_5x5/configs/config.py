@@ -76,6 +76,8 @@ class Spatiotemporal5x5Config:
     log_histograms: bool = False
     log_interval: int = 20
     val_interval: int = 1
+    probe_file: Optional[str] = None     # Optional TDMS file for epoch-by-epoch downstream probing (if None, auto-selects from val set)
+    probe_interval: int = 1              # Run downstream anomaly probe every N epochs (0 to disable, 1 = every epoch)
     seed: int = 42
     resume: Optional[str] = None         # Checkpoint path or 'latest' / 'auto' / 'best' to resume from
 

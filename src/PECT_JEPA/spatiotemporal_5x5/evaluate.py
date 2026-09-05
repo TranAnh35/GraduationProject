@@ -68,6 +68,7 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.cscan_extractor import (
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import (
     AnomalyDetector5x5,
     plot_anomaly_heatmap_5x5,
+    compute_anomaly_metrics,
 )
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.liftoff_invariance import (
     compute_linear_cka,
@@ -173,41 +174,6 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     print(f"  Model config: resample_mode={config.resample_mode}, C={config.in_channels}, embed_dim={config.embed_dim}")
     return model
 
-
-def compute_anomaly_metrics(score_map: np.ndarray, top_percentile: float = 95.0) -> Dict[str, float]:
-    """
-    Computes quantitative defect detection metrics on the 2D anomaly score map:
-    - mean_score: average anomaly score across entire scan
-    - max_score: peak anomaly score
-    - background_mean: mean score in normal metal zone (< top_percentile)
-    - background_std: noise standard deviation in normal metal zone
-    - defect_mean: mean score in defect zone (>= top_percentile)
-    - contrast_ratio (CNR): (defect_mean - background_mean) / (background_std + 1e-8)
-    - peak_contrast_ratio: (max_score - background_mean) / (background_std + 1e-8)
-    """
-    flat = score_map.flatten().astype(np.float64)
-    threshold = np.percentile(flat, top_percentile)
-
-    defect_pts = flat[flat >= threshold]
-    bg_pts = flat[flat < threshold]
-
-    bg_mean = float(np.mean(bg_pts))
-    bg_std = float(np.std(bg_pts))
-    defect_mean = float(np.mean(defect_pts))
-    max_score = float(np.max(flat))
-
-    cnr = (defect_mean - bg_mean) / (bg_std + 1e-8)
-    p_cnr = (max_score - bg_mean) / (bg_std + 1e-8)
-
-    return {
-        "mean_score": float(np.mean(flat)),
-        "max_score": max_score,
-        "background_mean": bg_mean,
-        "background_std": bg_std,
-        "defect_mean": defect_mean,
-        "contrast_ratio_cnr": float(cnr),
-        "peak_contrast_ratio": float(p_cnr),
-    }
 
 
 def evaluate_single_file(

@@ -29,6 +29,8 @@ from ..configs.config import Spatiotemporal5x5Config
 from ..models.jepa_5x5 import PECT_JEPA_5x5
 from ..utils.logger import PECTExperimentLogger5x5
 from ..evaluation.liftoff_invariance import compute_effective_rank
+from ..evaluation.anomaly_detection import AnomalyDetector5x5, compute_anomaly_metrics, plot_anomaly_heatmap_5x5
+from ..evaluation.cscan_extractor import extract_full_cscan_map, load_cscan_from_tdms
 from .optimizer import build_optimizer_5x5, WarmupCosineLRScheduler5x5, MomentumScheduler5x5
 
 
@@ -45,6 +47,7 @@ class Trainer5x5:
         val_loader=None,
         logger: Optional[PECTExperimentLogger5x5] = None,
         resume_checkpoint: Optional[str] = None,
+        probe_file: Optional[str] = None,
     ):
         self.model = model
         self.config = config
@@ -61,16 +64,15 @@ class Trainer5x5:
             weight_decay=config.weight_decay,
         )
 
-        steps_per_epoch = len(train_loader)
-        total_steps = steps_per_epoch * config.epochs
-        warmup_steps = steps_per_epoch * config.warmup_epochs
+        total_steps = config.epochs * max(1, len(train_loader))
+        warmup_steps = config.warmup_epochs * max(1, len(train_loader))
 
         self.lr_scheduler = WarmupCosineLRScheduler5x5(
             optimizer=self.optimizer,
-            base_lr=config.learning_rate,
-            min_lr=config.min_lr,
             warmup_steps=warmup_steps,
             total_steps=total_steps,
+            base_lr=config.learning_rate,
+            min_lr=config.min_lr,
         )
 
         self.momentum_scheduler = MomentumScheduler5x5(
@@ -92,6 +94,31 @@ class Trainer5x5:
         os.makedirs(config.save_dir, exist_ok=True)
         if config.log_dir:
             os.makedirs(config.log_dir, exist_ok=True)
+
+        # Pre-load optional validation TDMS scan for epoch-by-epoch downstream defect probing
+        self.probe_file = probe_file or getattr(config, "probe_file", None)
+        self.probe_grid = None
+        self.probe_fname = None
+        if self.probe_file and os.path.isfile(self.probe_file):
+            try:
+                self.probe_grid = load_cscan_from_tdms(
+                    file_path=self.probe_file,
+                    time_samples=config.time_samples,
+                    temporal_samples=config.temporal_samples,
+                    resample_mode=config.resample_mode,
+                    normalization=config.normalization,
+                    raster_correction=config.raster_correction,
+                    crop_border=config.crop_border,
+                )
+                self.probe_fname = os.path.splitext(os.path.basename(self.probe_file))[0]
+                if self.logger:
+                    self.logger.info(
+                        f"[Probe] Pre-loaded validation C-scan for downstream probing: {self.probe_fname} "
+                        f"(grid: {self.probe_grid.shape[0]}x{self.probe_grid.shape[1]}, C={self.probe_grid.shape[2]})"
+                    )
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"[Probe] Could not pre-load probe file '{self.probe_file}': {e}")
 
         target_resume = resume_checkpoint or getattr(config, "resume", None)
         if target_resume:
@@ -252,6 +279,53 @@ class Trainer5x5:
             "val_loss_pred": val_loss_pred,
             "effective_rank": eff_rank,
         }
+
+    @torch.no_grad()
+    def run_downstream_probe(self, epoch: int) -> Optional[Dict[str, float]]:
+        """
+        Runs full C-scan feature extraction and unsupervised anomaly detection on self.probe_grid,
+        plots the 2D anomaly heatmap, logs to TensorBoard, and returns defect metrics (CNR, etc.).
+        """
+        if self.probe_grid is None:
+            return None
+        self.model.eval()
+        try:
+            # 1. Extract 1-to-1 C-Scan feature map
+            feature_map = extract_full_cscan_map(
+                model=self.model,
+                full_cscan_3d=self.probe_grid,
+                batch_size=512,
+                device=self.device.type,
+                show_pbar=False,
+            )
+
+            # 2. Fit unsupervised anomaly detector on representations
+            detector = AnomalyDetector5x5(n_clusters=2)
+            detector.fit(feature_map)
+            score_map = detector.score_map(feature_map)
+
+            # 3. Compute quantitative defect contrast metrics
+            metrics = compute_anomaly_metrics(score_map)
+            cnr = metrics["contrast_ratio_cnr"]
+
+            # 4. Save heatmap image to disk
+            probe_dir = os.path.join(self.logger.run_dir if self.logger else "experiments/5x5", "probe_heatmaps")
+            os.makedirs(probe_dir, exist_ok=True)
+            heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_cnr_{cnr:.2f}.png")
+            title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f}"
+            fig = plot_anomaly_heatmap_5x5(score_map, save_path=heatmap_path, title=title, close_fig=False)
+
+            # 5. Log figure to TensorBoard & WandB
+            if self.logger and fig is not None:
+                self.logger.log_figure("downstream_probe/anomaly_heatmap", fig, global_step=epoch)
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+
+            return metrics
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"[Probe Epoch {epoch}] Downstream probing failed: {e}")
+            return None
 
     def save_checkpoint(self, path: str, val_loss: Optional[float] = None, effective_rank: Optional[float] = None):
         ckpt = {
@@ -423,16 +497,25 @@ class Trainer5x5:
             val_metrics = self.validate()
             dt = time.time() - t0
 
+            # Downstream defect probing on validation scan
+            probe_metrics = None
+            if self.probe_grid is not None and getattr(self.config, "probe_interval", 1) > 0:
+                if (epoch + 1) % self.config.probe_interval == 0:
+                    probe_metrics = self.run_downstream_probe(epoch=epoch + 1)
+
             val_str = f" | Val Loss: {val_metrics['val_loss']:.4f}" if val_metrics else ""
             rank_str = f" | Rank: {val_metrics['effective_rank']:.1f}/{self.config.embed_dim}" if val_metrics and "effective_rank" in val_metrics and val_metrics["effective_rank"] > 0 else ""
+            probe_str = f" | Probe CNR: {probe_metrics['contrast_ratio_cnr']:.2f}" if probe_metrics else ""
             log_line = (
                 f"[Epoch {epoch + 1:02d}/{self.config.epochs:02d}] "
                 f"Train Loss: {train_metrics['loss']:.4f} "
                 f"(Pred: {train_metrics['loss_pred']:.4f}, Var: {train_metrics['loss_var']:.4f}, Cov: {train_metrics['loss_cov']:.4f})"
-                f"{val_str}{rank_str} [{dt:.1f}s]"
+                f"{val_str}{rank_str}{probe_str} [{dt:.1f}s]"
             )
             if self.logger:
                 self.logger.info(log_line)
+                if probe_metrics:
+                    self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_cnr_{probe_metrics['contrast_ratio_cnr']:.2f}.png")
             else:
                 print(log_line)
 
@@ -447,6 +530,8 @@ class Trainer5x5:
                     epoch_data["val_loss"] = val_metrics["val_loss"]
                 if val_metrics and "effective_rank" in val_metrics:
                     epoch_data["effective_rank"] = val_metrics["effective_rank"]
+                if probe_metrics and "contrast_ratio_cnr" in probe_metrics:
+                    epoch_data["probe_cnr"] = probe_metrics["contrast_ratio_cnr"]
                 self.logger.log_epoch(epoch=epoch + 1, metrics=epoch_data, step=self.global_step)
 
             # Checkpoint saving

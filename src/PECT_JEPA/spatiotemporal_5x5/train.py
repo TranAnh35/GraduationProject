@@ -129,6 +129,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb_project", type=str, default="PECT_JEPA_5x5", help="WandB project name")
     p.add_argument("--wandb_entity", type=str, default=None, help="WandB entity/username")
     p.add_argument("--log_histograms", type=lambda v: v.lower() == "true", default=False, help="Log histograms to TB")
+    p.add_argument("--probe_file", type=str, default=None,
+                   help="Path to specific validation TDMS file to run downstream anomaly detection on after each epoch (default: auto-selects 1st defect file from val set)")
+    p.add_argument("--probe_interval", type=int, default=1,
+                   help="Frequency of running downstream probe on validation file (default: 1 = every epoch; 0 = disable)")
     p.add_argument("--resume", type=str, default=None,
                    help="Resume training from checkpoint: filepath (.pt), 'latest', 'best', or 'auto' (default: None)")
 
@@ -318,7 +322,20 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"PECT_JEPA_5x5 Trainable Parameters: {n_params / 1e6:.2f}M")
 
-    # 3. Trainer
+    # 3. Resolve validation scan for epoch-by-epoch downstream defect probing
+    probe_file = args.probe_file
+    if probe_file is None and val_files and args.probe_interval > 0:
+        defect_candidates = [
+            f for f in val_files
+            if any(k in os.path.basename(f).lower() for k in ("corrosion", "crack", "defect", "square", "gaussian", "step", "slot"))
+        ]
+        probe_file = defect_candidates[0] if defect_candidates else val_files[0]
+        logger.info(f"[Probe] Auto-selected validation scan for downstream evaluation: {os.path.basename(probe_file)}")
+
+    config.probe_file = probe_file
+    config.probe_interval = args.probe_interval
+
+    # 4. Trainer
     trainer = Trainer5x5(
         model=model,
         config=config,
@@ -326,6 +343,7 @@ def main():
         val_loader=val_loader,
         logger=logger,
         resume_checkpoint=args.resume,
+        probe_file=probe_file,
     )
 
     trainer.fit()
