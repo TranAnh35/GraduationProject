@@ -85,8 +85,13 @@ class Trainer5x5:
         self.current_epoch = 0
         self.best_val_loss = float("inf")
 
+        if config.save_dir is None:
+            base_dir = self.logger.run_dir if self.logger else os.path.join(config.log_dir, config.exp_name)
+            config.save_dir = os.path.join(base_dir, "checkpoints")
+
         os.makedirs(config.save_dir, exist_ok=True)
-        os.makedirs(config.log_dir, exist_ok=True)
+        if config.log_dir:
+            os.makedirs(config.log_dir, exist_ok=True)
 
         target_resume = resume_checkpoint or getattr(config, "resume", None)
         if target_resume:
@@ -188,6 +193,7 @@ class Trainer5x5:
         total_loss = 0.0
         total_pred = 0.0
         n_batches = 0
+        nan_batches = 0
 
         pbar = tqdm(
             self.val_loader,
@@ -197,30 +203,53 @@ class Trainer5x5:
         )
 
         val_features = []
-        for batch in pbar:
+        # Sample representations across the full validation dataset using a stride
+        # to capture true representation geometry across defects, sound metal, and lift-offs
+        val_stride = max(1, len(self.val_loader) // 16)
+
+        for batch_idx, batch in enumerate(pbar):
             x = batch["data"].to(self.device)
             with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
                 loss_dict = self.model(x)
-            loss_val = loss_dict["loss"].item()
-            pred_val = loss_dict["loss_pred"].item()
+
+            loss_tensor = loss_dict["loss"]
+            if torch.isnan(loss_tensor) or torch.isinf(loss_tensor):
+                nan_batches += 1
+                pbar.set_postfix({"v_loss": "NaN (skip)", "nan_batches": nan_batches})
+                continue
+
+            loss_val = float(loss_tensor.item())
+            pred_val = float(loss_dict["loss_pred"].item())
             total_loss += loss_val
             total_pred += pred_val
             n_batches += 1
 
-            if len(val_features) < 8:
+            if batch_idx % val_stride == 0 and len(val_features) < 16:
                 z_center = self.model.extract_center_feature(x)
-                val_features.append(z_center.detach().cpu().numpy())
+                z_np = z_center.detach().cpu().numpy()
+                if not np.isnan(z_np).any():
+                    val_features.append(z_np)
 
             pbar.set_postfix({"v_loss": f"{loss_val:.4f}", "v_pred": f"{pred_val:.4f}"})
+
+        if nan_batches > 0 and self.logger:
+            self.logger.warning(
+                f"[Val Epoch {self.current_epoch + 1}] Skipped {nan_batches}/{len(self.val_loader)} validation batches due to NaN/Inf loss."
+            )
 
         eff_rank = 0.0
         if val_features:
             feats = np.concatenate(val_features, axis=0)
-            eff_rank = compute_effective_rank(feats)
+            feats = feats[~np.isnan(feats).any(axis=1)]
+            if len(feats) >= 2:
+                eff_rank = compute_effective_rank(feats)
+
+        val_loss = (total_loss / n_batches) if n_batches > 0 else float("nan")
+        val_loss_pred = (total_pred / n_batches) if n_batches > 0 else float("nan")
 
         return {
-            "val_loss": total_loss / max(1, n_batches),
-            "val_loss_pred": total_pred / max(1, n_batches),
+            "val_loss": val_loss,
+            "val_loss_pred": val_loss_pred,
             "effective_rank": eff_rank,
         }
 

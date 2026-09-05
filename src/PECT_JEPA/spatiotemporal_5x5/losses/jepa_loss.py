@@ -30,6 +30,9 @@ class JEPALoss5x5(nn.Module):
 
     def latent_prediction_loss(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
         safe_eps = max(self.eps, 1e-5)
+        # Ensure FP32 precision to prevent numerical instability under mixed precision
+        H_pred = H_pred.float()
+        H_target = H_target.float()
         if self.loss_type == "smooth_l1":
             return F.smooth_l1_loss(H_pred, H_target, beta=1.0)
         elif self.loss_type == "l1":
@@ -44,17 +47,23 @@ class JEPALoss5x5(nn.Module):
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
     def variance_hinge(self, H_pred: torch.Tensor) -> torch.Tensor:
-        """Forces batch variance along each dimension to be >= var_gamma."""
-        B, N, D = H_pred.shape
-        z = H_pred.reshape(B * N, D)
+        """Forces batch variance along each dimension to be >= var_gamma (computed in FP32)."""
+        # Force FP32: avoids FP16 underflow/rounding errors
+        z = H_pred.float()
+        B, N, D = z.shape
+        z = z.reshape(B * N, D)
         safe_eps = max(self.eps, 1e-5)
-        std = torch.sqrt(z.var(dim=0, unbiased=False) + safe_eps)  # [D]
+        # Clamp variance to >= 0.0 to guard against negative variance from FP rounding
+        var = torch.clamp(z.var(dim=0, unbiased=False), min=0.0)
+        std = torch.sqrt(var + safe_eps)  # [D]
         return torch.mean(F.relu(self.var_gamma - std))
 
     def covariance_penalty(self, H_pred: torch.Tensor) -> torch.Tensor:
-        """Decorrelates embedding dimensions to maximize information content."""
-        B, N, D = H_pred.shape
-        z = H_pred.reshape(B * N, D)
+        """Decorrelates embedding dimensions to maximize information content (computed in FP32)."""
+        # Force FP32: inner product z.T @ z with B*N > 6000 easily overflows FP16 max (65,504) -> inf -> NaN
+        z = H_pred.float()
+        B, N, D = z.shape
+        z = z.reshape(B * N, D)
         z = z - z.mean(dim=0, keepdim=True)
         cov = (z.T @ z) / max(1, z.shape[0] - 1)  # [D, D]
         off_diag = cov - torch.diag(torch.diag(cov))
