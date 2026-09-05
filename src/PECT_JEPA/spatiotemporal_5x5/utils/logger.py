@@ -129,18 +129,22 @@ class PECTExperimentLogger5x5:
         if self.is_main:
             # Step CSV
             step_csv_path = os.path.join(self.run_dir, "metrics_step.csv")
-            self.step_csv_file = open(step_csv_path, "w", newline="", encoding="utf-8")
+            step_exists = os.path.exists(step_csv_path) and os.path.getsize(step_csv_path) > 0
+            self.step_csv_file = open(step_csv_path, "a" if step_exists else "w", newline="", encoding="utf-8")
             self.step_csv_cols = ["step", "epoch", "loss", "loss_pred", "loss_var", "loss_cov", "lr", "momentum", "grad_norm"]
             self.step_csv_writer = csv.DictWriter(self.step_csv_file, fieldnames=self.step_csv_cols)
-            self.step_csv_writer.writeheader()
+            if not step_exists:
+                self.step_csv_writer.writeheader()
             self.step_csv_file.flush()
 
             # Epoch CSV
             epoch_csv_path = os.path.join(self.run_dir, "metrics_epoch.csv")
-            self.epoch_csv_file = open(epoch_csv_path, "w", newline="", encoding="utf-8")
+            epoch_exists = os.path.exists(epoch_csv_path) and os.path.getsize(epoch_csv_path) > 0
+            self.epoch_csv_file = open(epoch_csv_path, "a" if epoch_exists else "w", newline="", encoding="utf-8")
             self.epoch_csv_cols = ["epoch", "train_loss", "val_loss", "effective_rank", "lr", "time_sec"]
             self.epoch_csv_writer = csv.DictWriter(self.epoch_csv_file, fieldnames=self.epoch_csv_cols)
-            self.epoch_csv_writer.writeheader()
+            if not epoch_exists:
+                self.epoch_csv_writer.writeheader()
             self.epoch_csv_file.flush()
 
             # 6. Save Config & Git Snapshot

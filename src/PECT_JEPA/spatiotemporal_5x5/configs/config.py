@@ -76,6 +76,7 @@ class Spatiotemporal5x5Config:
     log_interval: int = 20
     val_interval: int = 1
     seed: int = 42
+    resume: Optional[str] = None  # Checkpoint path or 'latest' / 'auto' / 'best' to resume from
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

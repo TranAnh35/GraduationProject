@@ -126,6 +126,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb_project", type=str, default="PECT_JEPA_5x5", help="WandB project name")
     p.add_argument("--wandb_entity", type=str, default=None, help="WandB entity/username")
     p.add_argument("--log_histograms", type=lambda v: v.lower() == "true", default=False, help="Log histograms to TB")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Resume training from checkpoint: filepath (.pt), 'latest', 'best', or 'auto' (default: None)")
 
     return p
 
@@ -167,6 +169,7 @@ def main():
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         log_histograms=args.log_histograms,
+        resume=args.resume,
     )
 
     # Initialize unified logger
@@ -307,6 +310,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         logger=logger,
+        resume_checkpoint=args.resume,
     )
 
     trainer.fit()

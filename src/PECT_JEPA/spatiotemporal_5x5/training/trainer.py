@@ -43,6 +43,7 @@ class Trainer5x5:
         train_loader,
         val_loader=None,
         logger: Optional[PECTExperimentLogger5x5] = None,
+        resume_checkpoint: Optional[str] = None,
     ):
         self.model = model
         self.config = config
@@ -79,11 +80,16 @@ class Trainer5x5:
 
         self.scaler = create_grad_scaler(self.device.type, enabled=config.mixed_precision and self.device.type == "cuda")
         self.global_step = 0
+        self.start_epoch = 0
         self.current_epoch = 0
         self.best_val_loss = float("inf")
 
         os.makedirs(config.save_dir, exist_ok=True)
         os.makedirs(config.log_dir, exist_ok=True)
+
+        target_resume = resume_checkpoint or getattr(config, "resume", None)
+        if target_resume:
+            self.resume_from_checkpoint(target_resume)
 
     def train_epoch(self) -> Dict[str, float]:
         self.model.train()
@@ -217,16 +223,111 @@ class Trainer5x5:
             "effective_rank": eff_rank,
         }
 
-    def save_checkpoint(self, path: str, val_loss: Optional[float] = None):
+    def save_checkpoint(self, path: str, val_loss: Optional[float] = None, effective_rank: Optional[float] = None):
         ckpt = {
             "epoch": self.current_epoch,
             "global_step": self.global_step,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict() if hasattr(self, "scaler") else None,
             "val_loss": val_loss,
+            "best_val_loss": self.best_val_loss,
+            "effective_rank": effective_rank,
             "config": self.config.to_dict(),
         }
         torch.save(ckpt, path)
+
+    def resume_from_checkpoint(self, checkpoint_path_or_keyword: str) -> bool:
+        """
+        Resumes model, optimizer, scaler, step, epoch, and best metrics from a checkpoint file
+        or keyword ('auto', 'latest', 'best').
+        """
+        keyword = str(checkpoint_path_or_keyword).strip()
+        resolved_path = None
+
+        if keyword.lower() in ("auto", "latest", "true", "1"):
+            candidate = os.path.join(self.config.save_dir, "latest_model_5x5.pt")
+            if os.path.isfile(candidate):
+                resolved_path = candidate
+            else:
+                candidate_best = os.path.join(self.config.save_dir, "best_model_5x5.pt")
+                if os.path.isfile(candidate_best):
+                    resolved_path = candidate_best
+        elif keyword.lower() == "best":
+            candidate_best = os.path.join(self.config.save_dir, "best_model_5x5.pt")
+            if os.path.isfile(candidate_best):
+                resolved_path = candidate_best
+        else:
+            if os.path.isfile(checkpoint_path_or_keyword):
+                resolved_path = checkpoint_path_or_keyword
+            else:
+                candidate_in_dir = os.path.join(self.config.save_dir, checkpoint_path_or_keyword)
+                if os.path.isfile(candidate_in_dir):
+                    resolved_path = candidate_in_dir
+
+        if not resolved_path or not os.path.isfile(resolved_path):
+            msg = (
+                f"[Resume] No checkpoint found matching '{checkpoint_path_or_keyword}' "
+                f"in '{self.config.save_dir}'. Starting fresh training from epoch 1."
+            )
+            if self.logger:
+                self.logger.warning(msg)
+            else:
+                print(msg)
+            return False
+
+        msg = f"[Resume] Loading checkpoint from: {resolved_path}"
+        if self.logger:
+            self.logger.info(msg)
+        else:
+            print(msg)
+
+        checkpoint = torch.load(resolved_path, map_location=self.device)
+
+        # 1. Model state
+        if "model_state_dict" in checkpoint:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            self.model.load_state_dict(checkpoint)
+
+        # 2. Optimizer state
+        if "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
+
+        # 3. Scaler state
+        if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None and hasattr(self, "scaler"):
+            try:
+                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"[Resume] Could not restore scaler state: {e}. Keeping clean scaler.")
+
+        # 4. Step and Epoch
+        self.global_step = checkpoint.get("global_step", 0)
+        saved_epoch = checkpoint.get("epoch", -1)
+        self.start_epoch = max(0, saved_epoch + 1)
+        self.current_epoch = self.start_epoch
+
+        # 5. Best Val Loss
+        self.best_val_loss = checkpoint.get("best_val_loss", checkpoint.get("val_loss", float("inf")))
+
+        # 6. Schedulers: synchronize LR to global_step
+        current_lr = self.lr_scheduler.step(self.global_step)
+
+        summary_msg = (
+            f"[Resume] Successfully restored checkpoint! Resuming at Epoch {self.start_epoch + 1}/{self.config.epochs} "
+            f"(Global Step: {self.global_step}, Best Val Loss: {self.best_val_loss:.4f}, LR: {current_lr:.2e})"
+        )
+        if self.logger:
+            self.logger.info(summary_msg)
+        else:
+            print(summary_msg)
+
+        return True
 
     def fit(self):
         msg_start = f"--- Starting Unified 5x5 Spatiotemporal PECT-JEPA Training ({self.config.epochs} epochs, device={self.device}) ---"
@@ -235,7 +336,18 @@ class Trainer5x5:
         else:
             print(msg_start)
 
-        for epoch in range(self.config.epochs):
+        if self.start_epoch >= self.config.epochs:
+            done_msg = (
+                f"[Resume] Training already reached requested epoch {self.start_epoch}/{self.config.epochs}. "
+                f"To train further, increase --epochs (e.g. --epochs {self.start_epoch + 20})."
+            )
+            if self.logger:
+                self.logger.info(done_msg)
+            else:
+                print(done_msg)
+            return
+
+        for epoch in range(self.start_epoch, self.config.epochs):
             self.current_epoch = epoch
             if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
                 self.train_loader.sampler.set_epoch(epoch)
@@ -272,14 +384,15 @@ class Trainer5x5:
                 self.logger.log_epoch(epoch=epoch + 1, metrics=epoch_data, step=self.global_step)
 
             # Checkpoint saving
+            eff_rank = val_metrics.get("effective_rank") if val_metrics else None
             latest_path = os.path.join(self.config.save_dir, "latest_model_5x5.pt")
-            self.save_checkpoint(latest_path, val_metrics.get("val_loss"))
+            self.save_checkpoint(latest_path, val_metrics.get("val_loss"), eff_rank)
 
             current_loss = val_metrics.get("val_loss", train_metrics["loss"])
             if current_loss < self.best_val_loss:
                 self.best_val_loss = current_loss
                 best_path = os.path.join(self.config.save_dir, "best_model_5x5.pt")
-                self.save_checkpoint(best_path, current_loss)
+                self.save_checkpoint(best_path, current_loss, eff_rank)
                 msg_best = f"  --> Saved new best checkpoint: {best_path}"
                 if self.logger:
                     self.logger.info(msg_best)
