@@ -51,8 +51,10 @@ class PECT5x5Dataset(Dataset):
         cache_dir: Optional[str] = ".cache/pect_5x5_mmap",
         eps: float = 1e-8,
         preload_ram: bool = False,
+        return_meta: bool = True,
     ):
         super().__init__()
+        self.return_meta = return_meta
         self.grid_size = grid_size
         self.pad = grid_size // 2  # 2 for 5x5
         self.sX = sX
@@ -214,6 +216,9 @@ class PECT5x5Dataset(Dataset):
         # Extract 5x5 window (from row : row + 5, col : col + 5 in padded array)
         patch = np.array(padded[row:row + self.grid_size, col:col + self.grid_size, :], copy=True)
 
+        if not self.return_meta:
+            return torch.from_numpy(patch).float()
+
         meta = dict(self.metadata_list[file_idx])
         meta["point_idx"] = point_idx
         meta["file_idx"] = file_idx
@@ -302,8 +307,12 @@ class FileBalancedBatchSampler5x5(Sampler[List[int]]):
             yield batch[:self.batch_size]
 
 
-def collate_5x5_batch(batch: List[Tuple[torch.Tensor, Dict[str, Any]]]) -> Dict[str, Any]:
-    """Collate list of (patch [5, 5, C], meta) into a batch dictionary."""
-    data = torch.stack([item[0] for item in batch], dim=0)
-    meta = [item[1] for item in batch]
-    return {"data": data, "meta": meta}
+def collate_5x5_batch(batch: List[Any]) -> Dict[str, Any]:
+    """Collate list of (patch [5, 5, C], meta) or pure patches into a batch dictionary."""
+    if isinstance(batch[0], tuple):
+        data = torch.stack([item[0] for item in batch], dim=0)
+        meta = [item[1] for item in batch]
+        return {"data": data, "meta": meta}
+    else:
+        data = torch.stack(batch, dim=0)
+        return {"data": data}

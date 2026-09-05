@@ -180,13 +180,23 @@ class Trainer5x5:
         total_pred = 0.0
         n_batches = 0
 
-        for batch in self.val_loader:
+        pbar = tqdm(
+            self.val_loader,
+            desc=f"Epoch {self.current_epoch + 1}/{self.config.epochs} [Val 5x5]  ",
+            dynamic_ncols=True,
+            leave=False
+        )
+
+        for batch in pbar:
             x = batch["data"].to(self.device)
             with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
                 loss_dict = self.model(x)
-            total_loss += loss_dict["loss"].item()
-            total_pred += loss_dict["loss_pred"].item()
+            loss_val = loss_dict["loss"].item()
+            pred_val = loss_dict["loss_pred"].item()
+            total_loss += loss_val
+            total_pred += pred_val
             n_batches += 1
+            pbar.set_postfix({"v_loss": f"{loss_val:.4f}", "v_pred": f"{pred_val:.4f}"})
 
         return {
             "val_loss": total_loss / max(1, n_batches),

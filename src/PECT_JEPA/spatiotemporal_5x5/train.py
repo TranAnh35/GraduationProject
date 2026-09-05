@@ -232,6 +232,7 @@ def main():
         crop_border=config.crop_border,
         use_memmap=config.use_memmap,
         preload_ram=args.preload_ram,
+        return_meta=False,
         cache_dir=config.cache_dir,
         eps=config.eps,
     )
@@ -252,6 +253,7 @@ def main():
         crop_border=config.crop_border,
         use_memmap=config.use_memmap,
         preload_ram=args.preload_ram,
+        return_meta=False,
         cache_dir=config.cache_dir,
         eps=config.eps,
     )
@@ -276,7 +278,7 @@ def main():
     }
     if num_workers > 0:
         train_loader_kwargs["persistent_workers"] = True
-        train_loader_kwargs["prefetch_factor"] = 2
+        train_loader_kwargs["prefetch_factor"] = 4 if num_workers <= 2 else 2
 
     train_loader = DataLoader(train_set, batch_sampler=train_sampler, **train_loader_kwargs)
 
@@ -290,7 +292,7 @@ def main():
         val_loader_kwargs["prefetch_factor"] = 2
 
     val_loader = DataLoader(
-        val_set, batch_size=min(config.batch_size, 256), shuffle=False, **val_loader_kwargs
+        val_set, batch_size=config.batch_size, shuffle=False, **val_loader_kwargs
     )
 
     # 2. Model initialization
