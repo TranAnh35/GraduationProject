@@ -292,11 +292,15 @@ class Trainer5x5:
 
         # 2. Optimizer state
         if "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(self.device)
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(self.device)
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"[Resume] Could not restore optimizer state: {e}. Keeping fresh optimizer buffers.")
 
         # 3. Scaler state
         if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None and hasattr(self, "scaler"):
