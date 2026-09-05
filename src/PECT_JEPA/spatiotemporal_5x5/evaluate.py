@@ -116,7 +116,6 @@ def resolve_checkpoint_path(checkpoint_path: str) -> str:
         os.path.join("experiments/5x5", checkpoint_path),
         os.path.join("experiments/5x5", checkpoint_path, "checkpoints", base),
         os.path.join("experiments/5x5", os.path.dirname(checkpoint_path), "checkpoints", base),
-        os.path.join("checkpoints/pect_jepa_5x5", base),
     ]
     for c in candidates:
         if os.path.isfile(c):
@@ -133,7 +132,6 @@ def resolve_split_summary_path(split_summary_path: Optional[str], checkpoint_pat
         candidates.extend([
             split_summary_path,
             os.path.join("experiments/5x5", split_summary_path),
-            os.path.join("checkpoints/pect_jepa_5x5", base),
         ])
     if checkpoint_path:
         ckpt_dir = os.path.dirname(checkpoint_path)

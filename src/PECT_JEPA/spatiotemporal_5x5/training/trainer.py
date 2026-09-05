@@ -349,21 +349,13 @@ class Trainer5x5:
         keyword = str(checkpoint_path_or_keyword).strip()
         resolved_path = None
 
-        # Build comprehensive list of search directories for checkpoints
+        # Checkpoint directories for this unified experiment
         candidate_dirs = []
         if hasattr(self, "config") and getattr(self.config, "save_dir", None):
             candidate_dirs.append(self.config.save_dir)
         if hasattr(self, "logger") and getattr(self.logger, "run_dir", None):
             candidate_dirs.append(os.path.join(self.logger.run_dir, "checkpoints"))
             candidate_dirs.append(self.logger.run_dir)
-        # Search existing runs for this exp_name (including timestamped ones)
-        exp_name = getattr(self.config, "exp_name", "pect_jepa_5x5_base")
-        log_base_dir = getattr(self.config, "log_dir", "experiments/5x5")
-        for prev_dir in sorted(glob.glob(os.path.join(log_base_dir, f"{exp_name}*")), reverse=True):
-            candidate_dirs.append(os.path.join(prev_dir, "checkpoints"))
-            candidate_dirs.append(prev_dir)
-        # Legacy fallback directory
-        candidate_dirs.append("checkpoints/pect_jepa_5x5")
 
         seen = set()
         search_dirs = []

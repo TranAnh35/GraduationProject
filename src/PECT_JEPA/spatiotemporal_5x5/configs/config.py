@@ -87,7 +87,7 @@ class Spatiotemporal5x5Config:
 
     @property
     def checkpoint_dir(self) -> str:
-        if self.save_dir and self.save_dir not in ("checkpoints/pect_jepa_5x5", "auto"):
+        if self.save_dir and self.save_dir != "auto":
             return self.save_dir
         return os.path.join(self.experiment_dir, "checkpoints")
 
