@@ -5,6 +5,7 @@ Features multi-tier logging: TensorBoard, structured CSVs, console/file logs, an
 
 import os
 import time
+import glob
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -245,30 +246,62 @@ class Trainer5x5:
         keyword = str(checkpoint_path_or_keyword).strip()
         resolved_path = None
 
+        # Build comprehensive list of search directories for checkpoints
+        candidate_dirs = []
+        if hasattr(self, "config") and getattr(self.config, "save_dir", None):
+            candidate_dirs.append(self.config.save_dir)
+        if hasattr(self, "logger") and getattr(self.logger, "run_dir", None):
+            candidate_dirs.append(os.path.join(self.logger.run_dir, "checkpoints"))
+            candidate_dirs.append(self.logger.run_dir)
+        # Search existing runs for this exp_name (including timestamped ones)
+        exp_name = getattr(self.config, "exp_name", "pect_jepa_5x5_base")
+        log_base_dir = getattr(self.config, "log_dir", "experiments/5x5")
+        for prev_dir in sorted(glob.glob(os.path.join(log_base_dir, f"{exp_name}*")), reverse=True):
+            candidate_dirs.append(os.path.join(prev_dir, "checkpoints"))
+            candidate_dirs.append(prev_dir)
+        # Legacy fallback directory
+        candidate_dirs.append("checkpoints/pect_jepa_5x5")
+
+        seen = set()
+        search_dirs = []
+        for d in candidate_dirs:
+            norm = os.path.normpath(d)
+            if norm not in seen and os.path.isdir(norm):
+                seen.add(norm)
+                search_dirs.append(norm)
+
         if keyword.lower() in ("auto", "latest", "true", "1"):
-            candidate = os.path.join(self.config.save_dir, "latest_model_5x5.pt")
-            if os.path.isfile(candidate):
-                resolved_path = candidate
-            else:
-                candidate_best = os.path.join(self.config.save_dir, "best_model_5x5.pt")
-                if os.path.isfile(candidate_best):
-                    resolved_path = candidate_best
+            for d in search_dirs:
+                c_latest = os.path.join(d, "latest_model_5x5.pt")
+                if os.path.isfile(c_latest):
+                    resolved_path = c_latest
+                    break
+            if not resolved_path:
+                for d in search_dirs:
+                    c_best = os.path.join(d, "best_model_5x5.pt")
+                    if os.path.isfile(c_best):
+                        resolved_path = c_best
+                        break
         elif keyword.lower() == "best":
-            candidate_best = os.path.join(self.config.save_dir, "best_model_5x5.pt")
-            if os.path.isfile(candidate_best):
-                resolved_path = candidate_best
+            for d in search_dirs:
+                c_best = os.path.join(d, "best_model_5x5.pt")
+                if os.path.isfile(c_best):
+                    resolved_path = c_best
+                    break
         else:
             if os.path.isfile(checkpoint_path_or_keyword):
                 resolved_path = checkpoint_path_or_keyword
             else:
-                candidate_in_dir = os.path.join(self.config.save_dir, checkpoint_path_or_keyword)
-                if os.path.isfile(candidate_in_dir):
-                    resolved_path = candidate_in_dir
+                for d in search_dirs:
+                    cand = os.path.join(d, checkpoint_path_or_keyword)
+                    if os.path.isfile(cand):
+                        resolved_path = cand
+                        break
 
         if not resolved_path or not os.path.isfile(resolved_path):
             msg = (
-                f"[Resume] No checkpoint found matching '{checkpoint_path_or_keyword}' "
-                f"in '{self.config.save_dir}'. Starting fresh training from epoch 1."
+                f"[Resume] No checkpoint found matching '{checkpoint_path_or_keyword}'. "
+                f"Searched in: {search_dirs}. Starting fresh training from epoch 1."
             )
             if self.logger:
                 self.logger.warning(msg)

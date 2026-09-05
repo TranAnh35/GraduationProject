@@ -107,7 +107,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def resolve_checkpoint_path(checkpoint_path: str) -> str:
+    if os.path.isfile(checkpoint_path):
+        return checkpoint_path
+    base = os.path.basename(checkpoint_path)
+    candidates = [
+        os.path.join("experiments/5x5", checkpoint_path),
+        os.path.join("experiments/5x5", checkpoint_path, "checkpoints", base),
+        os.path.join("experiments/5x5", os.path.dirname(checkpoint_path), "checkpoints", base),
+        os.path.join("checkpoints/pect_jepa_5x5", base),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return checkpoint_path
+
+
+def resolve_split_summary_path(split_summary_path: Optional[str], checkpoint_path: Optional[str] = None) -> Optional[str]:
+    if split_summary_path and os.path.isfile(split_summary_path):
+        return split_summary_path
+    candidates = []
+    if split_summary_path:
+        base = os.path.basename(split_summary_path)
+        candidates.extend([
+            split_summary_path,
+            os.path.join("experiments/5x5", split_summary_path),
+            os.path.join("checkpoints/pect_jepa_5x5", base),
+        ])
+    if checkpoint_path:
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        parent_dir = os.path.dirname(ckpt_dir)
+        for d in (ckpt_dir, parent_dir):
+            if os.path.isdir(d):
+                for f in os.listdir(d):
+                    if f.endswith("_split_summary.json"):
+                        candidates.append(os.path.join(d, f))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return split_summary_path
+
+
 def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PECT_JEPA_5x5:
+    resolved = resolve_checkpoint_path(checkpoint_path)
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    checkpoint_path = resolved
     dev = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
     ckpt = torch.load(checkpoint_path, map_location=dev)
     cfg_dict = ckpt.get("config", {})
@@ -338,15 +383,17 @@ def main():
     protocol_name: str = "custom"
     holdout_target: str = "none"
 
+    resolved_split_summary = resolve_split_summary_path(args.split_summary, checkpoint_path=args.checkpoint)
+
     if args.file and os.path.exists(args.file):
         test_files = [args.file]
         protocol_name = "single_file"
         holdout_target = os.path.basename(args.file)
         print(f"Single file evaluation mode: {args.file}")
 
-    elif args.split_summary and os.path.exists(args.split_summary):
-        print(f"Loading evaluation test partition from split summary: {args.split_summary}")
-        with open(args.split_summary, "r", encoding="utf-8") as f:
+    elif resolved_split_summary and os.path.exists(resolved_split_summary):
+        print(f"Loading evaluation test partition from split summary: {resolved_split_summary}")
+        with open(resolved_split_summary, "r", encoding="utf-8") as f:
             summary = json.load(f)
         test_files = summary.get("test_files", [])
         test_slices = summary.get("test_slices", {})

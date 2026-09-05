@@ -11,6 +11,7 @@ Inherits full feature parity with 1D temporal logger:
 
 import os
 import sys
+import glob
 import json
 import csv
 import logging
@@ -67,12 +68,35 @@ class PECTExperimentLogger5x5:
         self.rank = rank
         self.is_main = (rank == 0)
 
-        # 1. Create Timestamped Experiment Directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 1. Resolve Experiment Directory and Run Name
         exp_name = getattr(config, "exp_name", "pect_jepa_5x5_base")
         log_base_dir = getattr(config, "log_dir", "experiments/5x5")
-        self.run_name = f"{exp_name}_{timestamp}"
-        self.run_dir = os.path.join(log_base_dir, self.run_name)
+        add_timestamp = getattr(config, "add_timestamp", False)
+        is_resume = bool(getattr(config, "resume", None))
+
+        resolved_run_dir = None
+        if is_resume:
+            # Check exact directory: log_base_dir / exp_name
+            exact_dir = os.path.join(log_base_dir, exp_name)
+            if os.path.isdir(exact_dir):
+                resolved_run_dir = exact_dir
+                self.run_name = exp_name
+            else:
+                # Check for existing timestamped directory matching exp_name_*
+                candidates = sorted(glob.glob(os.path.join(log_base_dir, f"{exp_name}_*")), reverse=True)
+                if candidates and os.path.isdir(candidates[0]):
+                    resolved_run_dir = candidates[0]
+                    self.run_name = os.path.basename(candidates[0])
+
+        if resolved_run_dir is None:
+            if add_timestamp:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.run_name = f"{exp_name}_{timestamp}"
+            else:
+                self.run_name = exp_name
+            self.run_dir = os.path.join(log_base_dir, self.run_name)
+        else:
+            self.run_dir = resolved_run_dir
 
         if self.is_main:
             os.makedirs(self.run_dir, exist_ok=True)

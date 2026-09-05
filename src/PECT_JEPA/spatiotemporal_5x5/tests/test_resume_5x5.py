@@ -120,6 +120,41 @@ class TestResume5x5(unittest.TestCase):
         self.assertEqual(trainer.start_epoch, 0)
         self.assertEqual(trainer.global_step, 0)
 
+    def test_unified_experiment_dir_and_no_timestamp_on_resume(self):
+        """Test that exp_name folder is unified and consistent across resume runs."""
+        from ..utils.logger import PECTExperimentLogger5x5
+
+        cfg = Spatiotemporal5x5Config(
+            exp_name="test_unified_run",
+            log_dir=self.log_dir,
+            save_dir=None,
+            add_timestamp=False,
+            use_tensorboard=False,
+            use_wandb=False,
+        )
+
+        logger1 = PECTExperimentLogger5x5(cfg)
+        expected_dir = os.path.join(self.log_dir, "test_unified_run")
+        self.assertEqual(logger1.run_dir, expected_dir)
+
+        # Checkpoint dir inside experiment folder
+        ckpt_dir = os.path.join(logger1.run_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        cfg.save_dir = ckpt_dir
+
+        # Simulate resume
+        cfg_resume = Spatiotemporal5x5Config(
+            exp_name="test_unified_run",
+            log_dir=self.log_dir,
+            save_dir=None,
+            resume="auto",
+            add_timestamp=False,
+            use_tensorboard=False,
+            use_wandb=False,
+        )
+        logger2 = PECTExperimentLogger5x5(cfg_resume)
+        self.assertEqual(logger2.run_dir, expected_dir, "Resume must reuse the exact existing experiment folder")
+
 
 if __name__ == "__main__":
     unittest.main()

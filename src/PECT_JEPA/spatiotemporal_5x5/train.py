@@ -105,7 +105,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
     p.add_argument("--exp_name", type=str, default="pect_jepa_5x5_base", help="Experiment run name")
-    p.add_argument("--save_dir", type=str, default="checkpoints/pect_jepa_5x5", help="Directory to save model checkpoints")
+    p.add_argument("--save_dir", type=str, default=None,
+                   help="Directory to save model checkpoints (default: None -> auto-unified inside experiments/5x5/<exp_name>/checkpoints/)")
+    p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=False,
+                   help="Append timestamp suffix to exp_name (default: False to preserve consistent folder for resume)")
     p.add_argument("--split_protocol", type=str, default="compound_ood",
                    choices=["compound_ood", "leave_liftoff", "leave_sensor", "leave_waveform", "leave_specimen", "random"],
                    help="Evaluation/training split protocol: compound_ood (Option A: hold out z3+TMR+Chirp simultaneously), leave_liftoff (LOLO), leave_sensor (LOSO), leave_waveform (LOWO), leave_specimen (LODO), random (default: compound_ood)")
@@ -164,6 +167,7 @@ def main():
         exp_name=args.exp_name,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
+        add_timestamp=args.add_timestamp,
         use_tensorboard=args.use_tensorboard,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
@@ -174,6 +178,14 @@ def main():
 
     # Initialize unified logger
     logger = PECTExperimentLogger5x5(config)
+
+    # Unify checkpoint save_dir inside experiment directory if not explicitly custom
+    if config.save_dir is None or config.save_dir in ("checkpoints/pect_jepa_5x5", "auto"):
+        config.save_dir = os.path.join(logger.run_dir, "checkpoints")
+
+    os.makedirs(config.save_dir, exist_ok=True)
+    config.save_json(os.path.join(logger.run_dir, "config_5x5.json"))
+    config.save_json(os.path.join(config.save_dir, "config_5x5.json"))
 
     # 1. Discover data files
     all_files = find_all_tdms_files(config.data_dir)
@@ -214,8 +226,11 @@ def main():
 
     # Persist split summary for evaluation reproducibility
     os.makedirs(config.save_dir, exist_ok=True)
-    split_summary_path = os.path.join(config.save_dir, f"{config.exp_name}_split_summary.json")
+    split_summary_path = os.path.join(logger.run_dir, f"{config.exp_name}_split_summary.json")
     with open(split_summary_path, "w", encoding="utf-8") as f:
+        json.dump(split_summary, f, indent=2)
+    split_summary_in_ckpt = os.path.join(config.save_dir, f"{config.exp_name}_split_summary.json")
+    with open(split_summary_in_ckpt, "w", encoding="utf-8") as f:
         json.dump(split_summary, f, indent=2)
     logger.info(f"Saved split configuration summary to: {split_summary_path}")
 

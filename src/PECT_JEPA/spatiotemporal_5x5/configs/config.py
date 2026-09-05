@@ -67,7 +67,8 @@ class Spatiotemporal5x5Config:
     # --------------------------------------------------- Experiment & Logging
     exp_name: str = "pect_jepa_5x5_base"
     log_dir: str = "experiments/5x5"
-    save_dir: str = "checkpoints/pect_jepa_5x5"
+    save_dir: Optional[str] = None       # If None/default, automatically unified into <log_dir>/<exp_name>/checkpoints
+    add_timestamp: bool = False          # False keeps fixed exp_name folder for seamless resume; True appends timestamp
     use_tensorboard: bool = True
     use_wandb: bool = False
     wandb_project: str = "PECT_JEPA_5x5"
@@ -76,7 +77,17 @@ class Spatiotemporal5x5Config:
     log_interval: int = 20
     val_interval: int = 1
     seed: int = 42
-    resume: Optional[str] = None  # Checkpoint path or 'latest' / 'auto' / 'best' to resume from
+    resume: Optional[str] = None         # Checkpoint path or 'latest' / 'auto' / 'best' to resume from
+
+    @property
+    def experiment_dir(self) -> str:
+        return os.path.join(self.log_dir, self.exp_name)
+
+    @property
+    def checkpoint_dir(self) -> str:
+        if self.save_dir and self.save_dir not in ("checkpoints/pect_jepa_5x5", "auto"):
+            return self.save_dir
+        return os.path.join(self.experiment_dir, "checkpoints")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
