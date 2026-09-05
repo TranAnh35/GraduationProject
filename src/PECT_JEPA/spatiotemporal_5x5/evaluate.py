@@ -36,7 +36,16 @@ import argparse
 import json
 import os
 import sys
+import types
 from typing import List, Dict, Any, Optional
+
+# Defensive safeguard for HPC clusters where torch._dynamo has broken imports or NumPy 2.x conflicts
+try:
+    import torch._dynamo
+except Exception:
+    fake_dynamo = types.ModuleType("torch._dynamo")
+    fake_dynamo.disable = lambda fn=None, *args, **kwargs: (fn if fn is not None else (lambda f: f))
+    sys.modules["torch._dynamo"] = fake_dynamo
 
 import numpy as np
 import torch

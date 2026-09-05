@@ -6,9 +6,22 @@ Features multi-tier logging: TensorBoard, structured CSVs, console/file logs, an
 import os
 import time
 import torch
-from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from typing import Optional, Dict, Any
+
+# Clean device-agnostic AMP helpers (eliminates FutureWarnings on PyTorch 2.4+)
+try:
+    from torch.amp import autocast as _autocast, GradScaler as _GradScaler
+    def create_grad_scaler(device_type: str, enabled: bool):
+        return _GradScaler(device_type, enabled=enabled)
+    def create_autocast(device_type: str, enabled: bool):
+        return _autocast(device_type, enabled=enabled)
+except Exception:
+    from torch.cuda.amp import autocast as _autocast, GradScaler as _GradScaler
+    def create_grad_scaler(device_type: str, enabled: bool):
+        return _GradScaler(enabled=enabled and device_type == "cuda")
+    def create_autocast(device_type: str, enabled: bool):
+        return _autocast(enabled=enabled and device_type == "cuda")
 
 from ..configs.config import Spatiotemporal5x5Config
 from ..models.jepa_5x5 import PECT_JEPA_5x5
@@ -62,7 +75,7 @@ class Trainer5x5:
             total_steps=total_steps,
         )
 
-        self.scaler = GradScaler(enabled=config.mixed_precision and self.device.type == "cuda")
+        self.scaler = create_grad_scaler(self.device.type, enabled=config.mixed_precision and self.device.type == "cuda")
         self.global_step = 0
         self.current_epoch = 0
         self.best_val_loss = float("inf")
@@ -93,7 +106,7 @@ class Trainer5x5:
 
             self.optimizer.zero_grad()
 
-            with autocast(enabled=self.config.mixed_precision and self.device.type == "cuda"):
+            with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
                 loss_dict = self.model(x)
                 loss = loss_dict["loss"]
 
@@ -169,7 +182,7 @@ class Trainer5x5:
 
         for batch in self.val_loader:
             x = batch["data"].to(self.device)
-            with autocast(enabled=self.config.mixed_precision and self.device.type == "cuda"):
+            with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
                 loss_dict = self.model(x)
             total_loss += loss_dict["loss"].item()
             total_pred += loss_dict["loss_pred"].item()
