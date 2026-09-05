@@ -138,7 +138,7 @@ class PECTExperimentLogger5x5:
             # Epoch CSV
             epoch_csv_path = os.path.join(self.run_dir, "metrics_epoch.csv")
             self.epoch_csv_file = open(epoch_csv_path, "w", newline="", encoding="utf-8")
-            self.epoch_csv_cols = ["epoch", "train_loss", "val_loss", "lr", "time_sec"]
+            self.epoch_csv_cols = ["epoch", "train_loss", "val_loss", "effective_rank", "lr", "time_sec"]
             self.epoch_csv_writer = csv.DictWriter(self.epoch_csv_file, fieldnames=self.epoch_csv_cols)
             self.epoch_csv_writer.writeheader()
             self.epoch_csv_file.flush()

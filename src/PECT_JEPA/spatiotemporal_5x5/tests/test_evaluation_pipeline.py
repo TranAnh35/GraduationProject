@@ -15,7 +15,7 @@ import torch
 from ..configs.config import Spatiotemporal5x5Config
 from ..models.jepa_5x5 import PECT_JEPA_5x5
 from ..evaluation.anomaly_detection import AnomalyDetector5x5
-from ..evaluation.liftoff_invariance import compute_linear_cka, compute_feature_similarity_matrix
+from ..evaluation.liftoff_invariance import compute_linear_cka, compute_feature_similarity_matrix, compute_effective_rank
 from ..evaluate import compute_anomaly_metrics
 
 
@@ -93,6 +93,23 @@ class TestEvaluationPipeline(unittest.TestCase):
         # Inverted matrices should have cosine sim = -1.0
         sim_neg = compute_feature_similarity_matrix(X, -X)
         self.assertAlmostEqual(sim_neg, -1.0, places=4)
+
+    def test_effective_rank(self):
+        """Verify effective rank computation for collapsed vs isotropic representations."""
+        np.random.seed(42)
+        N, D = 500, 64
+
+        # 1. Full isotropic Gaussian noise should have high effective rank close to D
+        X_isotropic = np.random.randn(N, D)
+        rank_iso = compute_effective_rank(X_isotropic)
+        self.assertGreater(rank_iso, 45.0, f"Isotropic rank {rank_iso} should be > 45 for D={D}")
+
+        # 2. Completely collapsed rank-1 representation (all points on 1D line)
+        v = np.random.randn(1, D)
+        scales = np.random.randn(N, 1)
+        X_collapsed = scales @ v
+        rank_collapsed = compute_effective_rank(X_collapsed)
+        self.assertAlmostEqual(rank_collapsed, 1.0, places=1, msg=f"Collapsed rank {rank_collapsed} should be ~1.0")
 
 
 if __name__ == "__main__":

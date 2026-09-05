@@ -5,6 +5,7 @@ Features multi-tier logging: TensorBoard, structured CSVs, console/file logs, an
 
 import os
 import time
+import numpy as np
 import torch
 from tqdm import tqdm
 from typing import Optional, Dict, Any
@@ -26,6 +27,7 @@ except Exception:
 from ..configs.config import Spatiotemporal5x5Config
 from ..models.jepa_5x5 import PECT_JEPA_5x5
 from ..utils.logger import PECTExperimentLogger5x5
+from ..evaluation.liftoff_invariance import compute_effective_rank
 from .optimizer import build_optimizer_5x5, WarmupCosineLRScheduler5x5, MomentumScheduler5x5
 
 
@@ -187,6 +189,7 @@ class Trainer5x5:
             leave=False
         )
 
+        val_features = []
         for batch in pbar:
             x = batch["data"].to(self.device)
             with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
@@ -196,11 +199,22 @@ class Trainer5x5:
             total_loss += loss_val
             total_pred += pred_val
             n_batches += 1
+
+            if len(val_features) < 8:
+                z_center = self.model.extract_center_feature(x)
+                val_features.append(z_center.detach().cpu().numpy())
+
             pbar.set_postfix({"v_loss": f"{loss_val:.4f}", "v_pred": f"{pred_val:.4f}"})
+
+        eff_rank = 0.0
+        if val_features:
+            feats = np.concatenate(val_features, axis=0)
+            eff_rank = compute_effective_rank(feats)
 
         return {
             "val_loss": total_loss / max(1, n_batches),
             "val_loss_pred": total_pred / max(1, n_batches),
+            "effective_rank": eff_rank,
         }
 
     def save_checkpoint(self, path: str, val_loss: Optional[float] = None):
@@ -232,11 +246,12 @@ class Trainer5x5:
             dt = time.time() - t0
 
             val_str = f" | Val Loss: {val_metrics['val_loss']:.4f}" if val_metrics else ""
+            rank_str = f" | Rank: {val_metrics['effective_rank']:.1f}/{self.config.embed_dim}" if val_metrics and "effective_rank" in val_metrics and val_metrics["effective_rank"] > 0 else ""
             log_line = (
                 f"[Epoch {epoch + 1:02d}/{self.config.epochs:02d}] "
                 f"Train Loss: {train_metrics['loss']:.4f} "
                 f"(Pred: {train_metrics['loss_pred']:.4f}, Var: {train_metrics['loss_var']:.4f}, Cov: {train_metrics['loss_cov']:.4f})"
-                f"{val_str} [{dt:.1f}s]"
+                f"{val_str}{rank_str} [{dt:.1f}s]"
             )
             if self.logger:
                 self.logger.info(log_line)
@@ -252,6 +267,8 @@ class Trainer5x5:
                 }
                 if val_metrics and "val_loss" in val_metrics:
                     epoch_data["val_loss"] = val_metrics["val_loss"]
+                if val_metrics and "effective_rank" in val_metrics:
+                    epoch_data["effective_rank"] = val_metrics["effective_rank"]
                 self.logger.log_epoch(epoch=epoch + 1, metrics=epoch_data, step=self.global_step)
 
             # Checkpoint saving

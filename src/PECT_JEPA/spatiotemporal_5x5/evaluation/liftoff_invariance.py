@@ -60,3 +60,22 @@ def compute_feature_similarity_matrix(X: np.ndarray, Y: np.ndarray) -> float:
 
     cos_sim = np.sum(X_u * Y_u, axis=-1)
     return float(np.mean(cos_sim))
+
+
+def compute_effective_rank(X: np.ndarray, eps: float = 1e-12) -> float:
+    """
+    Entropy-based effective rank (Roy & Vetterli): exp(Shannon entropy of
+    normalized squared singular values).
+    A collapsed embedding has rank ~1.0, while a healthy embedding has rank close to D (e.g. 50-128).
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim > 2:
+        X = X.reshape(-1, X.shape[-1])
+    if X.shape[0] < 2:
+        return 1.0
+    Xc = X - X.mean(axis=0, keepdims=True)
+    s = np.linalg.svd(Xc, compute_uv=False)
+    p = (s ** 2) / max(float((s ** 2).sum()), eps)
+    p = p[p > eps]
+    return float(np.exp(-(p * np.log(p)).sum()))
+
