@@ -86,6 +86,8 @@ class Trainer5x5:
         self.start_epoch = 0
         self.current_epoch = 0
         self.best_val_loss = float("inf")
+        self.best_probe_cnr = -float("inf")
+        self.patience_counter = 0
 
         if config.save_dir is None:
             base_dir = self.logger.run_dir if self.logger else os.path.join(config.log_dir, config.exp_name)
@@ -336,6 +338,7 @@ class Trainer5x5:
             "scaler_state_dict": self.scaler.state_dict() if hasattr(self, "scaler") else None,
             "val_loss": val_loss,
             "best_val_loss": self.best_val_loss,
+            "best_probe_cnr": getattr(self, "best_probe_cnr", -float("inf")),
             "effective_rank": effective_rank,
             "config": self.config.to_dict(),
         }
@@ -344,7 +347,7 @@ class Trainer5x5:
     def resume_from_checkpoint(self, checkpoint_path_or_keyword: str) -> bool:
         """
         Resumes model, optimizer, scaler, step, epoch, and best metrics from a checkpoint file
-        or keyword ('auto', 'latest', 'best').
+        or keyword ('auto', 'latest', 'best', 'best_probe').
         """
         keyword = str(checkpoint_path_or_keyword).strip()
         resolved_path = None
@@ -382,6 +385,12 @@ class Trainer5x5:
                 c_best = os.path.join(d, "best_model_5x5.pt")
                 if os.path.isfile(c_best):
                     resolved_path = c_best
+                    break
+        elif keyword.lower() in ("best_probe", "probe"):
+            for d in search_dirs:
+                c_probe = os.path.join(d, "best_probe_model_5x5.pt")
+                if os.path.isfile(c_probe):
+                    resolved_path = c_probe
                     break
         else:
             if os.path.isfile(checkpoint_path_or_keyword):
@@ -444,8 +453,9 @@ class Trainer5x5:
         self.start_epoch = max(0, saved_epoch + 1)
         self.current_epoch = self.start_epoch
 
-        # 5. Best Val Loss
+        # 5. Best Val Loss and Best Probe CNR
         self.best_val_loss = checkpoint.get("best_val_loss", checkpoint.get("val_loss", float("inf")))
+        self.best_probe_cnr = checkpoint.get("best_probe_cnr", -float("inf"))
 
         # 6. Schedulers: synchronize LR to global_step
         current_lr = self.lr_scheduler.step(self.global_step)
@@ -494,6 +504,18 @@ class Trainer5x5:
             if self.probe_grid is not None and getattr(self.config, "probe_interval", 1) > 0:
                 if (epoch + 1) % self.config.probe_interval == 0:
                     probe_metrics = self.run_downstream_probe(epoch=epoch + 1)
+                    if probe_metrics and "contrast_ratio_cnr" in probe_metrics:
+                        cnr = float(probe_metrics["contrast_ratio_cnr"])
+                        if not np.isnan(cnr) and cnr > self.best_probe_cnr:
+                            self.best_probe_cnr = cnr
+                            eff_rank = val_metrics.get("effective_rank") if val_metrics else None
+                            best_probe_path = os.path.join(self.config.save_dir, "best_probe_model_5x5.pt")
+                            self.save_checkpoint(best_probe_path, val_metrics.get("val_loss"), eff_rank)
+                            msg_probe = f"  --> Saved new best downstream probe checkpoint (CNR: {cnr:.2f}): {best_probe_path}"
+                            if self.logger:
+                                self.logger.info(msg_probe)
+                            else:
+                                print(msg_probe)
 
             val_str = f" | Val Loss: {val_metrics['val_loss']:.4f}" if val_metrics else ""
             rank_str = f" | Rank: {val_metrics['effective_rank']:.1f}/{self.config.embed_dim}" if val_metrics and "effective_rank" in val_metrics and val_metrics["effective_rank"] > 0 else ""
@@ -532,8 +554,9 @@ class Trainer5x5:
             self.save_checkpoint(latest_path, val_metrics.get("val_loss"), eff_rank)
 
             current_loss = val_metrics.get("val_loss", train_metrics["loss"])
-            if current_loss < self.best_val_loss:
+            if not np.isnan(current_loss) and current_loss < self.best_val_loss:
                 self.best_val_loss = current_loss
+                self.patience_counter = 0
                 best_path = os.path.join(self.config.save_dir, "best_model_5x5.pt")
                 self.save_checkpoint(best_path, current_loss, eff_rank)
                 msg_best = f"  --> Saved new best checkpoint: {best_path}"
@@ -541,6 +564,19 @@ class Trainer5x5:
                     self.logger.info(msg_best)
                 else:
                     print(msg_best)
+            else:
+                self.patience_counter += 1
+                patience = getattr(self.config, "early_stopping_patience", 0)
+                if patience > 0 and self.patience_counter >= patience:
+                    stop_msg = (
+                        f"[Early Stopping] Validation loss did not improve for {patience} consecutive epochs "
+                        f"(current: {current_loss:.4f}, best: {self.best_val_loss:.4f}). Stopping training at Epoch {epoch + 1}."
+                    )
+                    if self.logger:
+                        self.logger.info(stop_msg)
+                    else:
+                        print(stop_msg)
+                    break
 
         if self.logger:
             self.logger.info("--- 5x5 PECT-JEPA Training Complete ---")

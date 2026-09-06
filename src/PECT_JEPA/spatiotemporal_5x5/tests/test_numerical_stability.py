@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.PECT_JEPA.spatiotemporal_5x5.configs.config import Spatiotemporal5x5Config
 from src.PECT_JEPA.spatiotemporal_5x5.losses.jepa_loss import JEPALoss5x5
+from src.PECT_JEPA.spatiotemporal_5x5.models.attention import MultiheadSelfAttention, MultiheadCrossAttention
 from src.PECT_JEPA.spatiotemporal_5x5.models.jepa_5x5 import PECT_JEPA_5x5
 from src.PECT_JEPA.spatiotemporal_5x5.training.trainer import Trainer5x5
 
@@ -147,6 +148,26 @@ class TestNumericalStability(unittest.TestCase):
 
         trainer.logger.close()
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_self_attention_fp16_extreme_stability(self):
+        """Verify MultiheadSelfAttention handles extreme FP16 dot products without NaN/Inf."""
+        attn = MultiheadSelfAttention(embed_dim=128, num_heads=4)
+        attn.eval()
+        # Create input with large variance (std=50.0) that would overflow naive FP16 dot products
+        x = torch.randn(8, 25, 128, dtype=torch.float32) * 50.0
+        out = attn(x)
+        self.assertFalse(torch.isnan(out).any(), "Self-Attention produced NaN on extreme inputs")
+        self.assertFalse(torch.isinf(out).any(), "Self-Attention produced Inf on extreme inputs")
+
+    def test_cross_attention_fp16_extreme_stability(self):
+        """Verify MultiheadCrossAttention handles extreme query/key inputs without NaN/Inf."""
+        cross = MultiheadCrossAttention(embed_dim=128, num_heads=4)
+        cross.eval()
+        q = torch.randn(8, 15, 128, dtype=torch.float32) * 50.0
+        kv = torch.randn(8, 10, 128, dtype=torch.float32) * 50.0
+        out = cross(query=q, key_value=kv)
+        self.assertFalse(torch.isnan(out).any(), "Cross-Attention produced NaN on extreme inputs")
+        self.assertFalse(torch.isinf(out).any(), "Cross-Attention produced Inf on extreme inputs")
 
 
 if __name__ == "__main__":

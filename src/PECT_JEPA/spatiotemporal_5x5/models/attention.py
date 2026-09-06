@@ -5,10 +5,11 @@ Attention building blocks for 5x5 Spatiotemporal PECT-JEPA Transformer.
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MultiheadSelfAttention(nn.Module):
-    """Standard Multi-Head Self-Attention with Pre-LN."""
+    """Standard Multi-Head Self-Attention with Pre-LN and SDPA numerical stability."""
     def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.0):
         super().__init__()
         assert embed_dim % num_heads == 0, f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
@@ -16,6 +17,7 @@ class MultiheadSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.dropout = dropout
 
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.proj = nn.Linear(embed_dim, embed_dim)
@@ -24,19 +26,30 @@ class MultiheadSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, D = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, H, N, d]
+        q, k, v = qkv[0].contiguous(), qkv[1].contiguous(), qkv[2].contiguous()  # [B, H, N, d]
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.drop(attn)
+        if hasattr(F, "scaled_dot_product_attention"):
+            # FlashAttention / Memory-Efficient attention with internal FP32 accumulation
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=self.scale
+            )
+        else:
+            # Fallback: clamp attention logits and compute softmax in FP32 to prevent FP16 overflow
+            attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+            attn_scores = torch.clamp(attn_scores, min=-65000.0, max=65000.0)
+            attn = torch.softmax(attn_scores.float(), dim=-1).to(q.dtype)
+            attn = self.drop(attn)
+            out = attn @ v
 
-        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        out = out.transpose(1, 2).reshape(B, N, D)
         out = self.proj(out)
         return out
 
 
 class MultiheadCrossAttention(nn.Module):
-    """Multi-Head Cross-Attention from Query to Key/Value memory."""
+    """Multi-Head Cross-Attention from Query to Key/Value memory with SDPA numerical stability."""
     def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.0):
         super().__init__()
         assert embed_dim % num_heads == 0
@@ -44,6 +57,7 @@ class MultiheadCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.dropout = dropout
 
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
@@ -55,15 +69,26 @@ class MultiheadCrossAttention(nn.Module):
         B, N_q, D = query.shape
         _, N_kv, _ = key_value.shape
 
-        q = self.q_proj(query).reshape(B, N_q, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(query).reshape(B, N_q, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = self.k_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = self.v_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.drop(attn)
+        if hasattr(F, "scaled_dot_product_attention"):
+            # FlashAttention / Memory-Efficient attention with internal FP32 accumulation
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=self.scale
+            )
+        else:
+            # Fallback: clamp attention logits and compute softmax in FP32 to prevent FP16 overflow
+            attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+            attn_scores = torch.clamp(attn_scores, min=-65000.0, max=65000.0)
+            attn = torch.softmax(attn_scores.float(), dim=-1).to(q.dtype)
+            attn = self.drop(attn)
+            out = attn @ v
 
-        out = (attn @ v).transpose(1, 2).reshape(B, N_q, D)
+        out = out.transpose(1, 2).reshape(B, N_q, D)
         out = self.out_proj(out)
         return out
 

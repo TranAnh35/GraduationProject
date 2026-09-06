@@ -133,6 +133,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to specific validation TDMS file to run downstream anomaly detection on after each epoch (default: auto-selects 1st defect file from val set)")
     p.add_argument("--probe_interval", type=int, default=1,
                    help="Frequency of running downstream probe on validation file (default: 1 = every epoch; 0 = disable)")
+    p.add_argument("--early_stopping_patience", type=int, default=0,
+                   help="Stop training early if val_loss fails to improve for N epochs (0 = disabled)")
     p.add_argument("--resume", type=str, default=None,
                    help="Resume training from checkpoint: filepath (.pt), 'latest', 'best', or 'auto' (default: None)")
 
@@ -177,6 +179,7 @@ def main():
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         log_histograms=args.log_histograms,
+        early_stopping_patience=args.early_stopping_patience,
         resume=args.resume,
     )
 

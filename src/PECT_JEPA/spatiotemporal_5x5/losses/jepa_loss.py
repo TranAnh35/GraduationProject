@@ -30,9 +30,9 @@ class JEPALoss5x5(nn.Module):
 
     def latent_prediction_loss(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
         safe_eps = max(self.eps, 1e-5)
-        # Ensure FP32 precision to prevent numerical instability under mixed precision
-        H_pred = H_pred.float()
-        H_target = H_target.float()
+        # Ensure FP32 precision and sanitize non-finite values to prevent numerical instability
+        H_pred = torch.nan_to_num(H_pred.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        H_target = torch.nan_to_num(H_target.float(), nan=0.0, posinf=50.0, neginf=-50.0)
         if self.loss_type == "smooth_l1":
             return F.smooth_l1_loss(H_pred, H_target, beta=1.0)
         elif self.loss_type == "l1":
@@ -48,26 +48,28 @@ class JEPALoss5x5(nn.Module):
 
     def variance_hinge(self, H_pred: torch.Tensor) -> torch.Tensor:
         """Forces batch variance along each dimension to be >= var_gamma (computed in FP32)."""
-        # Force FP32: avoids FP16 underflow/rounding errors
-        z = H_pred.float()
+        # Force FP32 and sanitize non-finite values
+        z = torch.nan_to_num(H_pred.float(), nan=0.0, posinf=50.0, neginf=-50.0)
         B, N, D = z.shape
         z = z.reshape(B * N, D)
         safe_eps = max(self.eps, 1e-5)
         # Clamp variance to >= 0.0 to guard against negative variance from FP rounding
         var = torch.clamp(z.var(dim=0, unbiased=False), min=0.0)
         std = torch.sqrt(var + safe_eps)  # [D]
+        std = torch.nan_to_num(std, nan=0.0, posinf=self.var_gamma)
         return torch.mean(F.relu(self.var_gamma - std))
 
     def covariance_penalty(self, H_pred: torch.Tensor) -> torch.Tensor:
         """Decorrelates embedding dimensions to maximize information content (computed in FP32)."""
         # Force FP32: inner product z.T @ z with B*N > 6000 easily overflows FP16 max (65,504) -> inf -> NaN
-        z = H_pred.float()
+        z = torch.nan_to_num(H_pred.float(), nan=0.0, posinf=50.0, neginf=-50.0)
         B, N, D = z.shape
         z = z.reshape(B * N, D)
         z = z - z.mean(dim=0, keepdim=True)
         cov = (z.T @ z) / max(1, z.shape[0] - 1)  # [D, D]
         off_diag = cov - torch.diag(torch.diag(cov))
-        return (off_diag ** 2).sum() / D
+        cov_penalty = (off_diag ** 2).sum() / D
+        return torch.nan_to_num(cov_penalty, nan=0.0, posinf=1.0)
 
     def forward(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> Dict[str, torch.Tensor]:
         l_pred = self.latent_prediction_loss(H_pred, H_target)
