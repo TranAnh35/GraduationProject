@@ -78,7 +78,10 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.liftoff_invariance import (
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("5x5 Spatiotemporal PECT-JEPA Evaluation")
-    p.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Path to model checkpoint (.pt), or keyword ('best', 'latest', 'best_probe')")
+    p.add_argument("--exp_name", type=str, default=None,
+                   help="Experiment name or prefix to evaluate (auto-discovers latest run in experiments/5x5/)")
     p.add_argument("--file", type=str, default=None, help="Path to single TDMS file for defect mapping")
     p.add_argument("--data_dir", type=str, default="data", help="Data directory containing TDMS files")
     p.add_argument("--split_summary", type=str, default=None,
@@ -94,8 +97,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Sensor hardware held out for compound_ood (default: 'TMR')")
     p.add_argument("--holdout_waveform", type=str, default="Chirp",
                    help="Waveform shape held out for compound_ood (default: 'Chirp')")
-    p.add_argument("--output_dir", type=str, default="evaluation_results/5x5",
-                   help="Directory to save evaluation artifacts and heatmaps")
+    p.add_argument("--output_dir", type=str, default=None,
+                   help="Directory to save evaluation artifacts and heatmaps (default: auto inside experiment run dir)")
     p.add_argument("--eval_liftoff", action="store_true", default=False,
                    help="Compute Linear CKA across lift-off variations (z1 vs z2 vs z3)")
     p.add_argument("--save_features", action="store_true", default=False,
@@ -108,22 +111,73 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def resolve_checkpoint_path(checkpoint_path: str) -> str:
-    if os.path.isfile(checkpoint_path):
+def resolve_checkpoint_path(checkpoint_path: Optional[str] = None, exp_name: Optional[str] = None) -> str:
+    """
+    Intelligently resolves model checkpoint path.
+    Supports:
+    - Direct filepath (.pt)
+    - Keyword ('best', 'latest', 'best_probe', 'auto')
+    - Experiment name or prefix with automatic timestamp discovery (e.g. --exp_name pect_jepa)
+    """
+    if checkpoint_path and os.path.isfile(checkpoint_path):
         return checkpoint_path
-    base = os.path.basename(checkpoint_path)
-    candidates = [
-        os.path.join("experiments/5x5", checkpoint_path),
-        os.path.join("experiments/5x5", checkpoint_path, "checkpoints", base),
-        os.path.join("experiments/5x5", os.path.dirname(checkpoint_path), "checkpoints", base),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return checkpoint_path
+
+    search_base = "experiments/5x5"
+    target_key = (checkpoint_path or "best").strip().lower()
+
+    # 1. Direct path / subfolder candidates
+    if checkpoint_path:
+        base = os.path.basename(checkpoint_path)
+        candidates = [
+            os.path.join(search_base, checkpoint_path),
+            os.path.join(search_base, checkpoint_path, "checkpoints", base),
+            os.path.join(search_base, os.path.dirname(checkpoint_path), "checkpoints", base),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+
+    # 2. Discover matching experiment directories in experiments/5x5/
+    if os.path.isdir(search_base):
+        subdirs = []
+        for d in os.listdir(search_base):
+            full_d = os.path.join(search_base, d)
+            if os.path.isdir(full_d):
+                if exp_name:
+                    if d == exp_name or d.startswith(f"{exp_name}_"):
+                        subdirs.append(full_d)
+                elif checkpoint_path and target_key not in ("auto", "latest", "best", "best_probe", "probe"):
+                    if d == checkpoint_path or d.startswith(f"{checkpoint_path}_"):
+                        subdirs.append(full_d)
+                else:
+                    subdirs.append(full_d)
+
+        # Sort by modification time (most recent first)
+        subdirs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+        target_files = []
+        if target_key in ("probe", "best_probe"):
+            target_files = ["best_probe_model_5x5.pt", "best_model_5x5.pt", "latest_model_5x5.pt"]
+        elif target_key in ("latest", "auto"):
+            target_files = ["latest_model_5x5.pt", "best_model_5x5.pt", "best_probe_model_5x5.pt"]
+        else:  # default 'best'
+            target_files = ["best_model_5x5.pt", "best_probe_model_5x5.pt", "latest_model_5x5.pt"]
+
+        for d in subdirs:
+            for fname in target_files:
+                cand = os.path.join(d, "checkpoints", fname)
+                if os.path.isfile(cand):
+                    return cand
+                cand2 = os.path.join(d, fname)
+                if os.path.isfile(cand2):
+                    return cand2
+
+    if checkpoint_path:
+        return checkpoint_path
+    raise FileNotFoundError("Could not automatically locate any model checkpoint in experiments/5x5.")
 
 
-def resolve_split_summary_path(split_summary_path: Optional[str], checkpoint_path: Optional[str] = None) -> Optional[str]:
+def resolve_split_summary_path(split_summary_path: Optional[str] = None, checkpoint_path: Optional[str] = None) -> Optional[str]:
     if split_summary_path and os.path.isfile(split_summary_path):
         return split_summary_path
     candidates = []
@@ -332,14 +386,25 @@ def evaluate_liftoff_invariance(
 
 def main():
     args = build_arg_parser().parse_args()
+
+    checkpoint_path = resolve_checkpoint_path(args.checkpoint, exp_name=args.exp_name)
+    args.checkpoint = checkpoint_path
+
+    # Output directory resolution: if not specified, save alongside experiment run
+    if args.output_dir is None:
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        parent_dir = os.path.dirname(ckpt_dir)
+        args.output_dir = os.path.join(parent_dir, "evaluation_results") if os.path.isdir(parent_dir) else "evaluation_results/5x5"
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 70)
     print("  5x5 SPATIOTEMPORAL PECT-JEPA EVALUATION SUITE")
     print("=" * 70)
+    print(f"[Evaluation] Model Checkpoint: {checkpoint_path}")
+    print(f"[Evaluation] Output Directory: {args.output_dir}")
 
     # Load model
-    model = load_model_from_checkpoint(args.checkpoint, device=args.device)
+    model = load_model_from_checkpoint(checkpoint_path, device=args.device)
 
     # 1. Determine evaluation test file set
     test_files: List[str] = []
@@ -347,7 +412,7 @@ def main():
     protocol_name: str = "custom"
     holdout_target: str = "none"
 
-    resolved_split_summary = resolve_split_summary_path(args.split_summary, checkpoint_path=args.checkpoint)
+    resolved_split_summary = resolve_split_summary_path(args.split_summary, checkpoint_path=checkpoint_path)
 
     if args.file and os.path.exists(args.file):
         test_files = [args.file]

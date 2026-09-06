@@ -135,6 +135,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Frequency of running downstream probe on validation file (default: 1 = every epoch; 0 = disable)")
     p.add_argument("--early_stopping_patience", type=int, default=0,
                    help="Stop training early if val_loss fails to improve for N epochs (0 = disabled)")
+    p.add_argument("--eval_after_train", type=lambda v: v.lower() == "true", default=False,
+                   help="Automatically run downstream evaluation suite immediately after training completes")
     p.add_argument("--resume", type=str, default=None,
                    help="Resume training from checkpoint: filepath (.pt), 'latest', 'best', or 'auto' (default: None)")
 
@@ -350,6 +352,35 @@ def main():
     )
 
     trainer.fit()
+
+    # Optional automated post-training evaluation suite
+    if getattr(args, "eval_after_train", False):
+        logger.info("--- Initiating Automated Post-Training Evaluation Suite ---")
+        best_ckpt = os.path.join(config.save_dir, "best_model_5x5.pt")
+        if not os.path.isfile(best_ckpt):
+            best_ckpt = os.path.join(config.save_dir, "latest_model_5x5.pt")
+
+        if os.path.isfile(best_ckpt):
+            from .evaluate import main as eval_main
+            eval_out_dir = os.path.join(logger.run_dir, "evaluation_results")
+            eval_args = [
+                "--checkpoint", best_ckpt,
+                "--split_summary", split_summary_path,
+                "--output_dir", eval_out_dir,
+                "--data_dir", config.data_dir,
+                "--device", config.device,
+                "--crop_border", str(config.crop_border),
+            ]
+            old_argv = sys.argv
+            try:
+                sys.argv = [old_argv[0]] + eval_args
+                eval_main()
+            except Exception as e:
+                logger.warning(f"[Post-Train Eval] Evaluation failed with error: {e}")
+            finally:
+                sys.argv = old_argv
+        else:
+            logger.warning(f"[Post-Train Eval] No checkpoint found in {config.save_dir} to evaluate.")
 
 
 if __name__ == "__main__":
