@@ -71,15 +71,16 @@ class WarmupCosineLRScheduler5x5:
 
 
 class MomentumScheduler5x5:
-    """Cosine momentum scheduler for EMA target encoder update (momentum -> 1.0)."""
-    def __init__(self, base_momentum: float = 0.996, final_momentum: float = 1.0, total_steps: int = 1000):
+    """Cosine momentum scheduler for EMA target encoder update (momentum -> 0.999)."""
+    def __init__(self, base_momentum: float = 0.996, final_momentum: float = 0.999, total_steps: int = 1000):
         self.base_momentum = base_momentum
-        self.final_momentum = final_momentum
+        self.final_momentum = min(0.9999, final_momentum)
         self.total_steps = max(1, total_steps)
 
     def get_momentum(self, current_step: int) -> float:
         progress = min(1.0, current_step / self.total_steps)
         # Cosine ramp from base_momentum to final_momentum
-        return self.final_momentum - (self.final_momentum - self.base_momentum) * (
+        m = self.final_momentum - (self.final_momentum - self.base_momentum) * (
             0.5 * (1.0 + math.cos(math.pi * progress))
         )
+        return min(self.final_momentum, max(self.base_momentum, m))

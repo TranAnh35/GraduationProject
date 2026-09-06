@@ -169,6 +169,35 @@ class TestNumericalStability(unittest.TestCase):
         self.assertFalse(torch.isnan(out).any(), "Cross-Attention produced NaN on extreme inputs")
         self.assertFalse(torch.isinf(out).any(), "Cross-Attention produced Inf on extreme inputs")
 
+    def test_vicreg_context_gradient_flow(self):
+        """Verify C-JEPA: VICReg applied to H_ctx directly flows gradients to context representation."""
+        loss_fn = JEPALoss5x5(vicreg_target="context", var_weight=1.0, cov_weight=0.5)
+        H_ctx = torch.randn(4, 10, 32, requires_grad=True)
+        H_pred = torch.randn(4, 15, 32, requires_grad=True)
+        H_tgt = torch.randn(4, 15, 32)
+
+        loss_dict = loss_fn(H_pred, H_tgt, H_ctx=H_ctx)
+        loss_dict["loss"].backward()
+
+        self.assertIsNotNone(H_ctx.grad, "H_ctx must receive direct gradients when vicreg_target='context'")
+        self.assertGreater(torch.norm(H_ctx.grad).item(), 0.0)
+
+    def test_momentum_scheduler_clamping(self):
+        """Verify momentum scheduler never exceeds 0.999 (preventing target freeze at 1.0)."""
+        from src.PECT_JEPA.spatiotemporal_5x5.training.optimizer import MomentumScheduler5x5
+        scheduler = MomentumScheduler5x5(base_momentum=0.996, final_momentum=0.999, total_steps=100)
+        # Check initial, intermediate, and final step momentum values
+        m_start = scheduler.get_momentum(0)
+        m_mid = scheduler.get_momentum(50)
+        m_end = scheduler.get_momentum(100)
+        m_over = scheduler.get_momentum(150)
+
+        self.assertAlmostEqual(m_start, 0.996, places=5)
+        self.assertLess(m_start, m_mid)
+        self.assertLessEqual(m_end, 0.999)
+        self.assertLessEqual(m_over, 0.999)
+        self.assertLess(m_end, 1.0, "Momentum must be strictly less than 1.0 to keep targets dynamic")
+
 
 if __name__ == "__main__":
     unittest.main()

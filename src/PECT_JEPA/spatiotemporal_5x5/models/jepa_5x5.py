@@ -79,7 +79,8 @@ class PECT_JEPA_5x5(nn.Module):
             eps=config.eps,
             var_weight=config.var_weight,
             cov_weight=config.cov_weight,
-            var_gamma=config.var_gamma
+            var_gamma=config.var_gamma,
+            vicreg_target=getattr(config, "vicreg_target", "context"),
         )
 
     def _init_target_encoder(self):
@@ -143,8 +144,8 @@ class PECT_JEPA_5x5(nn.Module):
         with torch.no_grad():
             H_tgt = self.target_encoder(target_tokens, target_pos)
 
-        # 7. JEPA Loss + Anti-collapse
-        loss_dict = self.loss_fn(H_pred, H_tgt)
+        # 7. JEPA Loss + Anti-collapse (C-JEPA regularizes H_ctx by default)
+        loss_dict = self.loss_fn(H_pred, H_tgt, H_ctx=H_ctx)
         loss_dict.update({
             "H_pred": H_pred,
             "H_tgt": H_tgt,

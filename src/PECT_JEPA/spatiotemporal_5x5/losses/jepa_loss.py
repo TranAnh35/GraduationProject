@@ -2,7 +2,7 @@
 JEPA Loss for 5x5 PECT-JEPA: Smooth L1 Prediction Loss + VICReg Anti-Collapse.
 """
 
-from typing import Dict
+from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +11,7 @@ import torch.nn.functional as F
 class JEPALoss5x5(nn.Module):
     """
     Smooth L1 latent prediction loss + VICReg variance hinge & covariance penalty.
+    Supports C-JEPA regularizing context encoder representations (H_ctx), predictor (H_pred), or both.
     """
 
     def __init__(
@@ -19,7 +20,8 @@ class JEPALoss5x5(nn.Module):
         eps: float = 1e-8,
         var_weight: float = 1.0,
         cov_weight: float = 0.5,
-        var_gamma: float = 1.0
+        var_gamma: float = 1.0,
+        vicreg_target: str = "context",
     ):
         super().__init__()
         self.loss_type = loss_type
@@ -27,6 +29,7 @@ class JEPALoss5x5(nn.Module):
         self.var_weight = var_weight
         self.cov_weight = cov_weight
         self.var_gamma = var_gamma
+        self.vicreg_target = vicreg_target
 
     def latent_prediction_loss(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
         safe_eps = max(self.eps, 1e-5)
@@ -71,10 +74,28 @@ class JEPALoss5x5(nn.Module):
         cov_penalty = (off_diag ** 2).sum() / D
         return torch.nan_to_num(cov_penalty, nan=0.0, posinf=1.0)
 
-    def forward(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        H_pred: torch.Tensor,
+        H_target: torch.Tensor,
+        H_ctx: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         l_pred = self.latent_prediction_loss(H_pred, H_target)
-        l_var = self.variance_hinge(H_pred)
-        l_cov = self.covariance_penalty(H_pred)
+
+        # Anti-collapse / decorrelation target (C-JEPA, NeurIPS 2024):
+        # 'context': regularizes Online Context Encoder directly (prevents dimensional collapse of representations)
+        # 'both': regularizes both H_ctx and H_pred
+        # 'predictor': regularizes H_pred only (legacy fallback)
+        if self.vicreg_target == "context" and H_ctx is not None:
+            l_var = self.variance_hinge(H_ctx)
+            l_cov = self.covariance_penalty(H_ctx)
+        elif self.vicreg_target == "both" and H_ctx is not None:
+            l_var = 0.5 * (self.variance_hinge(H_ctx) + self.variance_hinge(H_pred))
+            l_cov = 0.5 * (self.covariance_penalty(H_ctx) + self.covariance_penalty(H_pred))
+        else:
+            l_var = self.variance_hinge(H_pred)
+            l_cov = self.covariance_penalty(H_pred)
+
         total = l_pred + self.var_weight * l_var + self.cov_weight * l_cov
         return {
             "loss": total,

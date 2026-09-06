@@ -17,11 +17,14 @@ class AnomalyDetector5x5:
     """
     Downstream anomaly detector on frozen 5x5 representations [sY, sX, D].
     Uses unsupervised clustering to automatically isolate the dominant sound metal cluster.
+    Supports both cosine distance (orientation deviation) and euclidean distance (magnitude shift).
     """
 
-    def __init__(self, n_clusters: int = 2):
+    def __init__(self, n_clusters: int = 2, metric: str = "cosine"):
         self.n_clusters = n_clusters
+        self.metric = metric
         self.normal_prototype: Optional[np.ndarray] = None
+        self.raw_prototype: Optional[np.ndarray] = None
 
     def fit(self, train_features: np.ndarray):
         """
@@ -38,6 +41,12 @@ class AnomalyDetector5x5:
 
         proto = kmeans.cluster_centers_[dominant_id]
         self.normal_prototype = proto / (np.linalg.norm(proto) + 1e-8)
+        # Store mean of dominant cluster in original feature scale
+        mask_dominant = kmeans.labels_ == dominant_id
+        if np.any(mask_dominant):
+            self.raw_prototype = np.mean(flat[mask_dominant], axis=0)
+        else:
+            self.raw_prototype = proto
 
     def score_map(self, test_map: np.ndarray) -> np.ndarray:
         """
@@ -47,18 +56,25 @@ class AnomalyDetector5x5:
         assert self.normal_prototype is not None, "Detector must be fitted first"
         sY, sX, D = test_map.shape
         flat = test_map.reshape(-1, D).astype(np.float32)
-        norms = np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-8
-        flat_norm = flat / norms
 
-        # Cosine distance: 1 - cos(theta)
-        cos_sim = np.dot(flat_norm, self.normal_prototype)
-        scores_1d = 1.0 - cos_sim
+        if self.metric == "euclidean" and self.raw_prototype is not None:
+            # Euclidean distance from sound metal baseline in latent space
+            diff = flat - self.raw_prototype
+            scores_1d = np.linalg.norm(diff, axis=-1)
+        else:
+            # Cosine distance: 1 - cos(theta)
+            norms = np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-8
+            flat_norm = flat / norms
+            cos_sim = np.dot(flat_norm, self.normal_prototype)
+            scores_1d = 1.0 - cos_sim
+
         return scores_1d.reshape(sY, sX).astype(np.float32)
 
 
-def compute_anomaly_metrics(score_map: np.ndarray, top_percentile: float = 95.0) -> Dict[str, float]:
+def compute_anomaly_metrics(score_map: np.ndarray, top_percentile: float = 90.0) -> Dict[str, float]:
     """
-    Computes quantitative defect detection metrics on the 2D anomaly score map:
+    Computes quantitative defect detection metrics on the 2D anomaly score map.
+    Default top_percentile=90.0 (top 10%) covers the multi-defect calibration matrix (~25 corrosion spots).
     - contrast_ratio_cnr: (defect_mean - background_mean) / (background_std + 1e-8)
     - peak_contrast_ratio: (max_score - background_mean) / (background_std + 1e-8)
     """

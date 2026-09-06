@@ -97,7 +97,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="JEPA latent prediction loss function (default: smooth_l1)")
     p.add_argument("--cov_weight", type=float, default=0.5, help="VICReg covariance penalty weight (default: 0.5)")
     p.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (default: 1.0)")
+    p.add_argument("--vicreg_target", type=str, default="context", choices=["context", "both", "predictor"],
+                   help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
     p.add_argument("--ema_momentum", type=float, default=0.996, help="Target encoder base EMA momentum (default: 0.996)")
+    p.add_argument("--ema_momentum_end", type=float, default=0.999,
+                   help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
     p.add_argument("--embed_dim", type=int, default=128, help="Latent embedding dimension D (default: 128)")
     p.add_argument("--encoder_depth", type=int, default=4, help="Context/Target encoder Transformer depth")
     p.add_argument("--predictor_depth", type=int, default=2, help="Predictor Transformer depth")
@@ -133,8 +137,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to specific validation TDMS file to run downstream anomaly detection on after each epoch (default: auto-selects 1st defect file from val set)")
     p.add_argument("--probe_interval", type=int, default=1,
                    help="Frequency of running downstream probe on validation file (default: 1 = every epoch; 0 = disable)")
-    p.add_argument("--early_stopping_patience", type=int, default=0,
-                   help="Stop training early if val_loss fails to improve for N epochs (0 = disabled)")
+    p.add_argument("--early_stopping_patience", type=int, default=5,
+                   help="Stop training early if val_loss fails to improve for N epochs (default: 5; 0 = disabled)")
     p.add_argument("--eval_after_train", type=lambda v: v.lower() == "true", default=False,
                    help="Automatically run downstream evaluation suite immediately after training completes")
     p.add_argument("--resume", type=str, default=None,
@@ -165,7 +169,9 @@ def main():
         loss_type=args.loss_type,
         cov_weight=args.cov_weight,
         var_weight=args.var_weight,
+        vicreg_target=args.vicreg_target,
         ema_momentum=args.ema_momentum,
+        ema_momentum_end=args.ema_momentum_end,
         embed_dim=args.embed_dim,
         encoder_depth=args.encoder_depth,
         predictor_depth=args.predictor_depth,
@@ -181,6 +187,8 @@ def main():
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         log_histograms=args.log_histograms,
+        probe_file=args.probe_file,
+        probe_interval=args.probe_interval,
         early_stopping_patience=args.early_stopping_patience,
         resume=args.resume,
     )

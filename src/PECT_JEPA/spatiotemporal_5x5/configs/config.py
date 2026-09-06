@@ -44,7 +44,7 @@ class Spatiotemporal5x5Config:
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     ema_momentum: float = 0.996
-    ema_momentum_end: float = 1.0
+    ema_momentum_end: float = 0.999      # Capped at 0.999 (never 1.0) to keep target encoder dynamic
     use_momentum_schedule: bool = True
 
     # ------------------------------------------------------------------- Loss
@@ -52,6 +52,7 @@ class Spatiotemporal5x5Config:
     var_weight: float = 1.0              # VICReg variance hinge weight
     cov_weight: float = 0.5              # VICReg covariance decorrelation weight
     var_gamma: float = 1.0               # Target variance standard deviation
+    vicreg_target: str = "context"       # 'context' (C-JEPA on H_ctx) | 'both' | 'predictor'
 
     # --------------------------------------------------------------- Training
     batch_size: int = 256
@@ -59,7 +60,7 @@ class Spatiotemporal5x5Config:
     min_lr: float = 1e-6
     warmup_epochs: int = 5
     weight_decay: float = 0.05
-    epochs: int = 50
+    epochs: int = 20                     # 20 epochs (~60k steps) prevents late-stage overtraining
     grad_clip: float = 1.0
     mixed_precision: bool = True
     device: str = "cuda"
@@ -78,7 +79,7 @@ class Spatiotemporal5x5Config:
     val_interval: int = 1
     probe_file: Optional[str] = None     # Optional TDMS file for epoch-by-epoch downstream probing (if None, auto-selects from val set)
     probe_interval: int = 1              # Run downstream anomaly probe every N epochs (0 to disable, 1 = every epoch)
-    early_stopping_patience: int = 0     # Stop training early if val_loss fails to improve for N epochs (0 = disabled)
+    early_stopping_patience: int = 5     # Stop training early if val_loss fails to improve for N epochs (0 = disabled)
     seed: int = 42
     resume: Optional[str] = None         # Checkpoint path or 'latest' / 'auto' / 'best' to resume from
 
