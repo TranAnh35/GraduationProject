@@ -301,20 +301,26 @@ class Trainer5x5:
                 show_pbar=False,
             )
 
-            # 2. Fit unsupervised anomaly detector on representations
-            detector = AnomalyDetector5x5(n_clusters=2)
+            # 2. Fit unsupervised anomaly detector on representations (uses 2D spatial detrending)
+            detector = AnomalyDetector5x5(n_clusters=2, detrend=True)
             detector.fit(feature_map)
             score_map = detector.score_map(feature_map)
 
-            # 3. Compute quantitative defect contrast metrics
+            # 3. Compute quantitative defect contrast metrics & probe representation rank
             metrics = compute_anomaly_metrics(score_map)
             cnr = metrics["contrast_ratio_cnr"]
+
+            from scipy.ndimage import gaussian_filter
+            fmap_f32 = feature_map.astype(np.float32)
+            fmap_bg = gaussian_filter(fmap_f32, sigma=(15, 15, 0), mode="nearest")
+            probe_rank_detrended = compute_effective_rank((fmap_f32 - fmap_bg).reshape(-1, fmap_f32.shape[-1]))
+            metrics["probe_rank_detrended"] = float(probe_rank_detrended)
 
             # 4. Save heatmap image to disk
             probe_dir = os.path.join(self.logger.run_dir if self.logger else "experiments/5x5", "probe_heatmaps")
             os.makedirs(probe_dir, exist_ok=True)
             heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_cnr_{cnr:.2f}.png")
-            title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f}"
+            title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f} (Rank: {probe_rank_detrended:.1f})"
             fig = plot_anomaly_heatmap_5x5(score_map, save_path=heatmap_path, title=title, close_fig=False)
 
             # 5. Log figure to TensorBoard & WandB
@@ -518,8 +524,12 @@ class Trainer5x5:
                                 print(msg_probe)
 
             val_str = f" | Val Loss: {val_metrics['val_loss']:.4f}" if val_metrics else ""
-            rank_str = f" | Rank: {val_metrics['effective_rank']:.1f}/{self.config.embed_dim}" if val_metrics and "effective_rank" in val_metrics and val_metrics["effective_rank"] > 0 else ""
-            probe_str = f" | Probe CNR: {probe_metrics['contrast_ratio_cnr']:.2f}" if probe_metrics else ""
+            rank_str = f" | Val Rank: {val_metrics['effective_rank']:.1f}/{self.config.embed_dim}" if val_metrics and "effective_rank" in val_metrics and val_metrics["effective_rank"] > 0 else ""
+            probe_str = ""
+            if probe_metrics:
+                p_cnr = probe_metrics['contrast_ratio_cnr']
+                p_rk = probe_metrics.get('probe_rank_detrended')
+                probe_str = f" | Probe CNR: {p_cnr:.2f}" + (f" (Probe Rank: {p_rk:.1f})" if p_rk is not None else "")
             log_line = (
                 f"[Epoch {epoch + 1:02d}/{self.config.epochs:02d}] "
                 f"Train Loss: {train_metrics['loss']:.4f} "
@@ -546,6 +556,8 @@ class Trainer5x5:
                     epoch_data["effective_rank"] = val_metrics["effective_rank"]
                 if probe_metrics and "contrast_ratio_cnr" in probe_metrics:
                     epoch_data["probe_cnr"] = probe_metrics["contrast_ratio_cnr"]
+                if probe_metrics and "probe_rank_detrended" in probe_metrics:
+                    epoch_data["probe_rank"] = probe_metrics["probe_rank_detrended"]
                 self.logger.log_epoch(epoch=epoch + 1, metrics=epoch_data, step=self.global_step)
 
             # Checkpoint saving

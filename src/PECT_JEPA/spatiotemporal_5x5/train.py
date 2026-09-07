@@ -326,8 +326,10 @@ def main():
         val_loader_kwargs["persistent_workers"] = True
         val_loader_kwargs["prefetch_factor"] = 2
 
+    val_g = torch.Generator()
+    val_g.manual_seed(config.seed)
     val_loader = DataLoader(
-        val_set, batch_size=config.batch_size, shuffle=False, **val_loader_kwargs
+        val_set, batch_size=config.batch_size, shuffle=True, generator=val_g, **val_loader_kwargs
     )
 
     # 2. Model initialization

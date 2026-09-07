@@ -10,19 +10,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.cluster import MiniBatchKMeans
+from scipy.ndimage import gaussian_filter
 from typing import Optional, Dict, Any
 
 
 class AnomalyDetector5x5:
     """
     Downstream anomaly detector on frozen 5x5 representations [sY, sX, D].
-    Uses unsupervised clustering to automatically isolate the dominant sound metal cluster.
-    Supports both cosine distance (orientation deviation) and euclidean distance (magnitude shift).
+    Uses 2D spatial detrending (local baseline contrast) to eliminate low-frequency
+    mechanical scanner lift-off tilt and environmental drift, isolating localized defects.
+    Supports local contrast detrending, raw euclidean distance, and cosine distance.
     """
 
-    def __init__(self, n_clusters: int = 2, metric: str = "euclidean"):
+    def __init__(
+        self,
+        n_clusters: int = 2,
+        metric: str = "euclidean",
+        detrend: bool = True,
+        detrend_sigma: float = 15.0,
+    ):
         self.n_clusters = n_clusters
         self.metric = metric
+        self.detrend = detrend
+        self.detrend_sigma = detrend_sigma
         self.normal_prototype: Optional[np.ndarray] = None
         self.raw_prototype: Optional[np.ndarray] = None
 
@@ -64,6 +74,17 @@ class AnomalyDetector5x5:
         Compute 2D anomaly score map for test_map [sY, sX, D].
         Returns: [sY, sX] float32 array where higher score = more anomalous.
         """
+        if test_map.ndim == 3 and self.detrend:
+            sY, sX, D = test_map.shape
+            if min(sY, sX) >= 5:
+                # 2D Spatial Detrending: filter out low-frequency mechanical scanner tilt / lift-off drift
+                sigma = float(min(self.detrend_sigma, max(2.0, min(sY, sX) / 3.0)))
+                fmap_f32 = test_map.astype(np.float32)
+                fmap_bg = gaussian_filter(fmap_f32, sigma=(sigma, sigma, 0), mode="nearest")
+                # Feature-level local contrast: residual vector norm against local sound baseline
+                diff = fmap_f32 - fmap_bg
+                return np.linalg.norm(diff, axis=-1).astype(np.float32)
+
         assert (self.raw_prototype is not None if self.metric == "euclidean" else self.normal_prototype is not None), "Detector must be fitted first"
         sY, sX, D = test_map.shape
         flat = test_map.reshape(-1, D).astype(np.float32)
@@ -133,7 +154,7 @@ def plot_anomaly_heatmap_5x5(
     if vmax <= vmin:
         vmax = float(np.max(anomaly_map))
     im = plt.imshow(anomaly_map, cmap="jet", aspect="equal", origin="lower", vmin=vmin, vmax=vmax)
-    plt.colorbar(im, label="Anomaly Score (Euclidean Distance to Sound Baseline)")
+    plt.colorbar(im, label="Anomaly Score (Local Baseline Contrast)")
     plt.title(title, fontsize=11, fontweight="bold")
     plt.xlabel("Scan X (pixels)")
     plt.ylabel("Scan Y (pixels)")
