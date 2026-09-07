@@ -89,13 +89,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--resample_mode", type=str, default="linear", choices=["linear", "dual_channel"],
                    help="Resampling mode: 'linear' (128 samples) or 'dual_channel' (256 samples)")
     p.add_argument("--in_channels", type=int, default=128, help="Number of temporal channels (128 for linear, 256 for dual)")
-    p.add_argument("--crop_border", type=int, default=10,
-                   help="Number of outer boundary pixels to crop on each edge (default: 10 to remove air/edge effect)")
+    p.add_argument("--crop_border", type=int, default=15,
+                   help="Number of outer boundary pixels to crop on each edge (default: 15 to remove air/edge effect)")
     p.add_argument("--normalization", type=str, default="global_peak", choices=["global_peak", "zscore", "peak_early", "min_max"])
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
     p.add_argument("--loss_type", type=str, default="smooth_l1", choices=["smooth_l1", "l1", "l2", "cosine"],
                    help="JEPA latent prediction loss function (default: smooth_l1)")
-    p.add_argument("--cov_weight", type=float, default=0.5, help="VICReg covariance penalty weight (default: 0.5)")
+    p.add_argument("--cov_weight", type=float, default=2.0, help="VICReg covariance penalty weight (default: 2.0)")
     p.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (default: 1.0)")
     p.add_argument("--vicreg_target", type=str, default="context", choices=["context", "both", "predictor"],
                    help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")

@@ -103,8 +103,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Compute Linear CKA across lift-off variations (z1 vs z2 vs z3)")
     p.add_argument("--save_features", action="store_true", default=False,
                    help="Save extracted .npy feature maps to disk")
-    p.add_argument("--crop_border", type=int, default=10,
-                   help="Number of outer boundary pixels to crop on each edge (default: 10 to remove air/edge effect)")
+    p.add_argument("--crop_border", type=int, default=15,
+                   help="Number of outer boundary pixels to crop on each edge (default: 15 to remove air/edge effect)")
     p.add_argument("--batch_size", type=int, default=512, help="Batch size for sliding window feature extraction")
     p.add_argument("--device", type=str, default="cuda", help="Target device: 'cuda' or 'cpu'")
     p.add_argument("--max_eval_files", type=int, default=None, help="Optional limit on number of test files to evaluate")
@@ -304,7 +304,7 @@ def evaluate_liftoff_invariance(
     output_dir: str,
     batch_size: int = 512,
     device: str = "cuda",
-    crop_border: int = 10,
+    crop_border: int = 15,
 ) -> List[Dict[str, Any]]:
     """
     Computes Linear CKA and Cosine Similarity across lift-off variations (z1 vs z2 vs z3)

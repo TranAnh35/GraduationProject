@@ -20,7 +20,7 @@ class AnomalyDetector5x5:
     Supports both cosine distance (orientation deviation) and euclidean distance (magnitude shift).
     """
 
-    def __init__(self, n_clusters: int = 2, metric: str = "cosine"):
+    def __init__(self, n_clusters: int = 2, metric: str = "euclidean"):
         self.n_clusters = n_clusters
         self.metric = metric
         self.normal_prototype: Optional[np.ndarray] = None
@@ -32,28 +32,39 @@ class AnomalyDetector5x5:
         train_features: [N, D] or [sY, sX, D]
         """
         flat = train_features.reshape(-1, train_features.shape[-1]).astype(np.float32)
-        norms = np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-8
-        flat_norm = flat / norms
 
-        kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, random_state=42, batch_size=4096).fit(flat_norm)
-        counts = np.bincount(kmeans.labels_)
-        dominant_id = int(np.argmax(counts))
+        if self.metric == "euclidean":
+            # Direct MiniBatchKMeans clustering on raw representations preserves energy/magnitude
+            kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, random_state=42, batch_size=4096).fit(flat)
+            counts = np.bincount(kmeans.labels_)
+            dominant_id = int(np.argmax(counts))
 
-        proto = kmeans.cluster_centers_[dominant_id]
-        self.normal_prototype = proto / (np.linalg.norm(proto) + 1e-8)
-        # Store mean of dominant cluster in original feature scale
-        mask_dominant = kmeans.labels_ == dominant_id
-        if np.any(mask_dominant):
-            self.raw_prototype = np.mean(flat[mask_dominant], axis=0)
+            self.raw_prototype = kmeans.cluster_centers_[dominant_id]
+            norm_val = np.linalg.norm(self.raw_prototype) + 1e-8
+            self.normal_prototype = self.raw_prototype / norm_val
         else:
-            self.raw_prototype = proto
+            # Cosine distance clustering on unit hypersphere
+            norms = np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-8
+            flat_norm = flat / norms
+
+            kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, random_state=42, batch_size=4096).fit(flat_norm)
+            counts = np.bincount(kmeans.labels_)
+            dominant_id = int(np.argmax(counts))
+
+            proto = kmeans.cluster_centers_[dominant_id]
+            self.normal_prototype = proto / (np.linalg.norm(proto) + 1e-8)
+            mask_dominant = kmeans.labels_ == dominant_id
+            if np.any(mask_dominant):
+                self.raw_prototype = np.mean(flat[mask_dominant], axis=0)
+            else:
+                self.raw_prototype = proto
 
     def score_map(self, test_map: np.ndarray) -> np.ndarray:
         """
         Compute 2D anomaly score map for test_map [sY, sX, D].
         Returns: [sY, sX] float32 array where higher score = more anomalous.
         """
-        assert self.normal_prototype is not None, "Detector must be fitted first"
+        assert (self.raw_prototype is not None if self.metric == "euclidean" else self.normal_prototype is not None), "Detector must be fitted first"
         sY, sX, D = test_map.shape
         flat = test_map.reshape(-1, D).astype(np.float32)
 
@@ -107,16 +118,22 @@ def plot_anomaly_heatmap_5x5(
     anomaly_map: np.ndarray,
     save_path: Optional[str] = None,
     title: str = "5x5 PECT-JEPA C-Scan Anomaly Map",
-    close_fig: bool = True
+    close_fig: bool = True,
+    clip_percentile: float = 99.0,
 ):
     """
     Save and/or return 2D C-Scan anomaly heatmap matplotlib figure.
+    Uses 99th percentile clipping to prevent extreme edge/outlier artifacts from dominating the colormap.
     """
     if save_path:
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     fig = plt.figure(figsize=(7, 6), dpi=150)
-    im = plt.imshow(anomaly_map, cmap="jet", aspect="equal", origin="lower")
-    plt.colorbar(im, label="Anomaly Score (Cosine Distance to Sound Baseline)")
+    vmin = float(np.min(anomaly_map))
+    vmax = float(np.percentile(anomaly_map, clip_percentile))
+    if vmax <= vmin:
+        vmax = float(np.max(anomaly_map))
+    im = plt.imshow(anomaly_map, cmap="jet", aspect="equal", origin="lower", vmin=vmin, vmax=vmax)
+    plt.colorbar(im, label="Anomaly Score (Euclidean Distance to Sound Baseline)")
     plt.title(title, fontsize=11, fontweight="bold")
     plt.xlabel("Scan X (pixels)")
     plt.ylabel("Scan Y (pixels)")

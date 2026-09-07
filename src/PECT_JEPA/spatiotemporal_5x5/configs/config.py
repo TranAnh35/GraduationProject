@@ -24,7 +24,7 @@ class Spatiotemporal5x5Config:
     normalization: str = "global_peak"  # 'global_peak' | 'zscore' | 'peak_early' | 'min_max'
     early_window_frac: float = 0.10
     raster_correction: bool = True
-    crop_border: int = 10               # Crop outer boundary pixels to remove air/edge effect (10 pixels each side)
+    crop_border: int = 15               # Crop outer boundary pixels to remove air/edge effect (15 pixels each side)
     use_memmap: bool = True
     cache_dir: str = ".cache/pect_5x5_mmap"
     eps: float = 1e-8
@@ -50,7 +50,7 @@ class Spatiotemporal5x5Config:
     # ------------------------------------------------------------------- Loss
     loss_type: str = "smooth_l1"         # 'smooth_l1' | 'l1' | 'l2' | 'cosine'
     var_weight: float = 1.0              # VICReg variance hinge weight
-    cov_weight: float = 0.5              # VICReg covariance decorrelation weight
+    cov_weight: float = 2.0              # VICReg covariance decorrelation weight (boosted to 2.0 to maintain rank)
     var_gamma: float = 1.0               # Target variance standard deviation
     vicreg_target: str = "context"       # 'context' (C-JEPA on H_ctx) | 'both' | 'predictor'
 
