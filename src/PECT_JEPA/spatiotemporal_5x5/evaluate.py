@@ -252,6 +252,9 @@ def evaluate_single_file(
         normalization=model.config.normalization,
         raster_correction=model.config.raster_correction,
         crop_border=crop_border,
+        apply_lowpass=getattr(model.config, "apply_lowpass", True),
+        lowpass_cutoff=getattr(model.config, "lowpass_cutoff", 2500.0),
+        lowpass_order=getattr(model.config, "lowpass_order", 4),
     )
 
     feature_map = extract_full_cscan_map(

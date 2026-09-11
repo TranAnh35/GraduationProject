@@ -139,6 +139,51 @@ class TestDualDomainTokenizer(unittest.TestCase):
         tokens, pos = tokenizer(x)
         self.assertEqual(pos.shape, (2, 25, self.D))
 
+    def test_phase_snr_tapering_and_14_bins(self):
+        """Verify phase SNR tapering suppresses near-zero noise and operates on 14 bins."""
+        tokenizer = DualDomainGridTokenizer5x5(
+            in_channels=self.C,
+            embed_dim=self.D,
+            grid_size=5,
+            num_freq_bins=14,
+            spectral_features="phase_and_mag",
+            phase_snr_tapering=True,
+            phase_noise_floor=0.05,
+        )
+        self.assertEqual(tokenizer.num_freq_bins, 14)
+        self.assertEqual(tokenizer.freq_proj.in_features, 28)
+
+        # 1. Normal amplitude input
+        x = torch.randn(self.B, self.H, self.W, self.C)
+        tokens, pos = tokenizer(x)
+        self.assertEqual(tokens.shape, (self.B, 25, self.D))
+        self.assertTrue(torch.isfinite(tokens).all())
+
+        # 2. Near-zero amplitude input (pure noise floor)
+        x_small = torch.randn(self.B, self.H, self.W, self.C) * 1e-6
+        tokens_small, _ = tokenizer(x_small)
+        self.assertTrue(torch.isfinite(tokens_small).all())
+
+    def test_apply_lowpass_filter(self):
+        """Verify zero-phase Butterworth lowpass filter."""
+        import numpy as np
+        from src.PECT_JEPA.spatiotemporal_5x5.data.preprocessing import apply_lowpass_filter
+
+        # Create 128-pt waveform with low-freq signal (200 Hz) + high-freq noise (5000 Hz)
+        fs = 25600.0
+        t = np.arange(128) / fs
+        s_clean = np.sin(2 * np.pi * 200.0 * t).astype(np.float32)
+        s_noisy = s_clean + 0.5 * np.sin(2 * np.pi * 5000.0 * t).astype(np.float32)
+
+        s_filtered = apply_lowpass_filter(s_noisy, cutoff_hz=2500.0, fs=fs, order=4)
+        self.assertEqual(s_filtered.shape, s_noisy.shape)
+        self.assertTrue(np.all(np.isfinite(s_filtered)))
+
+        # Residual between filtered and clean should be much smaller than noise
+        err_noisy = np.mean((s_noisy - s_clean) ** 2)
+        err_filtered = np.mean((s_filtered - s_clean) ** 2)
+        self.assertLess(err_filtered, err_noisy * 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

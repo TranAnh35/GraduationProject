@@ -115,8 +115,10 @@ class DualDomainGridTokenizer5x5(nn.Module):
         in_channels: int = 128,
         embed_dim: int = 128,
         grid_size: int = 5,
-        num_freq_bins: int = 32,
+        num_freq_bins: int = 14,
         spectral_features: str = "phase_and_mag",
+        phase_snr_tapering: bool = True,
+        phase_noise_floor: float = 0.05,
         pos_embed_type: str = "learnable_2d",
         dropout: float = 0.0,
     ):
@@ -127,6 +129,8 @@ class DualDomainGridTokenizer5x5(nn.Module):
         self.embed_dim = embed_dim
         self.num_freq_bins = min(num_freq_bins, in_channels // 2)
         self.spectral_features = spectral_features
+        self.phase_snr_tapering = phase_snr_tapering
+        self.phase_noise_floor = max(1e-6, float(phase_noise_floor))
 
         # Dimensions for time and frequency branches
         self.time_embed_dim = embed_dim // 2
@@ -187,10 +191,17 @@ class DualDomainGridTokenizer5x5(nn.Module):
 
         # Phase angle normalized by pi -> [-1, 1]
         phase = torch.angle(X_sub) / torch.pi
+        mag_linear = torch.abs(X_sub)
+        mag = torch.log1p(mag_linear)
+
+        # Magnitude-weighted phase tapering: suppresses phase fluctuations in low-energy bins
+        if self.phase_snr_tapering:
+            snr_weight = torch.tanh(mag_linear / self.phase_noise_floor)
+            phase = phase * snr_weight
+
         if self.spectral_features == "phase_only":
             spectral_feat = phase.to(x_flat.dtype)
         else:
-            mag = torch.log1p(torch.abs(X_sub))
             spectral_feat = torch.cat([phase, mag], dim=-1).to(x_flat.dtype)
 
         z_freq = self.freq_proj(spectral_feat)  # [B, 25, D_freq]
@@ -212,8 +223,10 @@ def build_tokenizer_5x5(config) -> nn.Module:
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
             grid_size=config.grid_size,
-            num_freq_bins=getattr(config, "num_freq_bins", 32),
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
             spectral_features=getattr(config, "spectral_features", "phase_and_mag"),
+            phase_snr_tapering=getattr(config, "phase_snr_tapering", True),
+            phase_noise_floor=getattr(config, "phase_noise_floor", 0.05),
             pos_embed_type=config.pos_embed_type,
             dropout=config.dropout,
         )

@@ -19,6 +19,7 @@ from .preprocessing import (
     parse_metadata_from_path,
     linear_time_resample,
     normalize_waveforms_linear,
+    apply_lowpass_filter,
 )
 
 
@@ -47,6 +48,9 @@ class PECT5x5Dataset(Dataset):
         early_window_frac: float = 0.10,
         raster_correction: bool = True,
         crop_border: int = 10,
+        apply_lowpass: bool = True,
+        lowpass_cutoff: float = 2500.0,
+        lowpass_order: int = 4,
         use_memmap: bool = True,
         cache_dir: Optional[str] = ".cache/pect_5x5_mmap",
         eps: float = 1e-8,
@@ -71,6 +75,9 @@ class PECT5x5Dataset(Dataset):
         self.normalization = normalization
         self.early_window_frac = early_window_frac
         self.raster_correction = raster_correction
+        self.apply_lowpass = apply_lowpass
+        self.lowpass_cutoff = float(lowpass_cutoff)
+        self.lowpass_order = int(lowpass_order)
         self.use_memmap = use_memmap and cache_dir is not None
         self.cache_dir = cache_dir
         self.eps = eps
@@ -115,7 +122,7 @@ class PECT5x5Dataset(Dataset):
 
             if self.use_memmap:
                 h = hashlib.md5(
-                    f"{fp}_5x5_{self.resample_mode}_{self.in_channels}_{self.normalization}_crop{self.crop_border}".encode("utf-8")
+                    f"{fp}_5x5_{self.resample_mode}_{self.in_channels}_{self.normalization}_crop{self.crop_border}_lp{self.apply_lowpass}_{self.lowpass_cutoff}_{self.lowpass_order}".encode("utf-8")
                 ).hexdigest()
                 cache_path = os.path.join(self.cache_dir, f"{h}_padded.dat")
                 meta_path = os.path.join(self.cache_dir, f"{h}_padded.meta")
@@ -160,6 +167,10 @@ class PECT5x5Dataset(Dataset):
         )
         if self.resample_mode == "linear":
             x_resampled = linear_time_resample(raw, n_out=self.temporal_samples)
+            if self.apply_lowpass:
+                x_resampled = apply_lowpass_filter(
+                    x_resampled, cutoff_hz=self.lowpass_cutoff, fs=25600.0, order=self.lowpass_order
+                )
             flat_c = normalize_waveforms_linear(x_resampled, normalization=self.normalization, eps=self.eps)
         else:
             two_ch = build_two_channel_input(

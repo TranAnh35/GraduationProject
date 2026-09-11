@@ -25,6 +25,9 @@ class Spatiotemporal5x5Config:
     early_window_frac: float = 0.10
     raster_correction: bool = True
     crop_border: int = 15               # Crop outer boundary pixels to remove air/edge effect (15 pixels each side)
+    apply_lowpass: bool = True          # Zero-phase Butterworth lowpass filter to eliminate high-frequency EMI
+    lowpass_cutoff: float = 2500.0      # Cutoff frequency in Hz (2.5 kHz preserves 99.8% diffusion energy)
+    lowpass_order: int = 4              # 4th-order zero-phase filter (filtfilt)
     use_memmap: bool = True
     cache_dir: str = ".cache/pect_5x5_mmap"
     eps: float = 1e-8
@@ -36,8 +39,10 @@ class Spatiotemporal5x5Config:
 
     # ------------------------------------------------------------ Architecture
     tokenizer_type: str = "dual_domain" # 'dual_domain' (Time + FFT Spectral Phase/Mag) | 'time_only'
-    num_freq_bins: int = 32             # Number of FFT frequency bins (1..32)
+    num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
+    phase_snr_tapering: bool = True     # Magnitude-weighted phase tapering to suppress noise floor
+    phase_noise_floor: float = 0.05     # Signal magnitude threshold for phase tapering
     embed_dim: int = 128                # D
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4

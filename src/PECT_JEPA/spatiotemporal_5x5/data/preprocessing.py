@@ -17,6 +17,7 @@ from ...temporal_1d.data.preprocessing import (
     moving_rms_envelope,
     normalize_waveforms,
     build_two_channel_input,
+    apply_lowpass_filter,
 )
 
 
@@ -85,4 +86,5 @@ __all__ = [
     "moving_rms_envelope",
     "normalize_waveforms",
     "build_two_channel_input",
+    "apply_lowpass_filter",
 ]

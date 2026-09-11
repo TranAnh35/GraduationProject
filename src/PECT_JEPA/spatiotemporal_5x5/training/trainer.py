@@ -111,6 +111,9 @@ class Trainer5x5:
                     normalization=config.normalization,
                     raster_correction=config.raster_correction,
                     crop_border=config.crop_border,
+                    apply_lowpass=getattr(config, "apply_lowpass", True),
+                    lowpass_cutoff=getattr(config, "lowpass_cutoff", 2500.0),
+                    lowpass_order=getattr(config, "lowpass_order", 4),
                 )
                 self.probe_fname = os.path.splitext(os.path.basename(self.probe_file))[0]
                 if self.logger:

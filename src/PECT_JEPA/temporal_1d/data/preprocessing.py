@@ -142,6 +142,35 @@ def read_tdms_1d_waveforms(
     return data_2d.astype(np.float32)
 
 
+def apply_lowpass_filter(
+    waveforms: np.ndarray,
+    cutoff_hz: float = 2500.0,
+    fs: float = 25600.0,
+    order: int = 4,
+) -> np.ndarray:
+    """
+    Apply zero-phase forward-backward Butterworth lowpass filter (scipy.signal.filtfilt).
+    Suppresses high-frequency instrumentation noise (EMI, ADC quantization) without
+    introducing any phase delay or temporal waveform distortion.
+
+    Args:
+        waveforms: [..., T] numpy array
+        cutoff_hz: Cutoff frequency in Hz (default: 2500.0)
+        fs: Effective sampling rate in Hz (default: 25600.0 for 128 pts / 5ms)
+        order: Filter order (default: 4)
+
+    Returns:
+        [..., T] float32 numpy array
+    """
+    from scipy import signal
+    nyq = 0.5 * fs
+    normal_cutoff = float(np.clip(cutoff_hz / nyq, 0.01, 0.95))
+    b, a = signal.butter(order, normal_cutoff, btype="low", analog=False)
+    filtered = signal.filtfilt(b, a, waveforms, axis=-1)
+    return filtered.astype(np.float32)
+
+
+
 def linear_time_grid_ms(
     t_total_ms: float,
     n_out: int = 512

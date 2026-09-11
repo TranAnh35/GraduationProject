@@ -105,10 +105,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
     p.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["dual_domain", "time_only"],
                    help="Tokenizer architecture: 'dual_domain' (Time + FFT Spectral Phase/Mag) or 'time_only' (default: dual_domain)")
-    p.add_argument("--num_freq_bins", type=int, default=32,
-                   help="Number of FFT frequency bins for spectral branch (default: 32)")
+    p.add_argument("--num_freq_bins", type=int, default=14,
+                   help="Number of FFT frequency bins for spectral branch (default: 14, covers 0-2800 Hz)")
     p.add_argument("--spectral_features", type=str, default="phase_and_mag", choices=["phase_and_mag", "phase_only"],
                    help="Spectral features for dual-domain tokenizer: 'phase_and_mag' or 'phase_only' (default: phase_and_mag)")
+    p.add_argument("--phase_snr_tapering", type=lambda v: v.lower() == "true", default=True,
+                   help="Magnitude-weighted phase tapering for dual-domain tokenizer (default: True)")
+    p.add_argument("--phase_noise_floor", type=float, default=0.05,
+                   help="Signal magnitude threshold for phase tapering (default: 0.05)")
+    p.add_argument("--apply_lowpass", type=lambda v: v.lower() == "true", default=True,
+                   help="Apply zero-phase Butterworth lowpass filter to waveforms (default: True)")
+    p.add_argument("--lowpass_cutoff", type=float, default=2500.0,
+                   help="Lowpass filter cutoff frequency in Hz (default: 2500.0)")
+    p.add_argument("--lowpass_order", type=int, default=4,
+                   help="Lowpass filter order (default: 4)")
     p.add_argument("--ema_momentum", type=float, default=0.996, help="Target encoder base EMA momentum (default: 0.996)")
     p.add_argument("--ema_momentum_end", type=float, default=0.999,
                    help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
@@ -187,6 +197,11 @@ def main():
         tokenizer_type=args.tokenizer_type,
         num_freq_bins=args.num_freq_bins,
         spectral_features=args.spectral_features,
+        phase_snr_tapering=args.phase_snr_tapering,
+        phase_noise_floor=args.phase_noise_floor,
+        apply_lowpass=args.apply_lowpass,
+        lowpass_cutoff=args.lowpass_cutoff,
+        lowpass_order=args.lowpass_order,
         embed_dim=args.embed_dim,
         encoder_depth=args.encoder_depth,
         predictor_depth=args.predictor_depth,
@@ -280,6 +295,9 @@ def main():
         early_window_frac=config.early_window_frac,
         raster_correction=config.raster_correction,
         crop_border=config.crop_border,
+        apply_lowpass=config.apply_lowpass,
+        lowpass_cutoff=config.lowpass_cutoff,
+        lowpass_order=config.lowpass_order,
         use_memmap=config.use_memmap,
         preload_ram=args.preload_ram,
         return_meta=False,
@@ -301,6 +319,9 @@ def main():
         early_window_frac=config.early_window_frac,
         raster_correction=config.raster_correction,
         crop_border=config.crop_border,
+        apply_lowpass=config.apply_lowpass,
+        lowpass_cutoff=config.lowpass_cutoff,
+        lowpass_order=config.lowpass_order,
         use_memmap=config.use_memmap,
         preload_ram=args.preload_ram,
         return_meta=False,

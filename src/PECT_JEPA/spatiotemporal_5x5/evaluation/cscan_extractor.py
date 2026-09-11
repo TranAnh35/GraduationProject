@@ -16,6 +16,7 @@ from ..data.preprocessing import (
     build_two_channel_input,
     linear_time_resample,
     normalize_waveforms_linear,
+    apply_lowpass_filter,
 )
 
 
@@ -80,6 +81,9 @@ def load_cscan_from_tdms(
     sX: int = 300,
     sY: int = 300,
     crop_border: int = 10,
+    apply_lowpass: bool = True,
+    lowpass_cutoff: float = 2500.0,
+    lowpass_order: int = 4,
 ) -> np.ndarray:
     """
     Reads a TDMS file and converts it into a [sY, sX, C] grid (C=128 for linear, C=256 for dual_channel).
@@ -93,6 +97,10 @@ def load_cscan_from_tdms(
     )
     if resample_mode == "linear":
         x_resampled = linear_time_resample(raw, n_out=temporal_samples)
+        if apply_lowpass:
+            x_resampled = apply_lowpass_filter(
+                x_resampled, cutoff_hz=lowpass_cutoff, fs=25600.0, order=lowpass_order
+            )
         flat_c = normalize_waveforms_linear(x_resampled, normalization=normalization)
     else:
         two_ch = build_two_channel_input(
