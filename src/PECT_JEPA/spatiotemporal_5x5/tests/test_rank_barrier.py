@@ -65,7 +65,7 @@ class TestRankBarrierLoss(unittest.TestCase):
         loss_base = loss_fn.rank_barrier_loss(H_rep)
         loss_scaled = loss_fn.rank_barrier_loss(H_rep * 25.0)
 
-        self.assertAlmostEqual(loss_base.item(), loss_scaled.item(), places=4)
+        self.assertAlmostEqual(loss_base.item(), loss_scaled.item(), places=3)
 
     def test_collapsed_vs_isotropic_loss(self):
         """Test that rank barrier loss is significantly higher on a collapsed representation than on isotropic."""

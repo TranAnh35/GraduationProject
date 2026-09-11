@@ -27,6 +27,7 @@ class TestOverfitBatch(unittest.TestCase):
             max_masked=12,
             var_weight=0.1,  # Keep regularization small for fast overfit test
             cov_weight=0.01,
+            rank_barrier_weight=0.0,
         )
         model = PECT_JEPA_5x5(config)
         model.train()

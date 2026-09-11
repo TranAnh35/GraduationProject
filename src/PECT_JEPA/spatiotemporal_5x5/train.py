@@ -97,12 +97,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="JEPA latent prediction loss function (default: smooth_l1)")
     p.add_argument("--cov_weight", type=float, default=2.0, help="VICReg covariance penalty weight (default: 2.0)")
     p.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (default: 1.0)")
-    p.add_argument("--rank_barrier_weight", type=float, default=0.05,
-                   help="Log-Determinant Spectral Barrier loss weight to prevent effective rank collapse (default: 0.05)")
+    p.add_argument("--rank_barrier_weight", type=float, default=0.5,
+                   help="Log-Determinant Spectral Barrier loss weight to prevent effective rank collapse (default: 0.5)")
     p.add_argument("--rank_barrier_eps", type=float, default=1e-4,
                    help="Regularization epsilon for Log-Determinant Spectral Barrier (default: 1e-4)")
     p.add_argument("--vicreg_target", type=str, default="context", choices=["context", "both", "predictor"],
                    help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
+    p.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["dual_domain", "time_only"],
+                   help="Tokenizer architecture: 'dual_domain' (Time + FFT Spectral Phase/Mag) or 'time_only' (default: dual_domain)")
+    p.add_argument("--num_freq_bins", type=int, default=32,
+                   help="Number of FFT frequency bins for spectral branch (default: 32)")
+    p.add_argument("--spectral_features", type=str, default="phase_and_mag", choices=["phase_and_mag", "phase_only"],
+                   help="Spectral features for dual-domain tokenizer: 'phase_and_mag' or 'phase_only' (default: phase_and_mag)")
     p.add_argument("--ema_momentum", type=float, default=0.996, help="Target encoder base EMA momentum (default: 0.996)")
     p.add_argument("--ema_momentum_end", type=float, default=0.999,
                    help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
@@ -178,6 +184,9 @@ def main():
         vicreg_target=args.vicreg_target,
         ema_momentum=args.ema_momentum,
         ema_momentum_end=args.ema_momentum_end,
+        tokenizer_type=args.tokenizer_type,
+        num_freq_bins=args.num_freq_bins,
+        spectral_features=args.spectral_features,
         embed_dim=args.embed_dim,
         encoder_depth=args.encoder_depth,
         predictor_depth=args.predictor_depth,

@@ -101,9 +101,11 @@ class JEPALoss5x5(nn.Module):
         eps = max(self.rank_barrier_eps, 1e-6)
         corr_reg = corr + eps * torch.eye(D, device=z.device, dtype=z.dtype)
 
-        # Compute log-determinant safely
-        sign, logdet = torch.linalg.slogdet(corr_reg)
-        logdet = torch.where(sign > 0, logdet, torch.full_like(logdet, -100.0))
+        # Compute log-determinant via real eigenvalues of symmetric matrix
+        # Guarantees positive eigenvalues and smooth, non-collapsing gradients
+        eigvals = torch.linalg.eigvalsh(corr_reg)
+        eigvals_safe = torch.clamp(eigvals, min=eps)
+        logdet = torch.sum(torch.log(eigvals_safe))
         barrier = -logdet / D
         return torch.nan_to_num(barrier, nan=10.0, posinf=10.0, neginf=0.0)
 

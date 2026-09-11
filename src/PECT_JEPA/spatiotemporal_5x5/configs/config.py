@@ -35,6 +35,9 @@ class Spatiotemporal5x5Config:
     max_masked: int = 15                # 60% of 25 tokens
 
     # ------------------------------------------------------------ Architecture
+    tokenizer_type: str = "dual_domain" # 'dual_domain' (Time + FFT Spectral Phase/Mag) | 'time_only'
+    num_freq_bins: int = 32             # Number of FFT frequency bins (1..32)
+    spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
     embed_dim: int = 128                # D
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
@@ -53,7 +56,7 @@ class Spatiotemporal5x5Config:
     cov_weight: float = 2.0              # VICReg covariance decorrelation weight (boosted to 2.0 to maintain rank)
     var_gamma: float = 1.0               # Target variance standard deviation
     vicreg_target: str = "context"       # 'context' (C-JEPA on H_ctx) | 'both' | 'predictor'
-    rank_barrier_weight: float = 0.05    # Log-Determinant Spectral Barrier weight (prevents effective rank collapse)
+    rank_barrier_weight: float = 0.5     # Log-Determinant Spectral Barrier weight (balanced at 0.5 to prevent rank collapse)
     rank_barrier_eps: float = 1e-4       # Interior point barrier regularizer epsilon
 
     # --------------------------------------------------------------- Training

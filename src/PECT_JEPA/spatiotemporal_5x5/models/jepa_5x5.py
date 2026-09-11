@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from ..configs.config import Spatiotemporal5x5Config, get_default_config_5x5
-from .tokenizer_5x5 import SpatialGridTokenizer5x5
+from .tokenizer_5x5 import SpatialGridTokenizer5x5, DualDomainGridTokenizer5x5, build_tokenizer_5x5
 from .context_encoder import ContextEncoder5x5
 from .target_encoder import TargetEncoder5x5
 from .predictor import Predictor5x5
@@ -29,14 +29,8 @@ class PECT_JEPA_5x5(nn.Module):
             config = get_default_config_5x5()
         self.config = config
 
-        # 1. Tokenizer
-        self.tokenizer = SpatialGridTokenizer5x5(
-            in_channels=config.in_channels,
-            embed_dim=config.embed_dim,
-            grid_size=config.grid_size,
-            pos_embed_type=config.pos_embed_type,
-            dropout=config.dropout
-        )
+        # 1. Tokenizer (Dual-Domain Spatiotemporal-Spectral or Time-Only)
+        self.tokenizer = build_tokenizer_5x5(config)
 
         # 2. Contiguous Cluster Masker
         self.masker = ContiguousClusterMasker5x5(
