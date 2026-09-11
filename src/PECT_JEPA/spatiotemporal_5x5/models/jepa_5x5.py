@@ -81,6 +81,8 @@ class PECT_JEPA_5x5(nn.Module):
             cov_weight=config.cov_weight,
             var_gamma=config.var_gamma,
             vicreg_target=getattr(config, "vicreg_target", "context"),
+            rank_barrier_weight=getattr(config, "rank_barrier_weight", 0.05),
+            rank_barrier_eps=getattr(config, "rank_barrier_eps", 1e-4),
         )
 
     def _init_target_encoder(self):

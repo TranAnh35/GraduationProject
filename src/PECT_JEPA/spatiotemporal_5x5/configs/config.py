@@ -53,6 +53,8 @@ class Spatiotemporal5x5Config:
     cov_weight: float = 2.0              # VICReg covariance decorrelation weight (boosted to 2.0 to maintain rank)
     var_gamma: float = 1.0               # Target variance standard deviation
     vicreg_target: str = "context"       # 'context' (C-JEPA on H_ctx) | 'both' | 'predictor'
+    rank_barrier_weight: float = 0.05    # Log-Determinant Spectral Barrier weight (prevents effective rank collapse)
+    rank_barrier_eps: float = 1e-4       # Interior point barrier regularizer epsilon
 
     # --------------------------------------------------------------- Training
     batch_size: int = 256

@@ -132,6 +132,7 @@ class Trainer5x5:
         total_pred = 0.0
         total_var = 0.0
         total_cov = 0.0
+        total_rank_barrier = 0.0
         n_batches = 0
 
         pbar = tqdm(
@@ -176,11 +177,13 @@ class Trainer5x5:
             pred_val = float(loss_dict["loss_pred"].item())
             var_val = float(loss_dict["loss_var"].item())
             cov_val = float(loss_dict["loss_cov"].item())
+            rank_barrier_val = float(loss_dict.get("loss_rank_barrier", torch.tensor(0.0)).item())
 
             total_loss += loss_val
             total_pred += pred_val
             total_var += var_val
             total_cov += cov_val
+            total_rank_barrier += rank_barrier_val
             n_batches += 1
 
             if self.logger:
@@ -191,6 +194,7 @@ class Trainer5x5:
                         "loss_pred": pred_val,
                         "loss_var": var_val,
                         "loss_cov": cov_val,
+                        "loss_rank_barrier": rank_barrier_val,
                         "lr": lr,
                         "momentum": momentum,
                         "grad_norm": grad_norm,
@@ -211,6 +215,7 @@ class Trainer5x5:
             "loss_pred": total_pred / max(1, n_batches),
             "loss_var": total_var / max(1, n_batches),
             "loss_cov": total_cov / max(1, n_batches),
+            "loss_rank_barrier": total_rank_barrier / max(1, n_batches),
         }
         return metrics
 
@@ -301,27 +306,42 @@ class Trainer5x5:
                 show_pbar=False,
             )
 
-            # 2. Fit unsupervised anomaly detector on representations (uses 2D spatial detrending)
+            # 2. Fit unsupervised anomaly detector on representations
             detector = AnomalyDetector5x5(n_clusters=2, detrend=True)
             detector.fit(feature_map)
-            score_map = detector.score_map(feature_map)
+            score_map = detector.score_map(feature_map, detrend=True)
+            raw_score_map = detector.score_map(feature_map, detrend=False)
 
             # 3. Compute quantitative defect contrast metrics & probe representation rank
             metrics = compute_anomaly_metrics(score_map)
             cnr = metrics["contrast_ratio_cnr"]
+            raw_metrics = compute_anomaly_metrics(raw_score_map)
+            raw_cnr = float(raw_metrics["contrast_ratio_cnr"])
+            metrics["raw_cnr"] = raw_cnr
+
+            fmap_f32 = feature_map.astype(np.float32)
+            probe_rank_raw = compute_effective_rank(fmap_f32.reshape(-1, fmap_f32.shape[-1]))
+            metrics["probe_rank_raw"] = float(probe_rank_raw)
 
             from scipy.ndimage import gaussian_filter
-            fmap_f32 = feature_map.astype(np.float32)
             fmap_bg = gaussian_filter(fmap_f32, sigma=(15, 15, 0), mode="nearest")
             probe_rank_detrended = compute_effective_rank((fmap_f32 - fmap_bg).reshape(-1, fmap_f32.shape[-1]))
             metrics["probe_rank_detrended"] = float(probe_rank_detrended)
 
-            # 4. Save heatmap image to disk
+            # 4. Save heatmap images to disk
             probe_dir = os.path.join(self.logger.run_dir if self.logger else "experiments/5x5", "probe_heatmaps")
             os.makedirs(probe_dir, exist_ok=True)
             heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_cnr_{cnr:.2f}.png")
-            title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f} (Rank: {probe_rank_detrended:.1f})"
+            title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f} (Raw CNR: {raw_cnr:.2f}, Rank: {probe_rank_raw:.1f})"
             fig = plot_anomaly_heatmap_5x5(score_map, save_path=heatmap_path, title=title, close_fig=False)
+
+            # Also save raw latent anomaly heatmap for transparent representation inspection
+            raw_heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_raw_latent_cnr_{raw_cnr:.2f}.png")
+            raw_title = f"Epoch {epoch:02d} (Raw Latent) | Probe: {self.probe_fname} | Raw CNR: {raw_cnr:.2f} (Rank: {probe_rank_raw:.1f})"
+            fig_raw = plot_anomaly_heatmap_5x5(raw_score_map, save_path=raw_heatmap_path, title=raw_title, close_fig=False)
+            if fig_raw is not None:
+                import matplotlib.pyplot as plt
+                plt.close(fig_raw)
 
             # 5. Log figure to TensorBoard & WandB
             if self.logger and fig is not None:

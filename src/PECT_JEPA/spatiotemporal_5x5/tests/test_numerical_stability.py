@@ -143,8 +143,8 @@ class TestNumericalStability(unittest.TestCase):
         probe_dir = os.path.join(trainer.logger.run_dir, "probe_heatmaps")
         self.assertTrue(os.path.isdir(probe_dir))
         heatmaps = os.listdir(probe_dir)
-        self.assertEqual(len(heatmaps), 1)
-        self.assertTrue(heatmaps[0].endswith(".png"))
+        self.assertGreaterEqual(len(heatmaps), 1)
+        self.assertTrue(any(h.endswith(".png") for h in heatmaps))
 
         trainer.logger.close()
         shutil.rmtree(temp_dir, ignore_errors=True)

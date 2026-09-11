@@ -22,6 +22,8 @@ class JEPALoss5x5(nn.Module):
         cov_weight: float = 0.5,
         var_gamma: float = 1.0,
         vicreg_target: str = "context",
+        rank_barrier_weight: float = 0.05,
+        rank_barrier_eps: float = 1e-4,
     ):
         super().__init__()
         self.loss_type = loss_type
@@ -30,6 +32,8 @@ class JEPALoss5x5(nn.Module):
         self.cov_weight = cov_weight
         self.var_gamma = var_gamma
         self.vicreg_target = vicreg_target
+        self.rank_barrier_weight = rank_barrier_weight
+        self.rank_barrier_eps = rank_barrier_eps
 
     def latent_prediction_loss(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
         safe_eps = max(self.eps, 1e-5)
@@ -74,6 +78,35 @@ class JEPALoss5x5(nn.Module):
         cov_penalty = (off_diag ** 2).sum() / D
         return torch.nan_to_num(cov_penalty, nan=0.0, posinf=1.0)
 
+    def rank_barrier_loss(self, H_rep: torch.Tensor) -> torch.Tensor:
+        """
+        Log-Determinant Spectral Barrier Loss on the normalized representation correlation matrix.
+        Forces all eigenvalues to stay non-zero and isotropic, mathematically preventing
+        Effective Rank collapse without risk of scale explosion (scale-invariant via correlation matrix).
+        L_barrier = - (1 / D) * ln det (C_corr + eps * I)
+        """
+        z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        B, N, D = z.shape
+        z = z.reshape(B * N, D)
+        z = z - z.mean(dim=0, keepdim=True)
+        cov = (z.T @ z) / max(1, z.shape[0] - 1)  # [D, D]
+
+        # Standard deviations along each dimension
+        std = torch.sqrt(torch.clamp(torch.diag(cov), min=1e-8))
+        # Correlation matrix: cov / (std_i * std_j) (ensures scale-invariance)
+        corr = cov / (std.unsqueeze(0) * std.unsqueeze(1) + 1e-8)
+        corr = torch.nan_to_num(corr, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Regularized correlation matrix with interior point barrier eps
+        eps = max(self.rank_barrier_eps, 1e-6)
+        corr_reg = corr + eps * torch.eye(D, device=z.device, dtype=z.dtype)
+
+        # Compute log-determinant safely
+        sign, logdet = torch.linalg.slogdet(corr_reg)
+        logdet = torch.where(sign > 0, logdet, torch.full_like(logdet, -100.0))
+        barrier = -logdet / D
+        return torch.nan_to_num(barrier, nan=10.0, posinf=10.0, neginf=0.0)
+
     def forward(
         self,
         H_pred: torch.Tensor,
@@ -89,17 +122,21 @@ class JEPALoss5x5(nn.Module):
         if self.vicreg_target == "context" and H_ctx is not None:
             l_var = self.variance_hinge(H_ctx)
             l_cov = self.covariance_penalty(H_ctx)
+            l_rank = self.rank_barrier_loss(H_ctx) if self.rank_barrier_weight > 0.0 else torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
         elif self.vicreg_target == "both" and H_ctx is not None:
             l_var = 0.5 * (self.variance_hinge(H_ctx) + self.variance_hinge(H_pred))
             l_cov = 0.5 * (self.covariance_penalty(H_ctx) + self.covariance_penalty(H_pred))
+            l_rank = 0.5 * (self.rank_barrier_loss(H_ctx) + self.rank_barrier_loss(H_pred)) if self.rank_barrier_weight > 0.0 else torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
         else:
             l_var = self.variance_hinge(H_pred)
             l_cov = self.covariance_penalty(H_pred)
+            l_rank = self.rank_barrier_loss(H_pred) if self.rank_barrier_weight > 0.0 else torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
 
-        total = l_pred + self.var_weight * l_var + self.cov_weight * l_cov
+        total = l_pred + self.var_weight * l_var + self.cov_weight * l_cov + self.rank_barrier_weight * l_rank
         return {
             "loss": total,
             "loss_pred": l_pred.detach(),
             "loss_var": l_var.detach(),
             "loss_cov": l_cov.detach(),
+            "loss_rank_barrier": l_rank.detach(),
         }

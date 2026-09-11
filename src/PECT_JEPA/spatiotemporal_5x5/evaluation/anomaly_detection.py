@@ -69,12 +69,15 @@ class AnomalyDetector5x5:
             else:
                 self.raw_prototype = proto
 
-    def score_map(self, test_map: np.ndarray) -> np.ndarray:
+    def score_map(self, test_map: np.ndarray, detrend: Optional[bool] = None) -> np.ndarray:
         """
         Compute 2D anomaly score map for test_map [sY, sX, D].
         Returns: [sY, sX] float32 array where higher score = more anomalous.
+        If detrend is True (or None with self.detrend=True), applies local baseline detrending.
+        If detrend is False, evaluates pure raw latent distance from sound prototype.
         """
-        if test_map.ndim == 3 and self.detrend:
+        do_detrend = self.detrend if detrend is None else bool(detrend)
+        if test_map.ndim == 3 and do_detrend:
             sY, sX, D = test_map.shape
             if min(sY, sX) >= 5:
                 # 2D Spatial Detrending: filter out low-frequency mechanical scanner tilt / lift-off drift

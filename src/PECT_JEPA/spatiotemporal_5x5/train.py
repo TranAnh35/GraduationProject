@@ -97,6 +97,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="JEPA latent prediction loss function (default: smooth_l1)")
     p.add_argument("--cov_weight", type=float, default=2.0, help="VICReg covariance penalty weight (default: 2.0)")
     p.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (default: 1.0)")
+    p.add_argument("--rank_barrier_weight", type=float, default=0.05,
+                   help="Log-Determinant Spectral Barrier loss weight to prevent effective rank collapse (default: 0.05)")
+    p.add_argument("--rank_barrier_eps", type=float, default=1e-4,
+                   help="Regularization epsilon for Log-Determinant Spectral Barrier (default: 1e-4)")
     p.add_argument("--vicreg_target", type=str, default="context", choices=["context", "both", "predictor"],
                    help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
     p.add_argument("--ema_momentum", type=float, default=0.996, help="Target encoder base EMA momentum (default: 0.996)")
@@ -169,6 +173,8 @@ def main():
         loss_type=args.loss_type,
         cov_weight=args.cov_weight,
         var_weight=args.var_weight,
+        rank_barrier_weight=args.rank_barrier_weight,
+        rank_barrier_eps=args.rank_barrier_eps,
         vicreg_target=args.vicreg_target,
         ema_momentum=args.ema_momentum,
         ema_momentum_end=args.ema_momentum_end,
