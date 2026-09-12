@@ -79,7 +79,7 @@ def get_optimal_num_workers(requested_workers: Any = "auto") -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("Unified 5x5 Spatiotemporal PECT-JEPA Training")
     p.add_argument("--data_dir", type=str, default="data", help="Directory containing TDMS files")
-    p.add_argument("--epochs", type=int, default=50, help="Total training epochs")
+    p.add_argument("--epochs", type=int, default=30, help="Total training epochs (default: 30)")
     p.add_argument("--batch_size", type=int, default=256, help="Batch size (recommended: 128 - 512 for 5x5)")
     p.add_argument("--k_per_file", type=int, default=8, help="Points per file in file-balanced sampler")
     p.add_argument("--num_workers", type=str, default="auto", help="Number of CPU workers (integer or 'auto')")
@@ -122,7 +122,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ema_momentum", type=float, default=0.996, help="Target encoder base EMA momentum (default: 0.996)")
     p.add_argument("--ema_momentum_end", type=float, default=0.999,
                    help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
-    p.add_argument("--embed_dim", type=int, default=128, help="Latent embedding dimension D (default: 128)")
+    p.add_argument("--embed_dim", type=int, default=32, help="Latent embedding dimension D (default: 32)")
     p.add_argument("--encoder_depth", type=int, default=4, help="Context/Target encoder Transformer depth")
     p.add_argument("--predictor_depth", type=int, default=2, help="Predictor Transformer depth")
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
@@ -157,8 +157,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to specific validation TDMS file to run downstream anomaly detection on after each epoch (default: auto-selects 1st defect file from val set)")
     p.add_argument("--probe_interval", type=int, default=1,
                    help="Frequency of running downstream probe on validation file (default: 1 = every epoch; 0 = disable)")
-    p.add_argument("--early_stopping_patience", type=int, default=5,
-                   help="Stop training early if val_loss fails to improve for N epochs (default: 5; 0 = disabled)")
+    p.add_argument("--early_stopping_metric", type=str, default="val_loss_pred", choices=["val_loss_pred", "val_loss", "probe_cnr"],
+                   help="Metric to monitor for early stopping and best checkpoint saving (default: val_loss_pred)")
+    p.add_argument("--early_stopping_patience", type=int, default=10,
+                   help="Stop training early if monitored metric fails to improve for N epochs (default: 10; 0 = disabled)")
     p.add_argument("--eval_after_train", type=lambda v: v.lower() == "true", default=False,
                    help="Automatically run downstream evaluation suite immediately after training completes")
     p.add_argument("--resume", type=str, default=None,
@@ -219,6 +221,7 @@ def main():
         log_histograms=args.log_histograms,
         probe_file=args.probe_file,
         probe_interval=args.probe_interval,
+        early_stopping_metric=args.early_stopping_metric,
         early_stopping_patience=args.early_stopping_patience,
         resume=args.resume,
     )

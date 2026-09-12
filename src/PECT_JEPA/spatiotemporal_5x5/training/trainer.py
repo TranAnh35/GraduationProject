@@ -86,6 +86,7 @@ class Trainer5x5:
         self.start_epoch = 0
         self.current_epoch = 0
         self.best_val_loss = float("inf")
+        self.best_val_loss_pred = float("inf")
         self.best_probe_cnr = -float("inf")
         self.patience_counter = 0
 
@@ -358,7 +359,13 @@ class Trainer5x5:
                 self.logger.warning(f"[Probe Epoch {epoch}] Downstream probing failed: {e}")
             return None
 
-    def save_checkpoint(self, path: str, val_loss: Optional[float] = None, effective_rank: Optional[float] = None):
+    def save_checkpoint(
+        self,
+        path: str,
+        val_loss: Optional[float] = None,
+        val_loss_pred: Optional[float] = None,
+        effective_rank: Optional[float] = None
+    ):
         ckpt = {
             "epoch": self.current_epoch,
             "global_step": self.global_step,
@@ -366,7 +373,9 @@ class Trainer5x5:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scaler_state_dict": self.scaler.state_dict() if hasattr(self, "scaler") else None,
             "val_loss": val_loss,
+            "val_loss_pred": val_loss_pred,
             "best_val_loss": self.best_val_loss,
+            "best_val_loss_pred": getattr(self, "best_val_loss_pred", float("inf")),
             "best_probe_cnr": getattr(self, "best_probe_cnr", -float("inf")),
             "effective_rank": effective_rank,
             "config": self.config.to_dict(),
@@ -482,8 +491,9 @@ class Trainer5x5:
         self.start_epoch = max(0, saved_epoch + 1)
         self.current_epoch = self.start_epoch
 
-        # 5. Best Val Loss and Best Probe CNR
+        # 5. Best Val Loss, Best Val Pred Loss, and Best Probe CNR
         self.best_val_loss = checkpoint.get("best_val_loss", checkpoint.get("val_loss", float("inf")))
+        self.best_val_loss_pred = checkpoint.get("best_val_loss_pred", checkpoint.get("val_loss_pred", float("inf")))
         self.best_probe_cnr = checkpoint.get("best_probe_cnr", -float("inf"))
 
         # 6. Schedulers: synchronize LR to global_step
@@ -491,7 +501,7 @@ class Trainer5x5:
 
         summary_msg = (
             f"[Resume] Successfully restored checkpoint! Resuming at Epoch {self.start_epoch + 1}/{self.config.epochs} "
-            f"(Global Step: {self.global_step}, Best Val Loss: {self.best_val_loss:.4f}, LR: {current_lr:.2e})"
+            f"(Global Step: {self.global_step}, Best Val Pred: {self.best_val_loss_pred:.4f}, Best Val Loss: {self.best_val_loss:.4f}, LR: {current_lr:.2e})"
         )
         if self.logger:
             self.logger.info(summary_msg)
@@ -539,14 +549,26 @@ class Trainer5x5:
                             self.best_probe_cnr = cnr
                             eff_rank = val_metrics.get("effective_rank") if val_metrics else None
                             best_probe_path = os.path.join(self.config.save_dir, "best_probe_model_5x5.pt")
-                            self.save_checkpoint(best_probe_path, val_metrics.get("val_loss"), eff_rank)
+                            self.save_checkpoint(
+                                best_probe_path,
+                                val_loss=val_metrics.get("val_loss") if val_metrics else None,
+                                val_loss_pred=val_metrics.get("val_loss_pred") if val_metrics else None,
+                                effective_rank=eff_rank
+                            )
                             msg_probe = f"  --> Saved new best downstream probe checkpoint (CNR: {cnr:.2f}): {best_probe_path}"
                             if self.logger:
                                 self.logger.info(msg_probe)
                             else:
                                 print(msg_probe)
 
-            val_str = f" | Val Loss: {val_metrics['val_loss']:.4f}" if val_metrics else ""
+            val_str = ""
+            if val_metrics:
+                v_tot = val_metrics.get("val_loss")
+                v_pred = val_metrics.get("val_loss_pred")
+                if v_pred is not None and not np.isnan(v_pred):
+                    val_str = f" | Val Pred Loss: {v_pred:.4f} (Total: {v_tot:.4f})"
+                elif v_tot is not None and not np.isnan(v_tot):
+                    val_str = f" | Val Loss: {v_tot:.4f}"
             rank_str = f" | Val Rank: {val_metrics['effective_rank']:.1f}/{self.config.embed_dim}" if val_metrics and "effective_rank" in val_metrics and val_metrics["effective_rank"] > 0 else ""
             probe_str = ""
             if probe_metrics:
@@ -573,10 +595,13 @@ class Trainer5x5:
                     "lr": self.lr_scheduler.get_lr(self.global_step),
                     "time_sec": dt,
                 }
-                if val_metrics and "val_loss" in val_metrics:
-                    epoch_data["val_loss"] = val_metrics["val_loss"]
-                if val_metrics and "effective_rank" in val_metrics:
-                    epoch_data["effective_rank"] = val_metrics["effective_rank"]
+                if val_metrics:
+                    if "val_loss" in val_metrics:
+                        epoch_data["val_loss"] = val_metrics["val_loss"]
+                    if "val_loss_pred" in val_metrics:
+                        epoch_data["val_loss_pred"] = val_metrics["val_loss_pred"]
+                    if "effective_rank" in val_metrics:
+                        epoch_data["effective_rank"] = val_metrics["effective_rank"]
                 if probe_metrics and "contrast_ratio_cnr" in probe_metrics:
                     epoch_data["probe_cnr"] = probe_metrics["contrast_ratio_cnr"]
                 if probe_metrics and "probe_rank_detrended" in probe_metrics:
@@ -585,16 +610,51 @@ class Trainer5x5:
 
             # Checkpoint saving
             eff_rank = val_metrics.get("effective_rank") if val_metrics else None
+            val_loss = val_metrics.get("val_loss") if val_metrics else None
+            val_loss_pred = val_metrics.get("val_loss_pred") if val_metrics else None
             latest_path = os.path.join(self.config.save_dir, "latest_model_5x5.pt")
-            self.save_checkpoint(latest_path, val_metrics.get("val_loss"), eff_rank)
+            self.save_checkpoint(latest_path, val_loss=val_loss, val_loss_pred=val_loss_pred, effective_rank=eff_rank)
 
-            current_loss = val_metrics.get("val_loss", train_metrics["loss"])
-            if not np.isnan(current_loss) and current_loss < self.best_val_loss:
-                self.best_val_loss = current_loss
+            # Early stopping & best checkpoint evaluation
+            monitor_metric = getattr(self.config, "early_stopping_metric", "val_loss_pred")
+            improved = False
+            metric_info = ""
+
+            if monitor_metric == "val_loss_pred":
+                cur_metric = val_loss_pred if val_loss_pred is not None else train_metrics["loss_pred"]
+                if not np.isnan(cur_metric) and cur_metric < self.best_val_loss_pred:
+                    self.best_val_loss_pred = cur_metric
+                    improved = True
+                metric_info = f"val_loss_pred: {cur_metric:.4f} (best: {self.best_val_loss_pred:.4f})"
+            elif monitor_metric == "val_loss":
+                cur_metric = val_loss if val_loss is not None else train_metrics["loss"]
+                if not np.isnan(cur_metric) and cur_metric < self.best_val_loss:
+                    self.best_val_loss = cur_metric
+                    improved = True
+                metric_info = f"val_loss: {cur_metric:.4f} (best: {self.best_val_loss:.4f})"
+            elif monitor_metric == "probe_cnr":
+                cur_metric = float(probe_metrics["contrast_ratio_cnr"]) if (probe_metrics and "contrast_ratio_cnr" in probe_metrics) else float("nan")
+                if not np.isnan(cur_metric) and cur_metric > self.best_probe_cnr:
+                    improved = True
+                metric_info = f"probe_cnr: {cur_metric:.2f} (best: {self.best_probe_cnr:.2f})"
+            else:
+                cur_metric = val_loss_pred if val_loss_pred is not None else train_metrics["loss_pred"]
+                if not np.isnan(cur_metric) and cur_metric < self.best_val_loss_pred:
+                    self.best_val_loss_pred = cur_metric
+                    improved = True
+                metric_info = f"val_loss_pred: {cur_metric:.4f} (best: {self.best_val_loss_pred:.4f})"
+
+            # Keep best_val_loss and best_val_loss_pred updated tracking values
+            if val_loss is not None and not np.isnan(val_loss) and val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+            if val_loss_pred is not None and not np.isnan(val_loss_pred) and val_loss_pred < self.best_val_loss_pred:
+                self.best_val_loss_pred = val_loss_pred
+
+            if improved:
                 self.patience_counter = 0
                 best_path = os.path.join(self.config.save_dir, "best_model_5x5.pt")
-                self.save_checkpoint(best_path, current_loss, eff_rank)
-                msg_best = f"  --> Saved new best checkpoint: {best_path}"
+                self.save_checkpoint(best_path, val_loss=val_loss, val_loss_pred=val_loss_pred, effective_rank=eff_rank)
+                msg_best = f"  --> Saved new best checkpoint (monitored {monitor_metric}): {best_path}"
                 if self.logger:
                     self.logger.info(msg_best)
                 else:
@@ -604,8 +664,8 @@ class Trainer5x5:
                 patience = getattr(self.config, "early_stopping_patience", 0)
                 if patience > 0 and self.patience_counter >= patience:
                     stop_msg = (
-                        f"[Early Stopping] Validation loss did not improve for {patience} consecutive epochs "
-                        f"(current: {current_loss:.4f}, best: {self.best_val_loss:.4f}). Stopping training at Epoch {epoch + 1}."
+                        f"[Early Stopping] Monitored metric '{monitor_metric}' did not improve for {patience} consecutive epochs "
+                        f"({metric_info}). Stopping training at Epoch {epoch + 1}."
                     )
                     if self.logger:
                         self.logger.info(stop_msg)

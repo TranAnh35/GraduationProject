@@ -43,7 +43,7 @@ class Spatiotemporal5x5Config:
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
     phase_snr_tapering: bool = True     # Magnitude-weighted phase tapering to suppress noise floor
     phase_noise_floor: float = 0.05     # Signal magnitude threshold for phase tapering
-    embed_dim: int = 128                # D
+    embed_dim: int = 32                 # D (32 matches physical PECT rank ~8.23 and prevents covariance overfitting)
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
@@ -70,7 +70,7 @@ class Spatiotemporal5x5Config:
     min_lr: float = 1e-6
     warmup_epochs: int = 5
     weight_decay: float = 0.05
-    epochs: int = 20                     # 20 epochs (~60k steps) prevents late-stage overtraining
+    epochs: int = 30                     # 30 epochs ensures sustained representation convergence
     grad_clip: float = 1.0
     mixed_precision: bool = True
     device: str = "cuda"
@@ -89,7 +89,8 @@ class Spatiotemporal5x5Config:
     val_interval: int = 1
     probe_file: Optional[str] = None     # Optional TDMS file for epoch-by-epoch downstream probing (if None, auto-selects from val set)
     probe_interval: int = 1              # Run downstream anomaly probe every N epochs (0 to disable, 1 = every epoch)
-    early_stopping_patience: int = 5     # Stop training early if val_loss fails to improve for N epochs (0 = disabled)
+    early_stopping_metric: str = "val_loss_pred"  # 'val_loss_pred' | 'val_loss' | 'probe_cnr'
+    early_stopping_patience: int = 10    # Stop training early if monitored metric fails to improve for N epochs (0 = disabled)
     seed: int = 42
     resume: Optional[str] = None         # Checkpoint path or 'latest' / 'auto' / 'best' to resume from
 
