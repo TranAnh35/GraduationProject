@@ -168,3 +168,162 @@ def plot_anomaly_heatmap_5x5(
         plt.close(fig)
         return None
     return fig
+
+
+# ==============================================================================
+# Advanced Anomaly Detectors & Ground-Truth Benchmarking
+# ==============================================================================
+
+class MahalanobisDetector:
+    """
+    Mahalanobis Distance anomaly detector on frozen latent representations.
+    Fits empirical mean and covariance on sound metal baseline (dominant cluster or normal samples).
+    Score = sqrt( (z - mu)^T (Sigma + eps*I)^-1 (z - mu) ).
+    """
+    def __init__(self, regularize_eps: float = 1e-4):
+        self.regularize_eps = regularize_eps
+        self.mean: Optional[np.ndarray] = None
+        self.precision: Optional[np.ndarray] = None
+
+    def fit(self, features: np.ndarray, contamination: float = 0.05):
+        flat = features.reshape(-1, features.shape[-1]).astype(np.float64)
+        # Use median / robust estimation or trimmed sound metal
+        center = np.median(flat, axis=0)
+        dists = np.linalg.norm(flat - center, axis=1)
+        inlier_mask = dists <= np.percentile(dists, 100.0 * (1.0 - contamination))
+        sound_pts = flat[inlier_mask]
+
+        self.mean = np.mean(sound_pts, axis=0)
+        cov = np.cov(sound_pts, rowvar=False)
+        cov_reg = cov + np.eye(cov.shape[0]) * self.regularize_eps
+        self.precision = np.linalg.inv(cov_reg)
+
+    def score_map(self, test_map: np.ndarray) -> np.ndarray:
+        sY, sX, D = test_map.shape
+        flat = test_map.reshape(-1, D).astype(np.float64)
+        diff = flat - self.mean
+        # d^2 = sum(diff * (diff @ precision), axis=-1)
+        maha_sq = np.sum((diff @ self.precision) * diff, axis=-1)
+        maha_d = np.sqrt(np.maximum(0, maha_sq))
+        return maha_d.reshape(sY, sX).astype(np.float32)
+
+
+class IsolationForestDetector:
+    """
+    Isolation Forest anomaly detector on frozen latent representations.
+    Optimized for heavily imbalanced anomaly detection (< 2% defect pixels).
+    """
+    def __init__(self, n_estimators: int = 100, max_samples: int = 2048, random_state: int = 42):
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.random_state = random_state
+        self.model = None
+
+    def fit(self, features: np.ndarray):
+        from sklearn.ensemble import IsolationForest
+        flat = features.reshape(-1, features.shape[-1]).astype(np.float32)
+        # Downsample if too large for fast fitting
+        if len(flat) > 20000:
+            np.random.seed(self.random_state)
+            idx = np.random.choice(len(flat), 20000, replace=False)
+            flat_fit = flat[idx]
+        else:
+            flat_fit = flat
+
+        self.model = IsolationForest(
+            n_estimators=self.n_estimators,
+            max_samples=min(self.max_samples, len(flat_fit)),
+            contamination="auto",
+            random_state=self.random_state,
+            n_jobs=-1
+        )
+        self.model.fit(flat_fit)
+
+    def score_map(self, test_map: np.ndarray) -> np.ndarray:
+        sY, sX, D = test_map.shape
+        flat = test_map.reshape(-1, D).astype(np.float32)
+        # IsolationForest decision_function: lower means more anomalous.
+        # Negate so higher means more anomalous.
+        scores = -self.model.decision_function(flat)
+        return scores.reshape(sY, sX).astype(np.float32)
+
+
+class OneClassSVMDetector:
+    """
+    One-Class SVM anomaly detector on unit-normalized latent representations.
+    """
+    def __init__(self, kernel: str = "rbf", gamma: str = "scale", nu: float = 0.05):
+        self.kernel = kernel
+        self.gamma = gamma
+        self.nu = nu
+        self.model = None
+
+    def fit(self, features: np.ndarray):
+        from sklearn.svm import OneClassSVM
+        flat = features.reshape(-1, features.shape[-1]).astype(np.float32)
+        norms = np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-8
+        flat_norm = flat / norms
+
+        if len(flat_norm) > 10000:
+            np.random.seed(42)
+            idx = np.random.choice(len(flat_norm), 10000, replace=False)
+            flat_fit = flat_norm[idx]
+        else:
+            flat_fit = flat_norm
+
+        self.model = OneClassSVM(kernel=self.kernel, gamma=self.gamma, nu=self.nu)
+        self.model.fit(flat_fit)
+
+    def score_map(self, test_map: np.ndarray) -> np.ndarray:
+        sY, sX, D = test_map.shape
+        flat = test_map.reshape(-1, D).astype(np.float32)
+        norms = np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-8
+        flat_norm = flat / norms
+        scores = -self.model.decision_function(flat_norm)
+        return scores.reshape(sY, sX).astype(np.float32)
+
+
+def evaluate_anomaly_ground_truth(
+    score_map: np.ndarray,
+    gt_mask: np.ndarray
+) -> Dict[str, float]:
+    """
+    Evaluates an anomaly score map against the binary ground-truth mask.
+    Excludes transition buffer pixels (gt_mask == -1).
+    Computes:
+    - AUC-ROC
+    - Average Precision (PR-AUC)
+    - Optimal F1-Score, Precision, and Recall at best threshold
+    """
+    from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
+
+    flat_scores = score_map.reshape(-1)
+    flat_labels = gt_mask.reshape(-1)
+
+    valid_idx = np.where(flat_labels >= 0)[0]
+    y_true = flat_labels[valid_idx].astype(np.int64)
+    y_scores = flat_scores[valid_idx]
+
+    auc_roc = float(roc_auc_score(y_true, y_scores))
+    avg_prec = float(average_precision_score(y_true, y_scores))
+
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_scores)
+    f1_scores = 2.0 * (precisions * recalls) / (precisions + recalls + 1e-8)
+    best_idx = int(np.argmax(f1_scores))
+
+    best_f1 = float(f1_scores[best_idx])
+    best_p = float(precisions[best_idx])
+    best_r = float(recalls[best_idx])
+    best_thresh = float(thresholds[best_idx]) if best_idx < len(thresholds) else float(thresholds[-1])
+
+    return {
+        "auc_roc": round(auc_roc, 4),
+        "average_precision": round(avg_prec, 4),
+        "best_f1": round(best_f1, 4),
+        "precision_at_best_f1": round(best_p, 4),
+        "recall_at_best_f1": round(best_r, 4),
+        "optimal_threshold": round(best_thresh, 4),
+        "num_defect_pixels": int(np.sum(y_true == 1)),
+        "num_sound_pixels": int(np.sum(y_true == 0)),
+    }
+

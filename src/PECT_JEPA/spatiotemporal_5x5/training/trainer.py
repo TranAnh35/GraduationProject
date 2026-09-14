@@ -29,9 +29,35 @@ from ..configs.config import Spatiotemporal5x5Config
 from ..models.jepa_5x5 import PECT_JEPA_5x5
 from ..utils.logger import PECTExperimentLogger5x5
 from ..evaluation.liftoff_invariance import compute_effective_rank
-from ..evaluation.anomaly_detection import AnomalyDetector5x5, compute_anomaly_metrics, plot_anomaly_heatmap_5x5
+from ..evaluation.anomaly_detection import (
+    AnomalyDetector5x5,
+    compute_anomaly_metrics,
+    plot_anomaly_heatmap_5x5,
+    evaluate_anomaly_ground_truth,
+)
+from ..evaluation.manifold_dimension import estimate_twonn_dimension
 from ..evaluation.cscan_extractor import extract_full_cscan_map, load_cscan_from_tdms
 from .optimizer import build_optimizer_5x5, WarmupCosineLRScheduler5x5, MomentumScheduler5x5
+
+
+def compute_hypersphere_uniformity(features: np.ndarray, t: float = 2.0) -> float:
+    """
+    Computes Hypersphere Uniformity (Wang & Isola, ICML 2020).
+    Measures feature dispersion on the unit sphere:
+        L_unif = log( E_{u,v} [ exp(-t * ||u - v||^2) ] )
+    Collapse -> L_unif -> 0.0
+    Healthy representation -> L_unif < -2.0 (more negative = better).
+    """
+    if len(features) < 2:
+        return 0.0
+    norms = np.linalg.norm(features, axis=-1, keepdims=True) + 1e-12
+    u = features / norms
+    sim = np.dot(u, u.T)
+    dist_sq = np.clip(2.0 - 2.0 * sim, a_min=0.0, a_max=4.0)
+    np.fill_diagonal(dist_sq, np.inf)
+    valid = dist_sq < np.inf
+    loss = float(np.log(np.mean(np.exp(-t * dist_sq[valid])) + 1e-12))
+    return loss
 
 
 class Trainer5x5:
@@ -88,6 +114,7 @@ class Trainer5x5:
         self.best_val_loss = float("inf")
         self.best_val_loss_pred = float("inf")
         self.best_probe_cnr = -float("inf")
+        self.best_probe_gt_auc = -float("inf")
         self.patience_counter = 0
 
         if config.save_dir is None:
@@ -102,6 +129,7 @@ class Trainer5x5:
         self.probe_file = probe_file or getattr(config, "probe_file", None)
         self.probe_grid = None
         self.probe_fname = None
+        self.probe_gt_mask = None
         if self.probe_file and os.path.isfile(self.probe_file):
             try:
                 self.probe_grid = load_cscan_from_tdms(
@@ -125,6 +153,35 @@ class Trainer5x5:
             except Exception as e:
                 if self.logger:
                     self.logger.warning(f"[Probe] Could not pre-load probe file '{self.probe_file}': {e}")
+
+            # Locate and load matching Ground Truth mask
+            fname_lower = os.path.basename(self.probe_file).lower()
+            specimen_key = None
+            if "corosion" in fname_lower or "corrosion" in fname_lower:
+                specimen_key = "corrosion"
+            elif "rivet_v1" in fname_lower or "rivet1" in fname_lower:
+                specimen_key = "rivet_v1"
+            elif "rivet_v2" in fname_lower or "rivet2" in fname_lower or "mixed" in fname_lower:
+                specimen_key = "rivet_v2"
+
+            if specimen_key:
+                candidates = [
+                    os.path.join(config.data_dir, "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
+                    os.path.join("data", "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
+                ]
+                for c_gt in candidates:
+                    if os.path.isfile(c_gt):
+                        try:
+                            self.probe_gt_mask = np.load(c_gt)
+                            if self.logger:
+                                self.logger.info(
+                                    f"[Probe GT] Loaded ground-truth mask for '{specimen_key}': {c_gt} "
+                                    f"(mask shape: {self.probe_gt_mask.shape}, defects: {int(np.sum(self.probe_gt_mask == 1))})"
+                                )
+                            break
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.warning(f"[Probe GT] Could not load mask '{c_gt}': {e}")
 
         target_resume = resume_checkpoint or getattr(config, "resume", None)
         if target_resume:
@@ -276,10 +333,17 @@ class Trainer5x5:
             )
 
         eff_rank = 0.0
+        uniformity = float("nan")
+        twonn_dim = 0.0
         if val_features:
             feats = np.concatenate(val_features, axis=0)
             feats = feats[~np.isnan(feats).any(axis=1)]
             if len(feats) >= 2:
+                uniformity = compute_hypersphere_uniformity(feats)
+                try:
+                    twonn_dim = float(estimate_twonn_dimension(feats, subsample=2000))
+                except Exception:
+                    twonn_dim = 0.0
                 eff_rank = compute_effective_rank(feats)
 
         val_loss = (total_loss / n_batches) if n_batches > 0 else float("nan")
@@ -288,6 +352,8 @@ class Trainer5x5:
         return {
             "val_loss": val_loss,
             "val_loss_pred": val_loss_pred,
+            "uniformity": uniformity,
+            "twonn_dim": twonn_dim,
             "effective_rank": eff_rank,
         }
 
@@ -316,32 +382,48 @@ class Trainer5x5:
             score_map = detector.score_map(feature_map, detrend=True)
             raw_score_map = detector.score_map(feature_map, detrend=False)
 
-            # 3. Compute quantitative defect contrast metrics & probe representation rank
+            # 3. Compute quantitative defect contrast metrics & ground-truth AUC
             metrics = compute_anomaly_metrics(score_map)
             cnr = metrics["contrast_ratio_cnr"]
             raw_metrics = compute_anomaly_metrics(raw_score_map)
             raw_cnr = float(raw_metrics["contrast_ratio_cnr"])
             metrics["raw_cnr"] = raw_cnr
 
-            fmap_f32 = feature_map.astype(np.float32)
-            probe_rank_raw = compute_effective_rank(fmap_f32.reshape(-1, fmap_f32.shape[-1]))
-            metrics["probe_rank_raw"] = float(probe_rank_raw)
-
-            from scipy.ndimage import gaussian_filter
-            fmap_bg = gaussian_filter(fmap_f32, sigma=(15, 15, 0), mode="nearest")
-            probe_rank_detrended = compute_effective_rank((fmap_f32 - fmap_bg).reshape(-1, fmap_f32.shape[-1]))
-            metrics["probe_rank_detrended"] = float(probe_rank_detrended)
+            # Ground-Truth evaluation if mask is available
+            probe_gt_auc = None
+            probe_gt_ap = None
+            probe_gt_f1 = None
+            if self.probe_gt_mask is not None:
+                try:
+                    min_Y = min(score_map.shape[0], self.probe_gt_mask.shape[0])
+                    min_X = min(score_map.shape[1], self.probe_gt_mask.shape[1])
+                    sub_score = score_map[:min_Y, :min_X]
+                    sub_gt = self.probe_gt_mask[:min_Y, :min_X]
+                    gt_res = evaluate_anomaly_ground_truth(sub_score, sub_gt)
+                    probe_gt_auc = float(gt_res["auc_roc"])
+                    probe_gt_ap = float(gt_res["average_precision"])
+                    probe_gt_f1 = float(gt_res["best_f1"])
+                    metrics["probe_gt_auc"] = probe_gt_auc
+                    metrics["probe_gt_ap"] = probe_gt_ap
+                    metrics["probe_gt_f1"] = probe_gt_f1
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(f"[Probe GT] Ground-truth evaluation error: {e}")
 
             # 4. Save heatmap images to disk
             probe_dir = os.path.join(self.logger.run_dir if self.logger else "experiments/5x5", "probe_heatmaps")
             os.makedirs(probe_dir, exist_ok=True)
-            heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_cnr_{cnr:.2f}.png")
-            title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f} (Raw CNR: {raw_cnr:.2f}, Rank: {probe_rank_raw:.1f})"
+            if probe_gt_auc is not None:
+                heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_auc_{probe_gt_auc:.4f}.png")
+                title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | GT AUC: {probe_gt_auc:.4f} (AP: {probe_gt_ap:.4f}, CNR: {cnr:.2f})"
+            else:
+                heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_cnr_{cnr:.2f}.png")
+                title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f} (Raw CNR: {raw_cnr:.2f})"
             fig = plot_anomaly_heatmap_5x5(score_map, save_path=heatmap_path, title=title, close_fig=False)
 
             # Also save raw latent anomaly heatmap for transparent representation inspection
             raw_heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_raw_latent_cnr_{raw_cnr:.2f}.png")
-            raw_title = f"Epoch {epoch:02d} (Raw Latent) | Probe: {self.probe_fname} | Raw CNR: {raw_cnr:.2f} (Rank: {probe_rank_raw:.1f})"
+            raw_title = f"Epoch {epoch:02d} (Raw Latent) | Probe: {self.probe_fname} | Raw CNR: {raw_cnr:.2f}"
             fig_raw = plot_anomaly_heatmap_5x5(raw_score_map, save_path=raw_heatmap_path, title=raw_title, close_fig=False)
             if fig_raw is not None:
                 import matplotlib.pyplot as plt
@@ -364,7 +446,10 @@ class Trainer5x5:
         path: str,
         val_loss: Optional[float] = None,
         val_loss_pred: Optional[float] = None,
-        effective_rank: Optional[float] = None
+        effective_rank: Optional[float] = None,
+        uniformity: Optional[float] = None,
+        twonn_dim: Optional[float] = None,
+        probe_gt_auc: Optional[float] = None,
     ):
         ckpt = {
             "epoch": self.current_epoch,
@@ -377,7 +462,11 @@ class Trainer5x5:
             "best_val_loss": self.best_val_loss,
             "best_val_loss_pred": getattr(self, "best_val_loss_pred", float("inf")),
             "best_probe_cnr": getattr(self, "best_probe_cnr", -float("inf")),
+            "best_probe_gt_auc": getattr(self, "best_probe_gt_auc", -float("inf")),
             "effective_rank": effective_rank,
+            "uniformity": uniformity,
+            "twonn_dim": twonn_dim,
+            "probe_gt_auc": probe_gt_auc,
             "config": self.config.to_dict(),
         }
         torch.save(ckpt, path)
@@ -543,48 +632,75 @@ class Trainer5x5:
             if self.probe_grid is not None and getattr(self.config, "probe_interval", 1) > 0:
                 if (epoch + 1) % self.config.probe_interval == 0:
                     probe_metrics = self.run_downstream_probe(epoch=epoch + 1)
-                    if probe_metrics and "contrast_ratio_cnr" in probe_metrics:
+                    probe_improved = False
+                    msg_probe = ""
+                    if probe_metrics and "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
+                        auc_val = float(probe_metrics["probe_gt_auc"])
+                        if not np.isnan(auc_val) and auc_val > self.best_probe_gt_auc:
+                            self.best_probe_gt_auc = auc_val
+                            probe_improved = True
+                            msg_probe = f"  --> Saved new best downstream probe checkpoint (GT AUC: {auc_val:.4f}, AP: {probe_metrics['probe_gt_ap']:.4f})"
+                    elif probe_metrics and "contrast_ratio_cnr" in probe_metrics:
                         cnr = float(probe_metrics["contrast_ratio_cnr"])
                         if not np.isnan(cnr) and cnr > self.best_probe_cnr:
                             self.best_probe_cnr = cnr
-                            eff_rank = val_metrics.get("effective_rank") if val_metrics else None
-                            best_probe_path = os.path.join(self.config.save_dir, "best_probe_model_5x5.pt")
-                            self.save_checkpoint(
-                                best_probe_path,
-                                val_loss=val_metrics.get("val_loss") if val_metrics else None,
-                                val_loss_pred=val_metrics.get("val_loss_pred") if val_metrics else None,
-                                effective_rank=eff_rank
-                            )
-                            msg_probe = f"  --> Saved new best downstream probe checkpoint (CNR: {cnr:.2f}): {best_probe_path}"
-                            if self.logger:
-                                self.logger.info(msg_probe)
-                            else:
-                                print(msg_probe)
+                            probe_improved = True
+                            msg_probe = f"  --> Saved new best downstream probe checkpoint (CNR: {cnr:.2f})"
+
+                    if probe_improved:
+                        eff_rank = val_metrics.get("effective_rank") if val_metrics else None
+                        unif_val = val_metrics.get("uniformity") if val_metrics else None
+                        twonn_val = val_metrics.get("twonn_dim") if val_metrics else None
+                        best_probe_path = os.path.join(self.config.save_dir, "best_probe_model_5x5.pt")
+                        self.save_checkpoint(
+                            best_probe_path,
+                            val_loss=val_metrics.get("val_loss") if val_metrics else None,
+                            val_loss_pred=val_metrics.get("val_loss_pred") if val_metrics else None,
+                            effective_rank=eff_rank,
+                            uniformity=unif_val,
+                            twonn_dim=twonn_val,
+                            probe_gt_auc=probe_metrics.get("probe_gt_auc") if probe_metrics else None,
+                        )
+                        msg_full = f"{msg_probe}: {best_probe_path}"
+                        if self.logger:
+                            self.logger.info(msg_full)
+                        else:
+                            print(msg_full)
 
             val_str = ""
             if val_metrics:
-                v_tot = val_metrics.get("val_loss")
                 v_pred = val_metrics.get("val_loss_pred")
                 if v_pred is not None and not np.isnan(v_pred):
-                    val_str = f" | Val Pred Loss: {v_pred:.4f} (Total: {v_tot:.4f})"
-                elif v_tot is not None and not np.isnan(v_tot):
-                    val_str = f" | Val Loss: {v_tot:.4f}"
-            rank_str = f" | Val Rank: {val_metrics['effective_rank']:.1f}/{self.config.embed_dim}" if val_metrics and "effective_rank" in val_metrics and val_metrics["effective_rank"] > 0 else ""
+                    val_str = f" | Val Pred: {v_pred:.4f}"
+                elif val_metrics.get("val_loss") is not None:
+                    val_str = f" | Val Loss: {val_metrics['val_loss']:.4f}"
+
+            unif_val = val_metrics.get("uniformity") if val_metrics else None
+            unif_str = f" | Unif: {unif_val:.2f}" if unif_val is not None and not np.isnan(unif_val) else ""
+
+            twonn_val = val_metrics.get("twonn_dim") if val_metrics else None
+            twonn_str = f" | Two-NN: {twonn_val:.1f}D" if twonn_val is not None and twonn_val > 0 else ""
+
             probe_str = ""
             if probe_metrics:
-                p_cnr = probe_metrics['contrast_ratio_cnr']
-                p_rk = probe_metrics.get('probe_rank_detrended')
-                probe_str = f" | Probe CNR: {p_cnr:.2f}" + (f" (Probe Rank: {p_rk:.1f})" if p_rk is not None else "")
+                if "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
+                    probe_str = f" | Probe GT-AUC: {probe_metrics['probe_gt_auc']:.4f} (AP: {probe_metrics['probe_gt_ap']:.4f})"
+                elif "contrast_ratio_cnr" in probe_metrics:
+                    probe_str = f" | Probe CNR: {probe_metrics['contrast_ratio_cnr']:.2f}"
+
+            pred_loss_str = f"(Pred: {train_metrics['loss_pred']:.4f})" if "loss_pred" in train_metrics else ""
             log_line = (
                 f"[Epoch {epoch + 1:02d}/{self.config.epochs:02d}] "
-                f"Train Loss: {train_metrics['loss']:.4f} "
-                f"(Pred: {train_metrics['loss_pred']:.4f}, Var: {train_metrics['loss_var']:.4f}, Cov: {train_metrics['loss_cov']:.4f})"
-                f"{val_str}{rank_str}{probe_str} [{dt:.1f}s]"
+                f"Train Loss: {train_metrics['loss']:.4f} {pred_loss_str}"
+                f"{val_str}{unif_str}{twonn_str}{probe_str} [{dt:.1f}s]"
             )
             if self.logger:
                 self.logger.info(log_line)
                 if probe_metrics:
-                    self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_cnr_{probe_metrics['contrast_ratio_cnr']:.2f}.png")
+                    if "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
+                        self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_auc_{probe_metrics['probe_gt_auc']:.4f}.png")
+                    elif "contrast_ratio_cnr" in probe_metrics:
+                        self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_cnr_{probe_metrics['contrast_ratio_cnr']:.2f}.png")
             else:
                 print(log_line)
 
@@ -596,24 +712,42 @@ class Trainer5x5:
                     "time_sec": dt,
                 }
                 if val_metrics:
-                    if "val_loss" in val_metrics:
+                    if "val_loss" in val_metrics and not np.isnan(val_metrics["val_loss"]):
                         epoch_data["val_loss"] = val_metrics["val_loss"]
-                    if "val_loss_pred" in val_metrics:
+                    if "val_loss_pred" in val_metrics and not np.isnan(val_metrics["val_loss_pred"]):
                         epoch_data["val_loss_pred"] = val_metrics["val_loss_pred"]
+                    if "uniformity" in val_metrics and not np.isnan(val_metrics["uniformity"]):
+                        epoch_data["uniformity"] = val_metrics["uniformity"]
+                    if "twonn_dim" in val_metrics and val_metrics["twonn_dim"] > 0:
+                        epoch_data["twonn_dim"] = val_metrics["twonn_dim"]
                     if "effective_rank" in val_metrics:
                         epoch_data["effective_rank"] = val_metrics["effective_rank"]
-                if probe_metrics and "contrast_ratio_cnr" in probe_metrics:
-                    epoch_data["probe_cnr"] = probe_metrics["contrast_ratio_cnr"]
-                if probe_metrics and "probe_rank_detrended" in probe_metrics:
-                    epoch_data["probe_rank"] = probe_metrics["probe_rank_detrended"]
+                if probe_metrics:
+                    if "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
+                        epoch_data["probe_gt_auc"] = probe_metrics["probe_gt_auc"]
+                    if "probe_gt_ap" in probe_metrics and probe_metrics["probe_gt_ap"] is not None:
+                        epoch_data["probe_gt_ap"] = probe_metrics["probe_gt_ap"]
+                    if "contrast_ratio_cnr" in probe_metrics:
+                        epoch_data["probe_cnr"] = probe_metrics["contrast_ratio_cnr"]
                 self.logger.log_epoch(epoch=epoch + 1, metrics=epoch_data, step=self.global_step)
 
             # Checkpoint saving
             eff_rank = val_metrics.get("effective_rank") if val_metrics else None
+            unif_val = val_metrics.get("uniformity") if val_metrics else None
+            twonn_val = val_metrics.get("twonn_dim") if val_metrics else None
             val_loss = val_metrics.get("val_loss") if val_metrics else None
             val_loss_pred = val_metrics.get("val_loss_pred") if val_metrics else None
+            probe_gt_auc_val = probe_metrics.get("probe_gt_auc") if probe_metrics else None
             latest_path = os.path.join(self.config.save_dir, "latest_model_5x5.pt")
-            self.save_checkpoint(latest_path, val_loss=val_loss, val_loss_pred=val_loss_pred, effective_rank=eff_rank)
+            self.save_checkpoint(
+                latest_path,
+                val_loss=val_loss,
+                val_loss_pred=val_loss_pred,
+                effective_rank=eff_rank,
+                uniformity=unif_val,
+                twonn_dim=twonn_val,
+                probe_gt_auc=probe_gt_auc_val,
+            )
 
             # Early stopping & best checkpoint evaluation
             monitor_metric = getattr(self.config, "early_stopping_metric", "val_loss_pred")
@@ -626,6 +760,12 @@ class Trainer5x5:
                     self.best_val_loss_pred = cur_metric
                     improved = True
                 metric_info = f"val_loss_pred: {cur_metric:.4f} (best: {self.best_val_loss_pred:.4f})"
+            elif monitor_metric in ("probe_gt_auc", "gt_auc"):
+                cur_metric = float(probe_metrics["probe_gt_auc"]) if (probe_metrics and "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None) else float("-inf")
+                if not np.isnan(cur_metric) and cur_metric > getattr(self, "best_probe_gt_auc", -float("inf")):
+                    self.best_probe_gt_auc = cur_metric
+                    improved = True
+                metric_info = f"probe_gt_auc: {cur_metric:.4f} (best: {self.best_probe_gt_auc:.4f})"
             elif monitor_metric == "val_loss":
                 cur_metric = val_loss if val_loss is not None else train_metrics["loss"]
                 if not np.isnan(cur_metric) and cur_metric < self.best_val_loss:
@@ -653,25 +793,36 @@ class Trainer5x5:
             if improved:
                 self.patience_counter = 0
                 best_path = os.path.join(self.config.save_dir, "best_model_5x5.pt")
-                self.save_checkpoint(best_path, val_loss=val_loss, val_loss_pred=val_loss_pred, effective_rank=eff_rank)
+                self.save_checkpoint(
+                    best_path,
+                    val_loss=val_loss,
+                    val_loss_pred=val_loss_pred,
+                    effective_rank=eff_rank,
+                    uniformity=unif_val,
+                    twonn_dim=twonn_val,
+                    probe_gt_auc=probe_gt_auc_val,
+                )
                 msg_best = f"  --> Saved new best checkpoint (monitored {monitor_metric}): {best_path}"
                 if self.logger:
                     self.logger.info(msg_best)
                 else:
                     print(msg_best)
             else:
-                self.patience_counter += 1
                 patience = getattr(self.config, "early_stopping_patience", 0)
-                if patience > 0 and self.patience_counter >= patience:
-                    stop_msg = (
-                        f"[Early Stopping] Monitored metric '{monitor_metric}' did not improve for {patience} consecutive epochs "
-                        f"({metric_info}). Stopping training at Epoch {epoch + 1}."
-                    )
+                if patience > 0:
+                    self.patience_counter += 1
+                    msg_patience = f"  --> Early stopping patience: {self.patience_counter}/{patience} ({metric_info})"
                     if self.logger:
-                        self.logger.info(stop_msg)
+                        self.logger.info(msg_patience)
                     else:
-                        print(stop_msg)
-                    break
+                        print(msg_patience)
+                    if self.patience_counter >= patience:
+                        msg_stop = f"[Early Stopping] Monitored metric '{monitor_metric}' did not improve for {patience} consecutive epochs ({metric_info}). Stopping training at Epoch {epoch + 1}."
+                        if self.logger:
+                            self.logger.info(msg_stop)
+                        else:
+                            print(msg_stop)
+                        break
 
         if self.logger:
             self.logger.info("--- 5x5 PECT-JEPA Training Complete ---")

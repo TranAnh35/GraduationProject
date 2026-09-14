@@ -214,8 +214,14 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     else:
         config = Spatiotemporal5x5Config()
 
-    model = PECT_JEPA_5x5(config)
     state_dict = ckpt.get("model_state_dict", ckpt)
+    # Auto-detect tokenizer type from state_dict for backward compatibility
+    if "tokenizer.proj.weight" in state_dict:
+        config.tokenizer_type = "time_only"
+    elif "tokenizer.time_proj.weight" in state_dict:
+        config.tokenizer_type = "dual_domain"
+
+    model = PECT_JEPA_5x5(config)
     model.load_state_dict(state_dict)
     model.to(dev)
     model.eval()

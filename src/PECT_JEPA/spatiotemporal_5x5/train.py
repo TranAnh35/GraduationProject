@@ -157,7 +157,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to specific validation TDMS file to run downstream anomaly detection on after each epoch (default: auto-selects 1st defect file from val set)")
     p.add_argument("--probe_interval", type=int, default=1,
                    help="Frequency of running downstream probe on validation file (default: 1 = every epoch; 0 = disable)")
-    p.add_argument("--early_stopping_metric", type=str, default="val_loss_pred", choices=["val_loss_pred", "val_loss", "probe_cnr"],
+    p.add_argument("--early_stopping_metric", type=str, default="val_loss_pred", choices=["val_loss_pred", "val_loss", "probe_gt_auc", "gt_auc", "probe_cnr"],
                    help="Metric to monitor for early stopping and best checkpoint saving (default: val_loss_pred)")
     p.add_argument("--early_stopping_patience", type=int, default=10,
                    help="Stop training early if monitored metric fails to improve for N epochs (default: 10; 0 = disabled)")
