@@ -382,33 +382,19 @@ class Trainer5x5:
             score_map = detector.score_map(feature_map, detrend=True)
             raw_score_map = detector.score_map(feature_map, detrend=False)
 
-            # 3. Compute quantitative defect contrast metrics & ground-truth AUC
-            metrics = compute_anomaly_metrics(score_map)
+            # 3. Compute quantitative defect contrast metrics & ground-truth AUC (True Label-based when mask present)
+            metrics = compute_anomaly_metrics(score_map, gt_mask=self.probe_gt_mask)
             cnr = metrics["contrast_ratio_cnr"]
-            raw_metrics = compute_anomaly_metrics(raw_score_map)
+            raw_metrics = compute_anomaly_metrics(raw_score_map, gt_mask=self.probe_gt_mask)
             raw_cnr = float(raw_metrics["contrast_ratio_cnr"])
             metrics["raw_cnr"] = raw_cnr
 
-            # Ground-Truth evaluation if mask is available
-            probe_gt_auc = None
-            probe_gt_ap = None
-            probe_gt_f1 = None
-            if self.probe_gt_mask is not None:
-                try:
-                    min_Y = min(score_map.shape[0], self.probe_gt_mask.shape[0])
-                    min_X = min(score_map.shape[1], self.probe_gt_mask.shape[1])
-                    sub_score = score_map[:min_Y, :min_X]
-                    sub_gt = self.probe_gt_mask[:min_Y, :min_X]
-                    gt_res = evaluate_anomaly_ground_truth(sub_score, sub_gt)
-                    probe_gt_auc = float(gt_res["auc_roc"])
-                    probe_gt_ap = float(gt_res["average_precision"])
-                    probe_gt_f1 = float(gt_res["best_f1"])
-                    metrics["probe_gt_auc"] = probe_gt_auc
-                    metrics["probe_gt_ap"] = probe_gt_ap
-                    metrics["probe_gt_f1"] = probe_gt_f1
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"[Probe GT] Ground-truth evaluation error: {e}")
+            probe_gt_auc = metrics.get("auc_roc")
+            probe_gt_ap = metrics.get("average_precision")
+            probe_gt_f1 = metrics.get("best_f1")
+            metrics["probe_gt_auc"] = probe_gt_auc
+            metrics["probe_gt_ap"] = probe_gt_ap
+            metrics["probe_gt_f1"] = probe_gt_f1
 
             # 4. Save heatmap images to disk
             probe_dir = os.path.join(self.logger.run_dir if self.logger else "experiments/5x5", "probe_heatmaps")

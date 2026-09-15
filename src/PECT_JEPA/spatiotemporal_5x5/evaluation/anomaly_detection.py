@@ -106,35 +106,95 @@ class AnomalyDetector5x5:
         return scores_1d.reshape(sY, sX).astype(np.float32)
 
 
-def compute_anomaly_metrics(score_map: np.ndarray, top_percentile: float = 90.0) -> Dict[str, float]:
+def compute_anomaly_metrics(
+    score_map: np.ndarray,
+    gt_mask: Optional[np.ndarray] = None,
+    top_percentile: float = 90.0,
+) -> Dict[str, Any]:
     """
     Computes quantitative defect detection metrics on the 2D anomaly score map.
-    Default top_percentile=90.0 (top 10%) covers the multi-defect calibration matrix (~25 corrosion spots).
-    - contrast_ratio_cnr: (defect_mean - background_mean) / (background_std + 1e-8)
-    - peak_contrast_ratio: (max_score - background_mean) / (background_std + 1e-8)
+
+    If gt_mask is provided:
+        Computes TRUE label-based metrics:
+        - True contrast_ratio_cnr: (defect_mean - sound_mean) / (sound_std + 1e-8)
+        - True peak_contrast_ratio: (defect_max - sound_mean) / (sound_std + 1e-8)
+        - auc_roc: Area Under ROC Curve
+        - average_precision: Area Under Precision-Recall Curve (PR-AUC)
+        - best_f1: Optimal F1-Score
+        - has_ground_truth: True
+
+    If gt_mask is None:
+        Falls back to unsupervised top_percentile heuristic (default 90.0).
     """
     flat = score_map.flatten().astype(np.float64)
-    threshold = np.percentile(flat, top_percentile)
+    max_score = float(np.max(flat)) if len(flat) > 0 else 0.0
+    mean_score = float(np.mean(flat)) if len(flat) > 0 else 0.0
 
+    if gt_mask is not None:
+        min_Y = min(score_map.shape[0], gt_mask.shape[0])
+        min_X = min(score_map.shape[1], gt_mask.shape[1])
+        s_aligned = score_map[:min_Y, :min_X]
+        g_aligned = gt_mask[:min_Y, :min_X]
+
+        flat_s = s_aligned.reshape(-1)
+        flat_g = g_aligned.reshape(-1)
+
+        defect_pts = flat_s[flat_g == 1]
+        sound_pts = flat_s[flat_g == 0]
+
+        if len(defect_pts) > 0 and len(sound_pts) > 0:
+            bg_mean = float(np.mean(sound_pts))
+            bg_std = float(np.std(sound_pts))
+            defect_mean = float(np.mean(defect_pts))
+            defect_max = float(np.max(defect_pts))
+
+            cnr = (defect_mean - bg_mean) / (bg_std + 1e-8)
+            p_cnr = (defect_max - bg_mean) / (bg_std + 1e-8)
+
+            gt_eval = evaluate_anomaly_ground_truth(s_aligned, g_aligned)
+
+            return {
+                "mean_score": mean_score,
+                "max_score": max_score,
+                "background_mean": bg_mean,
+                "background_std": bg_std,
+                "defect_mean": defect_mean,
+                "defect_max": defect_max,
+                "contrast_ratio_cnr": float(cnr),
+                "peak_contrast_ratio": float(p_cnr),
+                "auc_roc": gt_eval["auc_roc"],
+                "average_precision": gt_eval["average_precision"],
+                "best_f1": gt_eval["best_f1"],
+                "optimal_threshold": gt_eval["optimal_threshold"],
+                "has_ground_truth": True,
+            }
+
+    # Fallback when gt_mask is None or has no valid defect/sound split
+    threshold = np.percentile(flat, top_percentile)
     defect_pts = flat[flat >= threshold]
     bg_pts = flat[flat < threshold]
 
-    bg_mean = float(np.mean(bg_pts))
-    bg_std = float(np.std(bg_pts))
-    defect_mean = float(np.mean(defect_pts))
-    max_score = float(np.max(flat))
+    bg_mean = float(np.mean(bg_pts)) if len(bg_pts) > 0 else 0.0
+    bg_std = float(np.std(bg_pts)) if len(bg_pts) > 0 else 1.0
+    defect_mean = float(np.mean(defect_pts)) if len(defect_pts) > 0 else 0.0
 
     cnr = (defect_mean - bg_mean) / (bg_std + 1e-8)
     p_cnr = (max_score - bg_mean) / (bg_std + 1e-8)
 
     return {
-        "mean_score": float(np.mean(flat)),
+        "mean_score": mean_score,
         "max_score": max_score,
         "background_mean": bg_mean,
         "background_std": bg_std,
         "defect_mean": defect_mean,
+        "defect_max": max_score,
         "contrast_ratio_cnr": float(cnr),
         "peak_contrast_ratio": float(p_cnr),
+        "auc_roc": None,
+        "average_precision": None,
+        "best_f1": None,
+        "optimal_threshold": None,
+        "has_ground_truth": False,
     }
 
 

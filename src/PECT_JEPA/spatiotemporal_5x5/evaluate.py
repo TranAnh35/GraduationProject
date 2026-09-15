@@ -69,11 +69,52 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import (
     AnomalyDetector5x5,
     plot_anomaly_heatmap_5x5,
     compute_anomaly_metrics,
+    evaluate_anomaly_ground_truth,
 )
+from src.PECT_JEPA.spatiotemporal_5x5.evaluation.linear_probe import LinearProbeEvaluator
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.liftoff_invariance import (
     compute_linear_cka,
     compute_feature_similarity_matrix,
 )
+
+
+def find_ground_truth_mask(file_path: str, data_dir: str = "data") -> Optional[np.ndarray]:
+    """
+    Finds and loads the ground-truth mask corresponding to a TDMS file's specimen.
+    Supports: 'corrosion', 'rivet_v1', 'rivet_v2'.
+    """
+    fname_lower = os.path.basename(file_path).lower()
+    specimen_key = None
+    if "corosion" in fname_lower or "corrosion" in fname_lower:
+        specimen_key = "corrosion"
+    elif "rivet_v1" in fname_lower or "rivet1" in fname_lower:
+        specimen_key = "rivet_v1"
+    elif "rivet_v2" in fname_lower or "rivet2" in fname_lower or "mixed" in fname_lower:
+        specimen_key = "rivet_v2"
+
+    if not specimen_key:
+        norm_parts = [p.lower() for p in os.path.normpath(file_path).split(os.sep)]
+        if "corrosion" in norm_parts:
+            specimen_key = "corrosion"
+        elif "rivet_v1" in norm_parts:
+            specimen_key = "rivet_v1"
+        elif "rivet_v2" in norm_parts:
+            specimen_key = "rivet_v2"
+
+    if specimen_key:
+        candidates = [
+            os.path.join(data_dir, "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
+            os.path.join(ROOT_DIR, "data", "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
+            os.path.join("data", "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
+        ]
+        for c_gt in candidates:
+            if os.path.isfile(c_gt):
+                try:
+                    return np.load(c_gt)
+                except Exception:
+                    pass
+    return None
+
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -271,19 +312,42 @@ def evaluate_single_file(
         show_pbar=True,
     )
 
-    # Fit unsupervised anomaly detector on the scan
-    detector = AnomalyDetector5x5(n_clusters=2)
-    detector.fit(feature_map)
-    score_map = detector.score_map(feature_map)
+    # Locate matching Ground Truth mask for this specimen
+    gt_mask = find_ground_truth_mask(file_path, data_dir=getattr(model.config, "data_dir", "data"))
 
-    # Compute quantitative defect metrics
-    metrics = compute_anomaly_metrics(score_map)
+    # Fit unsupervised anomaly detector on representations with spatial detrending
+    detector = AnomalyDetector5x5(n_clusters=2, detrend=True)
+    detector.fit(feature_map)
+    score_map = detector.score_map(feature_map, detrend=True)
+
+    # Compute quantitative defect metrics (True Label-based when gt_mask is available)
+    metrics = compute_anomaly_metrics(score_map, gt_mask=gt_mask)
+
+    # If Ground Truth mask is present, also evaluate SSL Linear Probe & k-NN (Standard SSL benchmark)
+    probe_metrics = None
+    if gt_mask is not None:
+        try:
+            min_Y = min(feature_map.shape[0], gt_mask.shape[0])
+            min_X = min(feature_map.shape[1], gt_mask.shape[1])
+            evaluator = LinearProbeEvaluator(n_splits=5)
+            probe_metrics = evaluator.evaluate_cross_val(feature_map[:min_Y, :min_X], gt_mask[:min_Y, :min_X])
+            metrics["linear_probe_auc_roc"] = probe_metrics["linear_probe_auc_roc"]
+            metrics["linear_probe_average_precision"] = probe_metrics["linear_probe_average_precision"]
+            metrics["linear_probe_f1"] = probe_metrics["linear_probe_f1"]
+            metrics["knn_5_accuracy"] = probe_metrics["knn_5_accuracy"]
+            metrics["knn_5_f1"] = probe_metrics["knn_5_f1"]
+        except Exception as e:
+            print(f"    [Probe Warning] Linear probe failed: {e}")
 
     # Plot and save high-contrast heatmap
     heatmap_path = os.path.join(output_dir, f"{fname_base}_anomaly_heatmap.png")
+    gt_header = ""
+    if metrics.get("auc_roc") is not None:
+        gt_header = f" | GT AUC: {metrics['auc_roc']:.4f} (AP: {metrics['average_precision']:.4f})"
+    cnr_label = "True CNR" if metrics.get("has_ground_truth") else "CNR"
     title = (
         f"PECT-JEPA 5x5 Anomaly Map | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
-        f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')} | CNR: {metrics['contrast_ratio_cnr']:.2f}"
+        f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')} | {cnr_label}: {metrics['contrast_ratio_cnr']:.2f}{gt_header}"
     )
     plot_anomaly_heatmap_5x5(
         anomaly_map=score_map,
@@ -301,9 +365,12 @@ def evaluate_single_file(
         "file_name": os.path.basename(file_path),
         "metadata": meta,
         "metrics": metrics,
+        "probe_metrics": probe_metrics,
         "heatmap_path": heatmap_path,
     }
-    print(f"  [Result] CNR: {metrics['contrast_ratio_cnr']:.2f} | Peak Anomaly: {metrics['max_score']:.4f} | Heatmap: {heatmap_path}")
+    auc_str = f" | GT AUC: {metrics['auc_roc']:.4f} | AP: {metrics['average_precision']:.4f}" if metrics.get("auc_roc") is not None else ""
+    lp_str = f" | Linear Probe AUC: {metrics['linear_probe_auc_roc']:.4f}" if "linear_probe_auc_roc" in metrics else ""
+    print(f"  [Result] {cnr_label}: {metrics['contrast_ratio_cnr']:.2f}{auc_str}{lp_str} | Peak: {metrics['max_score']:.4f} | Heatmap: {heatmap_path}")
     return result
 
 
@@ -504,6 +571,12 @@ def main():
     # 4. Generate Comprehensive Consolidated Report
     cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in file_results]
     peak_cnrs = [r["metrics"]["peak_contrast_ratio"] for r in file_results]
+    aucs = [r["metrics"]["auc_roc"] for r in file_results if r["metrics"].get("auc_roc") is not None]
+    aps = [r["metrics"]["average_precision"] for r in file_results if r["metrics"].get("average_precision") is not None]
+    lp_aucs = [r["metrics"]["linear_probe_auc_roc"] for r in file_results if "linear_probe_auc_roc" in r["metrics"]]
+    lp_aps = [r["metrics"]["linear_probe_average_precision"] for r in file_results if "linear_probe_average_precision" in r["metrics"]]
+    lp_f1s = [r["metrics"]["linear_probe_f1"] for r in file_results if "linear_probe_f1" in r["metrics"]]
+
     ckas = [r["linear_cka"] for r in liftoff_results]
     cos_sims = [r["cosine_similarity"] for r in liftoff_results]
 
@@ -512,17 +585,18 @@ def main():
     if test_slices:
         for slice_name, s_files in test_slices.items():
             s_set = {os.path.normpath(f) for f in s_files}
-            slice_cnrs = [
-                r["metrics"]["contrast_ratio_cnr"]
-                for r in file_results
-                if os.path.normpath(r["file"]) in s_set
-            ]
+            matching_results = [r for r in file_results if os.path.normpath(r["file"]) in s_set]
+            slice_cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in matching_results]
+            slice_aucs = [r["metrics"]["auc_roc"] for r in matching_results if r["metrics"].get("auc_roc") is not None]
+            slice_aps = [r["metrics"]["average_precision"] for r in matching_results if r["metrics"].get("average_precision") is not None]
             if slice_cnrs:
                 slice_metrics[slice_name] = {
                     "count": len(slice_cnrs),
                     "mean_cnr": float(np.mean(slice_cnrs)),
                     "std_cnr": float(np.std(slice_cnrs)),
                     "max_cnr": float(np.max(slice_cnrs)),
+                    "mean_auc": float(np.mean(slice_aucs)) if slice_aucs else None,
+                    "mean_ap": float(np.mean(slice_aps)) if slice_aps else None,
                 }
 
     report = {
@@ -540,10 +614,16 @@ def main():
         },
         "aggregate_metrics": {
             "total_test_files_evaluated": len(file_results),
+            "labeled_files_count": len(aucs),
             "mean_contrast_ratio_cnr": float(np.mean(cnrs)) if cnrs else None,
             "std_contrast_ratio_cnr": float(np.std(cnrs)) if cnrs else None,
             "max_contrast_ratio_cnr": float(np.max(cnrs)) if cnrs else None,
             "mean_peak_contrast_ratio": float(np.mean(peak_cnrs)) if peak_cnrs else None,
+            "mean_spatial_auc_roc": float(np.mean(aucs)) if aucs else None,
+            "mean_spatial_average_precision": float(np.mean(aps)) if aps else None,
+            "mean_linear_probe_auc_roc": float(np.mean(lp_aucs)) if lp_aucs else None,
+            "mean_linear_probe_average_precision": float(np.mean(lp_aps)) if lp_aps else None,
+            "mean_linear_probe_f1": float(np.mean(lp_f1s)) if lp_f1s else None,
             "mean_liftoff_linear_cka": float(np.mean(ckas)) if ckas else None,
             "mean_liftoff_cosine_sim": float(np.mean(cos_sims)) if cos_sims else None,
         },
@@ -560,16 +640,22 @@ def main():
     print("  EVALUATION SUMMARY REPORT")
     print("=" * 70)
     print(f"Protocol: {protocol_name.upper()} | Holdout Target: {holdout_target}")
-    print(f"Evaluated Test Files: {len(file_results)}")
+    print(f"Evaluated Test Files: {len(file_results)} ({len(aucs)} with Ground Truth labels)")
     if cnrs:
         print(f"Overall Defect-to-Background CNR:  Mean = {np.mean(cnrs):.2f} +/- {np.std(cnrs):.2f} (Max = {np.max(cnrs):.2f})")
+    if aucs:
+        print(f"Overall Ground-Truth Spatial AUC:  Mean = {np.mean(aucs):.4f} across {len(aucs)} labeled files (Mean AP: {np.mean(aps):.4f})")
+    if lp_aucs:
+        print(f"Overall SSL Linear Probe AUC:     Mean = {np.mean(lp_aucs):.4f} across {len(lp_aucs)} labeled files (Mean AP: {np.mean(lp_aps):.4f}, F1: {np.mean(lp_f1s):.4f})")
     if slice_metrics:
         print("\n--- OOD Domain Shift Performance Breakdown ---")
-        print(f"{'Domain Slice':<25} | {'Files':<6} | {'Mean CNR':<12} | {'Max CNR':<10}")
-        print("-" * 60)
+        print(f"{'Domain Slice':<25} | {'Files':<6} | {'Mean CNR':<10} | {'Mean AUC':<10} | {'Mean AP':<10}")
+        print("-" * 75)
         for s_name, sm in slice_metrics.items():
-            print(f"{s_name:<25} | {sm['count']:<6} | {sm['mean_cnr']:<12.2f} | {sm['max_cnr']:<10.2f}")
-        print("-" * 60)
+            auc_disp = f"{sm['mean_auc']:.4f}" if sm.get("mean_auc") is not None else "--"
+            ap_disp = f"{sm['mean_ap']:.4f}" if sm.get("mean_ap") is not None else "--"
+            print(f"{s_name:<25} | {sm['count']:<6} | {sm['mean_cnr']:<10.2f} | {auc_disp:<10} | {ap_disp:<10}")
+        print("-" * 75)
     if ckas:
         print(f"Lift-off Linear CKA Score: Mean = {np.mean(ckas):.4f} across {len(ckas)} pairs")
     if cos_sims:
