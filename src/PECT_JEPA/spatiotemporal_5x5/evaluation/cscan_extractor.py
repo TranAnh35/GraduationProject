@@ -84,10 +84,13 @@ def load_cscan_from_tdms(
     apply_lowpass: bool = True,
     lowpass_cutoff: float = 2500.0,
     lowpass_order: int = 4,
+    standardize_coords: bool = True,
 ) -> np.ndarray:
     """
     Reads a TDMS file and converts it into a [sY, sX, C] grid (C=128 for linear, C=256 for dual_channel).
-    Optionally crops outer boundary pixels (crop_border on each side) to remove air/edge effect.
+    If standardize_coords is True (default), applies authoritative geometric transformations
+    (rotation, flip, crop) from raw_tdms_rotate_crop.csv to align directly with CAD ground-truth masks.
+    Otherwise, optionally crops outer boundary pixels (crop_border on each side).
     """
     raw = read_tdms_1d_waveforms(
         file_path=file_path,
@@ -113,7 +116,19 @@ def load_cscan_from_tdms(
 
     C = flat_c.shape[-1]
     grid = flat_c[:sY * sX].reshape(sY, sX, C)
-    if crop_border > 0:
+
+    if standardize_coords:
+        try:
+            from ..data.ground_truth import get_ground_truth_manager
+            gt_mgr = get_ground_truth_manager()
+            grid = gt_mgr.transform_cscan_to_standard(grid, file_path)
+        except Exception as e:
+            if crop_border > 0:
+                cb = crop_border
+                grid = grid[cb: sY - cb, cb: sX - cb, :]
+    elif crop_border > 0:
         cb = crop_border
         grid = grid[cb: sY - cb, cb: sX - cb, :]
+
     return grid.astype(np.float32)
+

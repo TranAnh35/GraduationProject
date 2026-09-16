@@ -154,34 +154,49 @@ class Trainer5x5:
                 if self.logger:
                     self.logger.warning(f"[Probe] Could not pre-load probe file '{self.probe_file}': {e}")
 
-            # Locate and load matching Ground Truth mask
-            fname_lower = os.path.basename(self.probe_file).lower()
-            specimen_key = None
-            if "corosion" in fname_lower or "corrosion" in fname_lower:
-                specimen_key = "corrosion"
-            elif "rivet_v1" in fname_lower or "rivet1" in fname_lower:
-                specimen_key = "rivet_v1"
-            elif "rivet_v2" in fname_lower or "rivet2" in fname_lower or "mixed" in fname_lower:
-                specimen_key = "rivet_v2"
+            # Locate and load authoritative CAD Ground Truth mask
+            if self.probe_file:
+                try:
+                    from ..data.ground_truth import get_ground_truth_manager
+                    gt_mgr = get_ground_truth_manager(data_dir=config.data_dir)
+                    self.probe_gt_mask = gt_mgr.get_ground_truth_mask_for_file(self.probe_file, aligned_scan=True)
+                    if self.logger and self.probe_gt_mask is not None:
+                        self.logger.info(
+                            f"[Probe GT] Loaded authoritative CAD mask for '{self.probe_fname}': "
+                            f"(shape: {self.probe_gt_mask.shape}, defects: {int(np.sum(self.probe_gt_mask == 1))})"
+                        )
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(f"[Probe GT] Could not load authoritative mask via manager: {e}")
 
-            if specimen_key:
-                candidates = [
-                    os.path.join(config.data_dir, "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
-                    os.path.join("data", "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
-                ]
-                for c_gt in candidates:
-                    if os.path.isfile(c_gt):
-                        try:
-                            self.probe_gt_mask = np.load(c_gt)
-                            if self.logger:
-                                self.logger.info(
-                                    f"[Probe GT] Loaded ground-truth mask for '{specimen_key}': {c_gt} "
-                                    f"(mask shape: {self.probe_gt_mask.shape}, defects: {int(np.sum(self.probe_gt_mask == 1))})"
-                                )
-                            break
-                        except Exception as e:
-                            if self.logger:
-                                self.logger.warning(f"[Probe GT] Could not load mask '{c_gt}': {e}")
+            if self.probe_gt_mask is None:
+                fname_lower = os.path.basename(self.probe_file).lower()
+                specimen_key = None
+                if "corosion" in fname_lower or "corrosion" in fname_lower:
+                    specimen_key = "corrosion"
+                elif "rivet_v1" in fname_lower or "rivet1" in fname_lower:
+                    specimen_key = "rivet_v1"
+                elif "rivet_v2" in fname_lower or "rivet2" in fname_lower or "mixed" in fname_lower:
+                    specimen_key = "rivet_v2"
+
+                if specimen_key:
+                    candidates = [
+                        os.path.join(config.data_dir, "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
+                        os.path.join("data", "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
+                    ]
+                    for c_gt in candidates:
+                        if os.path.isfile(c_gt):
+                            try:
+                                self.probe_gt_mask = np.load(c_gt)
+                                if self.logger:
+                                    self.logger.info(
+                                        f"[Probe GT] Loaded ground-truth mask fallback for '{specimen_key}': {c_gt} "
+                                        f"(mask shape: {self.probe_gt_mask.shape}, defects: {int(np.sum(self.probe_gt_mask == 1))})"
+                                    )
+                                break
+                            except Exception as e:
+                                if self.logger:
+                                    self.logger.warning(f"[Probe GT] Could not load mask '{c_gt}': {e}")
 
         target_resume = resume_checkpoint or getattr(config, "resume", None)
         if target_resume:

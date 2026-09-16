@@ -80,9 +80,17 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.liftoff_invariance import (
 
 def find_ground_truth_mask(file_path: str, data_dir: str = "data") -> Optional[np.ndarray]:
     """
-    Finds and loads the ground-truth mask corresponding to a TDMS file's specimen.
+    Finds and loads the authoritative CAD ground-truth mask corresponding to a TDMS file's specimen.
+    Utilizes GroundTruthManager to ensure mathematical alignment with specimen_mask_features.json.
     Supports: 'corrosion', 'rivet_v1', 'rivet_v2'.
     """
+    try:
+        from .data.ground_truth import get_ground_truth_manager
+        gt_mgr = get_ground_truth_manager(data_dir=data_dir)
+        return gt_mgr.get_ground_truth_mask_for_file(file_path, aligned_scan=True)
+    except Exception:
+        pass
+
     fname_lower = os.path.basename(file_path).lower()
     specimen_key = None
     if "corosion" in fname_lower or "corrosion" in fname_lower:
