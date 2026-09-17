@@ -9,10 +9,10 @@ import torch
 import torch.nn as nn
 
 from ..configs.config import Spatiotemporal5x5Config, get_default_config_5x5
-from .tokenizer_5x5 import SpatialGridTokenizer5x5, DualDomainGridTokenizer5x5, build_tokenizer_5x5
+from .tokenizer_5x5 import SpatialGridTokenizer5x5, DualDomainGridTokenizer5x5, DualDomainAttentionTokenizer5x5, build_tokenizer_5x5
 from .context_encoder import ContextEncoder5x5
 from .target_encoder import TargetEncoder5x5
-from .predictor import Predictor5x5
+from .predictor import Predictor5x5, OperatorDiffusionPredictor5x5, build_predictor_5x5
 from ..masking.cluster_mask import ContiguousClusterMasker5x5
 from ..losses.jepa_loss import JEPALoss5x5
 
@@ -58,14 +58,8 @@ class PECT_JEPA_5x5(nn.Module):
         )
         self._init_target_encoder()
 
-        # 5. Predictor
-        self.predictor = Predictor5x5(
-            embed_dim=config.embed_dim,
-            depth=config.predictor_depth,
-            num_heads=config.predictor_heads,
-            mlp_ratio=config.mlp_ratio,
-            dropout=config.dropout
-        )
+        # 5. Predictor (Physics Operator Diffusion Predictor or Standard)
+        self.predictor = build_predictor_5x5(config)
 
         # 6. Loss Function
         self.loss_fn = JEPALoss5x5(
@@ -96,6 +90,7 @@ class PECT_JEPA_5x5(nn.Module):
         x: torch.Tensor,
         custom_context_indices: Optional[torch.Tensor] = None,
         custom_target_indices: Optional[torch.Tensor] = None,
+        freq_condition: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward self-supervised step.
@@ -103,6 +98,7 @@ class PECT_JEPA_5x5(nn.Module):
             x: [B, 5, 5, C] input grid
             custom_context_indices: optional override [B, N_ctx]
             custom_target_indices:  optional override [B, N_tgt]
+            freq_condition: optional explicit frequency diffusion query [B]
 
         Returns dict of loss and representations.
         """
@@ -133,8 +129,17 @@ class PECT_JEPA_5x5(nn.Module):
         # 4. Context Encoder (only sees visible context tokens)
         H_ctx = self.context_encoder(context_tokens, context_pos)
 
-        # 5. Predictor (queries predict target representations)
-        H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos)
+        # 5. Predictor (queries predict target representations conditioned on diffusion operator)
+        if freq_condition is None:
+            if self.training:
+                freq_condition = torch.randint(1, getattr(self.config, "num_freq_bins", 14) + 1, (B,), device=device)
+            else:
+                freq_condition = None
+
+        if hasattr(self.predictor, "op_embedding"):
+            H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos, freq_condition=freq_condition)
+        else:
+            H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos)
 
         # 6. Target Encoder (EMA, detached)
         with torch.no_grad():

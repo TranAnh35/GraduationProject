@@ -387,3 +387,162 @@ def evaluate_anomaly_ground_truth(
         "num_sound_pixels": int(np.sum(y_true == 0)),
     }
 
+
+def plot_latent_representation_quality(
+    feature_map: np.ndarray,
+    gt_mask: Optional[np.ndarray] = None,
+    save_path: Optional[str] = None,
+    title_prefix: str = "Latent Representation Quality",
+    close_fig: bool = True,
+) -> Dict[str, Any]:
+    """
+    Directly diagnoses the geometry and physical contrast of PECT-JEPA representations
+    WITHOUT artificial spatial high-pass filtering (Spatial Residual Contrast) or downstream detectors.
+
+    Generates a 3-panel diagnostic visualization:
+    1. Latent PCA-RGB Projection:
+       - Projects the high-dimensional latent space z in R^D to the top 3 principal components (PC1=R, PC2=G, PC3=B).
+       - Reveals intrinsic cluster separation, flaw pop-out, and lift-off gradients.
+    2. Hypersphere Angular Distance Map (1 - cos(theta)):
+       - Measures angular departure on the unit hypersphere from nominal sound metal baseline.
+       - Pure representation distance without spatial detrending.
+    3. Authoritative CAD Ground-Truth Verification Overlay:
+       - Physical CAD defect and fastener contours registered to C-scan space.
+
+    Returns:
+        dict containing:
+        - 'fig': matplotlib figure (if not closed)
+        - 'pca_variance_explained': list of variance explained by [PC1, PC2, PC3]
+        - 'total_3pc_variance': sum of variance of top 3 PCs
+        - 'angular_cnr': contrast-to-noise ratio in hypersphere angular space
+        - 'angular_auc': AUC-ROC of raw angular distance vs true label (if gt_mask provided)
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import roc_auc_score, average_precision_score
+
+    sY, sX, D = feature_map.shape
+    flat = feature_map.reshape(-1, D).astype(np.float32)
+
+    # 1. PCA-RGB Projection
+    pca = PCA(n_components=3, random_state=42)
+    pca_proj = pca.fit_transform(flat)  # [N, 3]
+    var_exp = pca.explained_variance_ratio_
+
+    rgb_map = np.zeros((sY, sX, 3), dtype=np.float32)
+    for c in range(3):
+        pc_c = pca_proj[:, c].reshape(sY, sX)
+        p_low = np.percentile(pc_c, 1.0)
+        p_high = np.percentile(pc_c, 99.0)
+        if p_high > p_low:
+            pc_norm = np.clip((pc_c - p_low) / (p_high - p_low), 0.0, 1.0)
+        else:
+            pc_norm = np.zeros_like(pc_c)
+        rgb_map[:, :, c] = pc_norm
+
+    # 2. Hypersphere Angular Distance Map (1 - cos(theta))
+    norms = np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-8
+    flat_norm = flat / norms  # [N, D] on unit sphere
+
+    # Estimate nominal sound metal vector as spatial median on unit sphere
+    median_vec = np.median(flat_norm, axis=0, keepdims=True)
+    median_vec = median_vec / (np.linalg.norm(median_vec, axis=-1, keepdims=True) + 1e-8)
+
+    # Cosine distance: 1 - z . z_nominal
+    cos_sim = np.sum(flat_norm * median_vec, axis=-1)  # [N]
+    angular_dist = (1.0 - cos_sim).reshape(sY, sX)
+
+    # Calculate metrics on angular distance
+    angular_cnr = float("nan")
+    angular_auc = None
+    angular_ap = None
+
+    if gt_mask is not None:
+        flat_labels = gt_mask.reshape(-1)
+        valid = flat_labels >= 0
+        if np.any(flat_labels == 1) and np.any(flat_labels == 0):
+            y_t = flat_labels[valid].astype(np.int64)
+            y_s = angular_dist.reshape(-1)[valid]
+            try:
+                angular_auc = float(roc_auc_score(y_t, y_s))
+                angular_ap = float(average_precision_score(y_t, y_s))
+            except Exception:
+                pass
+
+            def_vals = angular_dist.reshape(-1)[flat_labels == 1]
+            snd_vals = angular_dist.reshape(-1)[flat_labels == 0]
+            if len(def_vals) > 0 and len(snd_vals) > 0:
+                s_std = float(np.std(snd_vals))
+                angular_cnr = float((np.mean(def_vals) - np.mean(snd_vals)) / (s_std + 1e-8))
+
+    # 3. Create Diagnostic Plot
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), dpi=150)
+
+    # Panel 1: Latent PCA-RGB Projection
+    axes[0].imshow(rgb_map, origin="lower", aspect="equal")
+    axes[0].set_title(
+        f"1. Latent PCA-RGB Projection\n"
+        f"PC1(R):{var_exp[0]*100:.1f}% | PC2(G):{var_exp[1]*100:.1f}% | PC3(B):{var_exp[2]*100:.1f}% "
+        f"(\u03a3={np.sum(var_exp)*100:.1f}%)",
+        fontsize=10,
+        fontweight="bold"
+    )
+    axes[0].set_xlabel("Scan X (pixels)")
+    axes[0].set_ylabel("Scan Y (pixels)")
+
+    # Panel 2: Hypersphere Angular Distance Map
+    vmax_ang = float(np.percentile(angular_dist, 99.0))
+    im1 = axes[1].imshow(angular_dist, cmap="magma", origin="lower", aspect="equal", vmin=0.0, vmax=max(vmax_ang, 1e-4))
+    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, label="Angular Distance (1 - cos \u03b8)")
+    title_p2 = "2. Hypersphere Angular Distance\n(Pure Latent Departure from Nominal)"
+    if not np.isnan(angular_cnr):
+        title_p2 += f" | Raw Latent CNR: {angular_cnr:.2f}"
+    axes[1].set_title(title_p2, fontsize=10, fontweight="bold")
+    axes[1].set_xlabel("Scan X (pixels)")
+    axes[1].set_ylabel("Scan Y (pixels)")
+
+    # Panel 3: CAD Ground-Truth Verification Overlay
+    if gt_mask is not None:
+        im2 = axes[2].imshow(angular_dist, cmap="viridis", origin="lower", aspect="equal", vmin=0.0, vmax=max(vmax_ang, 1e-4))
+        # Overlay binary defect contour
+        binary_defects = (gt_mask == 1).astype(np.float32)
+        if np.any(binary_defects > 0):
+            axes[2].contour(binary_defects, levels=[0.5], colors=["#00ffff"], linewidths=[1.5])
+        title_p3 = "3. CAD Ground-Truth Alignment\n"
+        if angular_auc is not None:
+            title_p3 += f"Raw Latent AUC: {angular_auc:.4f} | AP: {angular_ap:.4f}"
+        else:
+            title_p3 += "Cyan Contours = True Physical Flaws"
+        axes[2].set_title(title_p3, fontsize=10, fontweight="bold")
+        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label="Angular Distance (1 - cos \u03b8)")
+    else:
+        # Fallback if no gt_mask: plot intensity slice or magnitude
+        axes[2].imshow(np.linalg.norm(feature_map, axis=-1), cmap="viridis", origin="lower", aspect="equal")
+        axes[2].set_title("3. Latent L2 Norm Distribution", fontsize=10, fontweight="bold")
+        axes[2].set_xlabel("Scan X (pixels)")
+        axes[2].set_ylabel("Scan Y (pixels)")
+
+    axes[2].set_xlabel("Scan X (pixels)")
+    axes[2].set_ylabel("Scan Y (pixels)")
+
+    plt.suptitle(f"{title_prefix} — Representation Geometry & Contrast Audit", fontsize=12, fontweight="bold", y=0.98)
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        plt.savefig(save_path)
+
+    result_dict = {
+        "fig": fig if not close_fig else None,
+        "pca_variance_explained": [float(v) for v in var_exp],
+        "total_3pc_variance": float(np.sum(var_exp)),
+        "angular_cnr": angular_cnr,
+        "angular_auc": angular_auc,
+        "angular_ap": angular_ap,
+    }
+
+    if close_fig:
+        plt.close(fig)
+
+    return result_dict
+
+

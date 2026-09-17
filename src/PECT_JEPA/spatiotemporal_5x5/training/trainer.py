@@ -33,6 +33,7 @@ from ..evaluation.anomaly_detection import (
     AnomalyDetector5x5,
     compute_anomaly_metrics,
     plot_anomaly_heatmap_5x5,
+    plot_latent_representation_quality,
     evaluate_anomaly_ground_truth,
 )
 from ..evaluation.manifold_dimension import estimate_twonn_dimension
@@ -430,7 +431,28 @@ class Trainer5x5:
                 import matplotlib.pyplot as plt
                 plt.close(fig_raw)
 
-            # 5. Log figure to TensorBoard & WandB
+            # 5. Generate Latent Representation Quality Visualizer (PCA-RGB + Hypersphere Angular Distance + CAD Overlay)
+            lq_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_latent_quality.png")
+            lq_res = plot_latent_representation_quality(
+                feature_map=feature_map,
+                gt_mask=self.probe_gt_mask,
+                save_path=lq_path,
+                title_prefix=f"Epoch {epoch:02d} | Probe: {self.probe_fname}",
+                close_fig=False,
+            )
+            if self.logger and lq_res.get("fig") is not None:
+                self.logger.log_figure("representation/latent_quality", lq_res["fig"], global_step=epoch)
+                import matplotlib.pyplot as plt
+                plt.close(lq_res["fig"])
+
+            if lq_res.get("angular_cnr") is not None and not np.isnan(lq_res["angular_cnr"]):
+                metrics["latent_angular_cnr"] = float(lq_res["angular_cnr"])
+            if lq_res.get("angular_auc") is not None:
+                metrics["latent_angular_auc"] = float(lq_res["angular_auc"])
+            if lq_res.get("total_3pc_variance") is not None:
+                metrics["latent_total_3pc_variance"] = float(lq_res["total_3pc_variance"])
+
+            # 6. Log figure to TensorBoard & WandB
             if self.logger and fig is not None:
                 self.logger.log_figure("downstream_probe/anomaly_heatmap", fig, global_step=epoch)
                 import matplotlib.pyplot as plt
@@ -702,6 +724,7 @@ class Trainer5x5:
                         self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_auc_{probe_metrics['probe_gt_auc']:.4f}.png")
                     elif "contrast_ratio_cnr" in probe_metrics:
                         self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_cnr_{probe_metrics['contrast_ratio_cnr']:.2f}.png")
+                    self.logger.info(f"  --> [Latent Quality Figure] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_latent_quality.png")
             else:
                 print(log_line)
 
@@ -730,6 +753,12 @@ class Trainer5x5:
                         epoch_data["probe_gt_ap"] = probe_metrics["probe_gt_ap"]
                     if "contrast_ratio_cnr" in probe_metrics:
                         epoch_data["probe_cnr"] = probe_metrics["contrast_ratio_cnr"]
+                    if "latent_angular_auc" in probe_metrics and probe_metrics["latent_angular_auc"] is not None:
+                        epoch_data["latent_angular_auc"] = probe_metrics["latent_angular_auc"]
+                    if "latent_angular_cnr" in probe_metrics and not np.isnan(probe_metrics["latent_angular_cnr"]):
+                        epoch_data["latent_angular_cnr"] = probe_metrics["latent_angular_cnr"]
+                    if "latent_total_3pc_variance" in probe_metrics:
+                        epoch_data["latent_total_3pc_variance"] = probe_metrics["latent_total_3pc_variance"]
                 self.logger.log_epoch(epoch=epoch + 1, metrics=epoch_data, step=self.global_step)
 
             # Checkpoint saving

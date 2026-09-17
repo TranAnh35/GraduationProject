@@ -37,6 +37,7 @@ class TestCropBorder(unittest.TestCase):
             temporal_samples=128,
             resample_mode="linear",
             crop_border=0,
+            standardize_coords=False,
         )
         self.assertEqual(grid_uncropped.shape, (300, 300, 128))
 
@@ -47,6 +48,7 @@ class TestCropBorder(unittest.TestCase):
             temporal_samples=128,
             resample_mode="linear",
             crop_border=5,
+            standardize_coords=False,
         )
         self.assertEqual(grid_cropped_5.shape, (290, 290, 128))
         np.testing.assert_allclose(grid_cropped_5, grid_uncropped[5:295, 5:295, :], rtol=1e-5)
@@ -58,6 +60,7 @@ class TestCropBorder(unittest.TestCase):
             temporal_samples=128,
             resample_mode="linear",
             crop_border=10,
+            standardize_coords=False,
         )
         self.assertEqual(grid_cropped_10.shape, (280, 280, 128))
         np.testing.assert_allclose(grid_cropped_10, grid_uncropped[10:290, 10:290, :], rtol=1e-5)

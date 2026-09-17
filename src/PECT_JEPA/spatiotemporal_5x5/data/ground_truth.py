@@ -337,6 +337,146 @@ class GroundTruthManager:
         cropped = inv_mask[ct : 300 - cb, cl : 300 - cr]
         return np.ascontiguousarray(cropped)
 
+    def generate_multiclass_mask(
+        self,
+        specimen: str,
+        buffer_px: int = 2,
+    ) -> np.ndarray:
+        """
+        Generates 4-Class Semantic Ground-Truth Mask [270, 270]:
+          0: Sound metal
+          1: Free corrosion (Corrosion calibration plate)
+          2: Sound rivet fastener (pure fastener heads without defect)
+          3: Rivet with corrosion (Rivet_v1 concentric and Rivet_v2 offset defects)
+         -1: Transition buffer zone
+        """
+        spec_key = self.canonical_specimen_key(specimen)
+        sY, sX = 300, 300
+        nominal = np.zeros((sY, sX), dtype=np.int8)
+        Y, X = np.ogrid[:sY, :sX]
+
+        features = self.cad_specs.get(spec_key, {}).get("features", [])
+
+        # 1. Mark transition buffers (-1)
+        if buffer_px > 0:
+            for feat in features:
+                diam = feat.get("diameter")
+                if diam is not None and feat.get("kind") != "rivet only":
+                    cx = feat.get("corrosionX") if feat.get("corrosionX") is not None else feat.get("x")
+                    cy = feat.get("corrosionY") if feat.get("corrosionY") is not None else feat.get("y")
+                    if cx is not None and cy is not None:
+                        r_outer = (diam / 2.0) + buffer_px
+                        nominal[(X - cx) ** 2 + (Y - cy) ** 2 <= r_outer ** 2] = -1
+
+        # 2. Mark sound rivets (Class 2)
+        for feat in features:
+            rx = feat.get("x")
+            ry = feat.get("y")
+            rd = feat.get("rivetDiameter")
+            if rx is not None and ry is not None and rd is not None:
+                r_rivet = rd / 2.0
+                nominal[(X - rx) ** 2 + (Y - ry) ** 2 <= r_rivet ** 2] = 2
+
+        # 3. Mark corrosion defects (Class 1 for free corrosion, Class 3 for rivet+corrosion)
+        for feat in features:
+            diam = feat.get("diameter")
+            if diam is not None and feat.get("kind") != "rivet only":
+                cx = feat.get("corrosionX") if feat.get("corrosionX") is not None else feat.get("x")
+                cy = feat.get("corrosionY") if feat.get("corrosionY") is not None else feat.get("y")
+                if cx is not None and cy is not None:
+                    r = diam / 2.0
+                    target_cls = 1 if spec_key == "corrosion" else 3
+                    nominal[(X - cx) ** 2 + (Y - cy) ** 2 <= r ** 2] = target_cls
+
+        ct = self.default_crop["crop_top"]
+        cb = self.default_crop["crop_bottom"]
+        cl = self.default_crop["crop_left"]
+        cr = self.default_crop["crop_right"]
+        return nominal[ct : 300 - cb, cl : 300 - cr].copy()
+
+    def generate_depth_map(
+        self,
+        specimen: str,
+    ) -> np.ndarray:
+        """
+        Generates continuous physical defect depth map [270, 270] in millimeters (float32).
+        Sound metal has depth = 0.0 mm. Defect pixels have their true CAD depth in [0.1, 1.0] mm.
+        """
+        spec_key = self.canonical_specimen_key(specimen)
+        sY, sX = 300, 300
+        depth_nominal = np.zeros((sY, sX), dtype=np.float32)
+        Y, X = np.ogrid[:sY, :sX]
+
+        features = self.cad_specs.get(spec_key, {}).get("features", [])
+        for feat in features:
+            diam = feat.get("diameter")
+            dp = feat.get("depth")
+            if diam is not None and dp is not None and feat.get("kind") != "rivet only":
+                cx = feat.get("corrosionX") if feat.get("corrosionX") is not None else feat.get("x")
+                cy = feat.get("corrosionY") if feat.get("corrosionY") is not None else feat.get("y")
+                if cx is not None and cy is not None:
+                    r = diam / 2.0
+                    depth_nominal[(X - cx) ** 2 + (Y - cy) ** 2 <= r ** 2] = float(dp)
+
+        ct = self.default_crop["crop_top"]
+        cb = self.default_crop["crop_bottom"]
+        cl = self.default_crop["crop_left"]
+        cr = self.default_crop["crop_right"]
+        return depth_nominal[ct : 300 - cb, cl : 300 - cr].copy()
+
+    def generate_severity_mask(
+        self,
+        specimen: str,
+        buffer_px: int = 2,
+    ) -> np.ndarray:
+        """
+        Generates defect severity / depth binning mask [270, 270]:
+          0: Sound metal (depth = 0.0)
+          1: Shallow defect (0 < depth <= 0.2 mm)
+          2: Medium defect (0.2 < depth <= 0.6 mm)
+          3: Severe defect (depth > 0.6 mm)
+         -1: Transition buffer zone
+        """
+        spec_key = self.canonical_specimen_key(specimen)
+        sY, sX = 300, 300
+        sev_nominal = np.zeros((sY, sX), dtype=np.int8)
+        Y, X = np.ogrid[:sY, :sX]
+
+        features = self.cad_specs.get(spec_key, {}).get("features", [])
+        if buffer_px > 0:
+            for feat in features:
+                diam = feat.get("diameter")
+                if diam is not None and feat.get("kind") != "rivet only":
+                    cx = feat.get("corrosionX") if feat.get("corrosionX") is not None else feat.get("x")
+                    cy = feat.get("corrosionY") if feat.get("corrosionY") is not None else feat.get("y")
+                    if cx is not None and cy is not None:
+                        r_outer = (diam / 2.0) + buffer_px
+                        sev_nominal[(X - cx) ** 2 + (Y - cy) ** 2 <= r_outer ** 2] = -1
+
+        for feat in features:
+            diam = feat.get("diameter")
+            dp = feat.get("depth")
+            if diam is not None and dp is not None and feat.get("kind") != "rivet only":
+                cx = feat.get("corrosionX") if feat.get("corrosionX") is not None else feat.get("x")
+                cy = feat.get("corrosionY") if feat.get("corrosionY") is not None else feat.get("y")
+                if cx is not None and cy is not None:
+                    r = diam / 2.0
+                    val = float(dp)
+                    if val <= 0.25:
+                        s_cls = 1
+                    elif val <= 0.65:
+                        s_cls = 2
+                    else:
+                        s_cls = 3
+                    sev_nominal[(X - cx) ** 2 + (Y - cy) ** 2 <= r ** 2] = s_cls
+
+        ct = self.default_crop["crop_top"]
+        cb = self.default_crop["crop_bottom"]
+        cl = self.default_crop["crop_left"]
+        cr = self.default_crop["crop_right"]
+        return sev_nominal[ct : 300 - cb, cl : 300 - cr].copy()
+
+
 
 # Global singleton instance for easy import across modules
 _GT_MANAGER: Optional[GroundTruthManager] = None

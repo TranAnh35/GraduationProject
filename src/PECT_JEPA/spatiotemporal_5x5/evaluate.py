@@ -68,6 +68,7 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.cscan_extractor import (
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import (
     AnomalyDetector5x5,
     plot_anomaly_heatmap_5x5,
+    plot_latent_representation_quality,
     compute_anomaly_metrics,
     evaluate_anomaly_ground_truth,
 )
@@ -363,6 +364,16 @@ def evaluate_single_file(
         title=title,
     )
 
+    # Save Latent Quality 3-panel figure (PCA-RGB + Angular Distance + CAD Overlay)
+    latent_quality_path = os.path.join(output_dir, f"{fname_base}_latent_quality.png")
+    lq_dict = plot_latent_representation_quality(
+        feature_map=feature_map,
+        gt_mask=gt_mask,
+        save_path=latent_quality_path,
+        title_prefix=f"{meta.get('specimen', '')} - {meta.get('sensor', '')} ({meta.get('liftoff', '')})",
+        close_fig=True,
+    )
+
     # Optionally save full feature map
     if save_features:
         feat_path = os.path.join(output_dir, f"{fname_base}_features_5x5.npy")
@@ -373,8 +384,10 @@ def evaluate_single_file(
         "file_name": os.path.basename(file_path),
         "metadata": meta,
         "metrics": metrics,
+        "latent_quality": lq_dict,
         "probe_metrics": probe_metrics,
         "heatmap_path": heatmap_path,
+        "latent_quality_path": latent_quality_path,
     }
     auc_str = f" | GT AUC: {metrics['auc_roc']:.4f} | AP: {metrics['average_precision']:.4f}" if metrics.get("auc_roc") is not None else ""
     lp_str = f" | Linear Probe AUC: {metrics['linear_probe_auc_roc']:.4f}" if "linear_probe_auc_roc" in metrics else ""

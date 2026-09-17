@@ -213,12 +213,171 @@ class DualDomainGridTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class DualDomainAttentionTokenizer5x5(nn.Module):
+    """
+    Physics-Grounded Dual-Domain Attention Tokenizer for 5x5 PECT-JEPA.
+
+    Transforms the C-channel waveform at each spatial coordinate (i, j)
+    into a unified physical token of dimension D via Cross-Domain Multi-Head Attention:
+      1. Time Domain Branch:
+         - Linear projection: in_channels (128) -> D
+         - Branch-wise LayerNorm: guarantees independent variance = 1.0
+         - Adds learnable Domain Embedding for temporal domain
+      2. Spectral Domain Branch:
+         - torch.fft.rfft extracts harmonic frequency bins (k=1..num_freq_bins).
+         - Computes normalized phase angle phi_k = angle(X_k)/pi (lift-off invariant)
+           and log-magnitude ln(1 + |X_k|).
+         - Linear projection: spectral_dim -> D
+         - Branch-wise LayerNorm: guarantees independent variance = 1.0
+         - Adds learnable Domain Embedding for spectral domain
+      3. Cross-Domain Multi-Head Attention Fusion:
+         - Stacks [z_time, z_freq] as 2 physical tokens per spatial location: [B*25, 2, D]
+         - Multi-Head Self-Attention allows data-dependent cross-routing:
+           * Temporal token queries spectral phase to reject lift-off artifacts.
+           * Spectral token queries temporal peak dynamics (t_p, t_z).
+      4. Spatial Synthesis & Residual Highway:
+         - Projects flattened tokens [2*D] -> D.
+         - Adds residual shortcut from z_time to preserve raw transient dynamics.
+         - Final LayerNorm + Dropout.
+      5. 2D Spatial Positional Embedding:
+         - Added across 25 spatial grid coordinates.
+
+    Input: [B, 5, 5, C] -> Output: tokens [B, 25, D], pos [B, 25, D]
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        num_heads: int = 4,
+        spectral_features: str = "phase_and_mag",
+        phase_snr_tapering: bool = True,
+        phase_noise_floor: float = 0.05,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_tokens = grid_size * grid_size  # 25
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+        self.spectral_features = spectral_features
+        self.phase_snr_tapering = phase_snr_tapering
+        self.phase_noise_floor = max(1e-6, float(phase_noise_floor))
+
+        # 1. Temporal branch
+        self.time_proj = nn.Linear(in_channels, embed_dim)
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Spectral branch
+        if spectral_features == "phase_only":
+            spectral_dim = self.num_freq_bins
+        elif spectral_features == "phase_and_mag":
+            spectral_dim = self.num_freq_bins * 2
+        else:
+            raise ValueError(f"Unknown spectral_features: {spectral_features}")
+
+        self.freq_proj = nn.Linear(spectral_dim, embed_dim)
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Domain Embeddings
+        self.domain_time = nn.Parameter(torch.zeros(1, embed_dim))
+        self.domain_freq = nn.Parameter(torch.zeros(1, embed_dim))
+        nn.init.trunc_normal_(self.domain_time, std=0.02)
+        nn.init.trunc_normal_(self.domain_freq, std=0.02)
+
+        # 4. Cross-domain Multi-Head Attention Fusion
+        self.cross_domain_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.attn_norm = nn.LayerNorm(embed_dim)
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+        # 5. Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_flat = x.reshape(B * self.num_tokens, C)
+
+        # 1. Time branch with independent LayerNorm
+        z_time = self.ln_time(self.time_proj(x_flat)) + self.domain_time  # [B*25, D]
+
+        # 2. Spectral branch with independent LayerNorm
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)[:, 1:self.num_freq_bins + 1]  # Exclude DC
+        phase = torch.angle(X_fft) / torch.pi
+        mag_linear = torch.abs(X_fft)
+        mag = torch.log1p(mag_linear)
+
+        if self.phase_snr_tapering:
+            snr_weight = torch.tanh(mag_linear / self.phase_noise_floor)
+            phase = phase * snr_weight
+
+        if self.spectral_features == "phase_only":
+            spectral_feat = phase.to(x_flat.dtype)
+        else:
+            spectral_feat = torch.cat([phase, mag], dim=-1).to(x_flat.dtype)
+
+        z_freq = self.ln_freq(self.freq_proj(spectral_feat)) + self.domain_freq  # [B*25, D]
+
+        # 3. Stack into 2 tokens per spatial pixel: [B*25, 2, D]
+        tokens_pair = torch.stack([z_time, z_freq], dim=1)  # [B*25, 2, D]
+        attn_out, _ = self.cross_domain_attn(
+            query=tokens_pair,
+            key=tokens_pair,
+            value=tokens_pair
+        )
+        tokens_fused = self.attn_norm(tokens_pair + attn_out)  # [B*25, 2, D]
+
+        # 4. Synthesize to single spatial token with Residual Shortcut
+        fused_flat = tokens_fused.reshape(B * self.num_tokens, 2 * self.embed_dim)
+        token_spatial = self.fuse_proj(fused_flat) + z_time  # [B*25, D]
+        tokens = self.drop(self.norm_out(token_spatial)).reshape(B, self.num_tokens, self.embed_dim)
+
+        # 5. Positional Embedding
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "dual_domain")
-    if tokenizer_type == "dual_domain":
+    tokenizer_type = getattr(config, "tokenizer_type", "dual_domain_attention")
+    if tokenizer_type == "dual_domain_attention":
+        return DualDomainAttentionTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            num_heads=getattr(config, "tokenizer_heads", 4),
+            spectral_features=getattr(config, "spectral_features", "phase_and_mag"),
+            phase_snr_tapering=getattr(config, "phase_snr_tapering", True),
+            phase_noise_floor=getattr(config, "phase_noise_floor", 0.05),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type == "dual_domain":
         return DualDomainGridTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,

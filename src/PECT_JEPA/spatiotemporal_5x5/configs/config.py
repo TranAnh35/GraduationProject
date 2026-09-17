@@ -38,15 +38,17 @@ class Spatiotemporal5x5Config:
     max_masked: int = 15                # 60% of 25 tokens
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "dual_domain" # 'dual_domain' (Time + FFT Spectral Phase/Mag) | 'time_only'
+    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (Pure Multi-Head Attention Fusion) | 'dual_domain' | 'time_only'
+    tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
     phase_snr_tapering: bool = True     # Magnitude-weighted phase tapering to suppress noise floor
     phase_noise_floor: float = 0.05     # Signal magnitude threshold for phase tapering
-    embed_dim: int = 32                 # D (32 matches physical PECT rank ~8.23 and prevents covariance overfitting)
+    embed_dim: int = 64                 # D (64 provides optimal capacity for 1.46M samples/epoch, 4 heads with dk=16)
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
+    predictor_type: str = "operator_diffusion" # 'operator_diffusion' (Helmholtz diffusion query) | 'standard'
     predictor_depth: int = 2
     predictor_heads: int = 4
     mlp_ratio: float = 4.0
