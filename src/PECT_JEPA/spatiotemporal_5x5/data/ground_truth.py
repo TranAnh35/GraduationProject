@@ -478,6 +478,56 @@ class GroundTruthManager:
 
 
 
+    def get_flaw_features(
+        self,
+        specimen: str,
+        coordinate_system: str = "cropped",
+    ) -> List[Dict[str, Any]]:
+        """
+        Returns standardized defect flaw features for a specimen.
+        
+        Args:
+            specimen: 'corrosion', 'rivet_v1', 'rivet_v2' (or file path/stem)
+            coordinate_system:
+                - 'cropped': (default) Coordinates `x, y`, `corrosionX, corrosionY` are shifted by
+                  `-crop_left, -crop_top` to match the standardized [270, 270] C-scan arrays.
+                  Original CAD coordinates are preserved in `cad_x, cad_y`, `cad_corrosionX, cad_corrosionY`.
+                - 'cad': Coordinates `x, y` match the original nominal [300, 300] plate blueprint.
+        """
+        spec_key = self.canonical_specimen_key(specimen)
+        raw_features = self.cad_specs.get(spec_key, {}).get("features", [])
+        cl = self.default_crop["crop_left"]
+        ct = self.default_crop["crop_top"]
+        
+        out_features = []
+        for feat in raw_features:
+            f = dict(feat)
+            cad_x = f.get("x")
+            cad_y = f.get("y")
+            f["cad_x"] = cad_x
+            f["cad_y"] = cad_y
+            
+            cad_cx = f.get("corrosionX")
+            cad_cy = f.get("corrosionY")
+            if cad_cx is not None:
+                f["cad_corrosionX"] = cad_cx
+            if cad_cy is not None:
+                f["cad_corrosionY"] = cad_cy
+                
+            if coordinate_system.lower() == "cropped":
+                if cad_x is not None:
+                    f["x"] = round(float(cad_x - cl), 3)
+                if cad_y is not None:
+                    f["y"] = round(float(cad_y - ct), 3)
+                if cad_cx is not None:
+                    f["corrosionX"] = round(float(cad_cx - cl), 3)
+                if cad_cy is not None:
+                    f["corrosionY"] = round(float(cad_cy - ct), 3)
+                    
+            out_features.append(f)
+        return out_features
+
+
 # Global singleton instance for easy import across modules
 _GT_MANAGER: Optional[GroundTruthManager] = None
 
