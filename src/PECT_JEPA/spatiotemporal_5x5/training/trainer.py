@@ -73,7 +73,6 @@ class Trainer5x5:
         val_loader=None,
         logger: Optional[PECTExperimentLogger5x5] = None,
         resume_checkpoint: Optional[str] = None,
-        probe_file: Optional[str] = None,
     ):
         self.model = model
         self.config = config

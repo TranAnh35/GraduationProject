@@ -153,11 +153,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb_project", type=str, default="PECT_JEPA_5x5", help="WandB project name")
     p.add_argument("--wandb_entity", type=str, default=None, help="WandB entity/username")
     p.add_argument("--log_histograms", type=lambda v: v.lower() == "true", default=False, help="Log histograms to TB")
-    p.add_argument("--probe_file", type=str, default=None,
-                   help="Path to specific validation TDMS file to run downstream anomaly detection on after each epoch (default: auto-selects 1st defect file from val set)")
-    p.add_argument("--probe_interval", type=int, default=1,
-                   help="Frequency of running downstream probe on validation file (default: 1 = every epoch; 0 = disable)")
-    p.add_argument("--early_stopping_metric", type=str, default="val_loss_pred", choices=["val_loss_pred", "val_loss", "probe_gt_auc", "gt_auc", "probe_cnr"],
+    p.add_argument("--diagnostics_interval", type=int, default=1,
+                   help="Frequency of running physics-grounded foundation diagnostics dashboard (default: 1 = every epoch; 0 = disable)")
+    p.add_argument("--early_stopping_metric", type=str, default="val_loss_pred", choices=["val_loss_pred", "val_loss"],
                    help="Metric to monitor for early stopping and best checkpoint saving (default: val_loss_pred)")
     p.add_argument("--early_stopping_patience", type=int, default=10,
                    help="Stop training early if monitored metric fails to improve for N epochs (default: 10; 0 = disabled)")
@@ -219,8 +217,7 @@ def main():
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         log_histograms=args.log_histograms,
-        probe_file=args.probe_file,
-        probe_interval=args.probe_interval,
+        diagnostics_interval=args.diagnostics_interval,
         early_stopping_metric=args.early_stopping_metric,
         early_stopping_patience=args.early_stopping_patience,
         resume=args.resume,
@@ -308,32 +305,7 @@ def main():
         eps=config.eps,
     )
 
-    logger.info(f"Indexing validation dataset ({len(val_files)} files, mode={config.resample_mode}, C={config.in_channels})...")
-    val_set = PECT5x5Dataset(
-        file_paths=val_files,
-        grid_size=config.grid_size,
-        time_samples=config.time_samples,
-        temporal_samples=config.temporal_samples,
-        in_channels=config.in_channels,
-        resample_mode=config.resample_mode,
-        log_time_samples=config.log_time_samples,
-        t_start_frac=config.t_start_frac,
-        normalization=config.normalization,
-        early_window_frac=config.early_window_frac,
-        raster_correction=config.raster_correction,
-        crop_border=config.crop_border,
-        apply_lowpass=config.apply_lowpass,
-        lowpass_cutoff=config.lowpass_cutoff,
-        lowpass_order=config.lowpass_order,
-        use_memmap=config.use_memmap,
-        preload_ram=args.preload_ram,
-        return_meta=False,
-        cache_dir=config.cache_dir,
-        eps=config.eps,
-    )
-
     logger.info(f"Train Dataset: {len(train_files)} files / {len(train_set):,} 5x5 patches")
-    logger.info(f"Val Dataset:   {len(val_files)} files / {len(val_set):,} 5x5 patches")
 
     num_workers = get_optimal_num_workers(args.num_workers)
     logger.info(f"DataLoader Worker Allocation: {num_workers} workers")
@@ -356,38 +328,55 @@ def main():
 
     train_loader = DataLoader(train_set, batch_sampler=train_sampler, **train_loader_kwargs)
 
-    val_loader_kwargs = {
-        "collate_fn": collate_5x5_batch,
-        "num_workers": min(2, num_workers),
-        "pin_memory": (config.device == "cuda" and torch.cuda.is_available()),
-    }
-    if min(2, num_workers) > 0:
-        val_loader_kwargs["persistent_workers"] = True
-        val_loader_kwargs["prefetch_factor"] = 2
+    val_set = None
+    val_loader = None
+    if val_files:
+        logger.info(f"Indexing validation dataset ({len(val_files)} files, mode={config.resample_mode}, C={config.in_channels})...")
+        val_set = PECT5x5Dataset(
+            file_paths=val_files,
+            grid_size=config.grid_size,
+            time_samples=config.time_samples,
+            temporal_samples=config.temporal_samples,
+            in_channels=config.in_channels,
+            resample_mode=config.resample_mode,
+            log_time_samples=config.log_time_samples,
+            t_start_frac=config.t_start_frac,
+            normalization=config.normalization,
+            early_window_frac=config.early_window_frac,
+            raster_correction=config.raster_correction,
+            crop_border=config.crop_border,
+            apply_lowpass=config.apply_lowpass,
+            lowpass_cutoff=config.lowpass_cutoff,
+            lowpass_order=config.lowpass_order,
+            use_memmap=config.use_memmap,
+            preload_ram=args.preload_ram,
+            return_meta=False,
+            cache_dir=config.cache_dir,
+            eps=config.eps,
+        )
+        logger.info(f"Val Dataset:   {len(val_files)} files / {len(val_set):,} 5x5 patches")
 
-    val_g = torch.Generator()
-    val_g.manual_seed(config.seed)
-    val_loader = DataLoader(
-        val_set, batch_size=config.batch_size, shuffle=True, generator=val_g, **val_loader_kwargs
-    )
+        val_loader_kwargs = {
+            "collate_fn": collate_5x5_batch,
+            "num_workers": min(2, num_workers),
+            "pin_memory": (config.device == "cuda" and torch.cuda.is_available()),
+        }
+        if min(2, num_workers) > 0:
+            val_loader_kwargs["persistent_workers"] = True
+            val_loader_kwargs["prefetch_factor"] = 2
+
+        val_g = torch.Generator()
+        val_g.manual_seed(config.seed)
+        val_loader = DataLoader(
+            val_set, batch_size=config.batch_size, shuffle=True, generator=val_g, **val_loader_kwargs
+        )
+    else:
+        logger.info("Val Dataset:   0 files (Validation skipped)")
 
     # 2. Model initialization
     model = PECT_JEPA_5x5(config)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"PECT_JEPA_5x5 Trainable Parameters: {n_params / 1e6:.2f}M")
-
-    # 3. Resolve validation scan for epoch-by-epoch downstream defect probing
-    probe_file = args.probe_file
-    if probe_file is None and val_files and args.probe_interval > 0:
-        defect_candidates = [
-            f for f in val_files
-            if any(k in os.path.basename(f).lower() for k in ("corrosion", "crack", "defect", "square", "gaussian", "step", "slot"))
-        ]
-        probe_file = defect_candidates[0] if defect_candidates else val_files[0]
-        logger.info(f"[Probe] Auto-selected validation scan for downstream evaluation: {os.path.basename(probe_file)}")
-
-    config.probe_file = probe_file
-    config.probe_interval = args.probe_interval
 
     # 4. Trainer
     trainer = Trainer5x5(
@@ -397,7 +386,6 @@ def main():
         val_loader=val_loader,
         logger=logger,
         resume_checkpoint=args.resume,
-        probe_file=probe_file,
     )
 
     trainer.fit()
