@@ -225,7 +225,7 @@ def build_predictor_5x5(config) -> nn.Module:
             dropout=config.dropout,
             num_freq_bins=getattr(config, "num_freq_bins", 14),
         )
-    elif predictor_type == "standard":
+    elif predictor_type in ("standard", "default"):
         return Predictor5x5(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,

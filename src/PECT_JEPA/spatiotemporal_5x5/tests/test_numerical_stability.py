@@ -96,7 +96,7 @@ class TestNumericalStability(unittest.TestCase):
         self.assertIn("val_loss", val_metrics)
         self.assertFalse(np.isnan(val_metrics["val_loss"]), "Val loss must not be poisoned by NaN batch")
         self.assertGreater(val_metrics["val_loss"], 0.0)
-        self.assertIn("effective_rank", val_metrics)
+        self.assertIn("twonn_dim", val_metrics)
         trainer.logger.close()
 
     def test_downstream_probe_execution(self):

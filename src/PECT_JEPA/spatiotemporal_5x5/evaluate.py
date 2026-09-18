@@ -271,6 +271,12 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     elif "tokenizer.time_proj.weight" in state_dict:
         config.tokenizer_type = "dual_domain"
 
+    # Auto-detect predictor type from state_dict for backward compatibility
+    if "predictor.op_embedding.default_op" not in state_dict:
+        config.predictor_type = "default"
+    else:
+        config.predictor_type = "operator_diffusion"
+
     model = PECT_JEPA_5x5(config)
     model.load_state_dict(state_dict)
     model.to(dev)
@@ -332,30 +338,49 @@ def evaluate_single_file(
     # Compute quantitative defect metrics (True Label-based when gt_mask is available)
     metrics = compute_anomaly_metrics(score_map, gt_mask=gt_mask)
 
-    # If Ground Truth mask is present, also evaluate SSL Linear Probe & k-NN (Standard SSL benchmark)
+    # If Ground Truth mask is present, evaluate SSL Linear Probe & k-NN (Standard SSL benchmark)
     probe_metrics = None
+    probe_heatmap_path = None
     if gt_mask is not None:
         try:
             min_Y = min(feature_map.shape[0], gt_mask.shape[0])
             min_X = min(feature_map.shape[1], gt_mask.shape[1])
             evaluator = LinearProbeEvaluator(n_splits=5)
-            probe_metrics = evaluator.evaluate_cross_val(feature_map[:min_Y, :min_X], gt_mask[:min_Y, :min_X])
+            probe_metrics, probe_prob_map = evaluator.fit_and_predict_probability_map(
+                feature_map[:min_Y, :min_X], gt_mask[:min_Y, :min_X]
+            )
+            probe_cnr_res = compute_anomaly_metrics(probe_prob_map, gt_mask=gt_mask[:min_Y, :min_X])
+            probe_cnr = probe_cnr_res.get("contrast_ratio_cnr", 0.0)
+            probe_metrics["linear_probe_cnr"] = probe_cnr
+            metrics["linear_probe_cnr"] = probe_cnr
             metrics["linear_probe_auc_roc"] = probe_metrics["linear_probe_auc_roc"]
             metrics["linear_probe_average_precision"] = probe_metrics["linear_probe_average_precision"]
             metrics["linear_probe_f1"] = probe_metrics["linear_probe_f1"]
             metrics["knn_5_accuracy"] = probe_metrics["knn_5_accuracy"]
             metrics["knn_5_f1"] = probe_metrics["knn_5_f1"]
+
+            # Plot and save Frozen JEPA + Linear Probe Probability Heatmap
+            probe_heatmap_path = os.path.join(output_dir, f"{fname_base}_linear_probe_heatmap.png")
+            probe_title = (
+                f"Frozen PECT-JEPA + Linear Probe | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
+                f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')} | Probe CNR: {probe_cnr:.2f} | AUC: {probe_metrics['linear_probe_auc_roc']:.4f}"
+            )
+            plot_anomaly_heatmap_5x5(
+                anomaly_map=probe_prob_map,
+                save_path=probe_heatmap_path,
+                title=probe_title,
+            )
         except Exception as e:
             print(f"    [Probe Warning] Linear probe failed: {e}")
 
-    # Plot and save high-contrast heatmap
+    # Plot and save high-contrast unsupervised K-Means heatmap
     heatmap_path = os.path.join(output_dir, f"{fname_base}_anomaly_heatmap.png")
     gt_header = ""
     if metrics.get("auc_roc") is not None:
         gt_header = f" | GT AUC: {metrics['auc_roc']:.4f} (AP: {metrics['average_precision']:.4f})"
     cnr_label = "True CNR" if metrics.get("has_ground_truth") else "CNR"
     title = (
-        f"PECT-JEPA 5x5 Anomaly Map | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
+        f"PECT-JEPA 5x5 Anomaly Map (K-Means) | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
         f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')} | {cnr_label}: {metrics['contrast_ratio_cnr']:.2f}{gt_header}"
     )
     plot_anomaly_heatmap_5x5(
@@ -387,10 +412,11 @@ def evaluate_single_file(
         "latent_quality": lq_dict,
         "probe_metrics": probe_metrics,
         "heatmap_path": heatmap_path,
+        "linear_probe_heatmap_path": probe_heatmap_path,
         "latent_quality_path": latent_quality_path,
     }
     auc_str = f" | GT AUC: {metrics['auc_roc']:.4f} | AP: {metrics['average_precision']:.4f}" if metrics.get("auc_roc") is not None else ""
-    lp_str = f" | Linear Probe AUC: {metrics['linear_probe_auc_roc']:.4f}" if "linear_probe_auc_roc" in metrics else ""
+    lp_str = f" | Linear Probe AUC: {metrics['linear_probe_auc_roc']:.4f} (CNR: {metrics.get('linear_probe_cnr', 0.0):.2f})" if "linear_probe_auc_roc" in metrics else ""
     print(f"  [Result] {cnr_label}: {metrics['contrast_ratio_cnr']:.2f}{auc_str}{lp_str} | Peak: {metrics['max_score']:.4f} | Heatmap: {heatmap_path}")
     return result
 

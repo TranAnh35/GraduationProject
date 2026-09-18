@@ -348,7 +348,7 @@ class Trainer5x5:
                 f"[Val Epoch {self.current_epoch + 1}] Skipped {nan_batches}/{len(self.val_loader)} validation batches due to NaN/Inf loss."
             )
 
-        eff_rank = 0.0
+        eff_rank = None
         uniformity = float("nan")
         twonn_dim = 0.0
         if val_features:
@@ -360,18 +360,21 @@ class Trainer5x5:
                     twonn_dim = float(estimate_twonn_dimension(feats, subsample=2000))
                 except Exception:
                     twonn_dim = 0.0
-                eff_rank = compute_effective_rank(feats)
+                if getattr(self.config, "track_effective_rank", False):
+                    eff_rank = compute_effective_rank(feats)
 
         val_loss = (total_loss / n_batches) if n_batches > 0 else float("nan")
         val_loss_pred = (total_pred / n_batches) if n_batches > 0 else float("nan")
 
-        return {
+        res = {
             "val_loss": val_loss,
             "val_loss_pred": val_loss_pred,
             "uniformity": uniformity,
             "twonn_dim": twonn_dim,
-            "effective_rank": eff_rank,
         }
+        if eff_rank is not None:
+            res["effective_rank"] = eff_rank
+        return res
 
     @torch.no_grad()
     def run_downstream_probe(self, epoch: int) -> Optional[Dict[str, float]]:

@@ -140,3 +140,38 @@ class LinearProbeEvaluator:
             f"knn_{knn_neighbors}_accuracy": round(float(np.mean(knn_acc_list)), 4),
             f"knn_{knn_neighbors}_f1": round(float(np.mean(knn_f1_list)), 4),
         }
+
+    def fit_and_predict_probability_map(
+        self,
+        feature_map: np.ndarray,
+        gt_mask: np.ndarray,
+        knn_neighbors: int = 5,
+    ) -> Tuple[Dict[str, float], np.ndarray]:
+        """
+        1. Runs Stratified K-Fold Cross-Validation on labeled pixels to calculate unbiased CV metrics.
+        2. Fits a final Logistic Regression model on all valid labeled pixels.
+        3. Predicts defect probability P(Y=1 | z) for every pixel in the entire feature_map.
+
+        Returns:
+            metrics: dict of cross-validation metrics.
+            prob_map: [sY, sX] 2D array of defect probabilities in range [0, 1].
+        """
+        metrics = self.evaluate_cross_val(feature_map, gt_mask, knn_neighbors=knn_neighbors)
+
+        sY, sX, D = feature_map.shape
+        X_labeled, y_labeled = self.extract_labeled_samples(feature_map, gt_mask)
+
+        clf = LogisticRegression(
+            C=self.c_reg,
+            max_iter=self.max_iter,
+            class_weight="balanced",
+            random_state=self.random_state,
+            solver="lbfgs",
+        )
+        clf.fit(X_labeled, y_labeled)
+
+        flat_all = feature_map.reshape(-1, D)
+        probs_flat = clf.predict_proba(flat_all)[:, 1]
+        prob_map = probs_flat.reshape(sY, sX)
+
+        return metrics, prob_map
