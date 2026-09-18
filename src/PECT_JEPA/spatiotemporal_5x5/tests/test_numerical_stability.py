@@ -99,8 +99,8 @@ class TestNumericalStability(unittest.TestCase):
         self.assertIn("twonn_dim", val_metrics)
         trainer.logger.close()
 
-    def test_downstream_probe_execution(self):
-        """Verify that downstream probe extracts C-scan, computes CNR, and saves heatmap."""
+    def test_training_diagnostics_execution(self):
+        """Verify that training diagnostics runs, extracts variograms, attention maps, and saves dashboard."""
         import tempfile
         import shutil
 
@@ -110,7 +110,9 @@ class TestNumericalStability(unittest.TestCase):
             in_channels=128,
             embed_dim=32,
             encoder_depth=1,
+            encoder_heads=4,
             predictor_depth=1,
+            predictor_heads=4,
             epochs=1,
             batch_size=4,
             device="cpu",
@@ -127,24 +129,18 @@ class TestNumericalStability(unittest.TestCase):
             val_loader=None,
         )
 
-        # Mock a small C-scan grid [15, 15, 128]
-        trainer.probe_grid = np.random.randn(15, 15, 128).astype(np.float32)
-        # Add a synthetic defect in the center
-        trainer.probe_grid[6:9, 6:9, :] += 3.0
-        trainer.probe_fname = "mock_defect_scan"
+        diag_res = trainer.run_training_diagnostics(epoch=1)
 
-        probe_res = trainer.run_downstream_probe(epoch=1)
+        self.assertIsNotNone(diag_res)
+        self.assertIn("dashboard_path", diag_res)
+        self.assertTrue(os.path.isfile(diag_res["dashboard_path"]))
 
-        self.assertIsNotNone(probe_res)
-        self.assertIn("contrast_ratio_cnr", probe_res)
-        self.assertGreater(probe_res["contrast_ratio_cnr"], 0.0)
-
-        # Check that heatmap was created
-        probe_dir = os.path.join(trainer.logger.run_dir, "probe_heatmaps")
-        self.assertTrue(os.path.isdir(probe_dir))
-        heatmaps = os.listdir(probe_dir)
-        self.assertGreaterEqual(len(heatmaps), 1)
-        self.assertTrue(any(h.endswith(".png") for h in heatmaps))
+        # Check that dashboard was created in training_diagnostics dir
+        diag_dir = os.path.join(trainer.logger.run_dir, "training_diagnostics")
+        self.assertTrue(os.path.isdir(diag_dir))
+        dashboards = os.listdir(diag_dir)
+        self.assertGreaterEqual(len(dashboards), 1)
+        self.assertTrue(any(d.endswith(".png") for d in dashboards))
 
         trainer.logger.close()
         shutil.rmtree(temp_dir, ignore_errors=True)

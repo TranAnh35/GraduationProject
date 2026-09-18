@@ -23,28 +23,30 @@ class MultiheadSelfAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
         B, N, D = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0].contiguous(), qkv[1].contiguous(), qkv[2].contiguous()  # [B, H, N, d]
 
-        if hasattr(F, "scaled_dot_product_attention"):
+        attn_weights = None
+        if return_attention or not hasattr(F, "scaled_dot_product_attention"):
+            attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+            attn_scores = torch.clamp(attn_scores, min=-65000.0, max=65000.0)
+            attn_weights = torch.softmax(attn_scores.float(), dim=-1).to(q.dtype)
+            attn_drop = self.drop(attn_weights)
+            out = attn_drop @ v
+        else:
             # FlashAttention / Memory-Efficient attention with internal FP32 accumulation
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.dropout if self.training else 0.0,
                 scale=self.scale
             )
-        else:
-            # Fallback: clamp attention logits and compute softmax in FP32 to prevent FP16 overflow
-            attn_scores = (q @ k.transpose(-2, -1)) * self.scale
-            attn_scores = torch.clamp(attn_scores, min=-65000.0, max=65000.0)
-            attn = torch.softmax(attn_scores.float(), dim=-1).to(q.dtype)
-            attn = self.drop(attn)
-            out = attn @ v
 
         out = out.transpose(1, 2).reshape(B, N, D)
         out = self.proj(out)
+        if return_attention:
+            return out, attn_weights
         return out
 
 
@@ -126,7 +128,12 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp = MLP(in_features=embed_dim, hidden_features=int(embed_dim * mlp_ratio), dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
+        if return_attention:
+            attn_out, attn_weights = self.attn(self.norm1(x), return_attention=True)
+            x = x + attn_out
+            x = x + self.mlp(self.norm2(x))
+            return x, attn_weights
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x

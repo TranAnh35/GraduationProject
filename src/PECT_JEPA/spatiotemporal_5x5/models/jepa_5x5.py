@@ -181,3 +181,15 @@ class PECT_JEPA_5x5(nn.Module):
             x = x.unsqueeze(0)
         tokens, pos = self.tokenizer(x)
         return self.context_encoder(tokens, pos)
+
+    @torch.no_grad()
+    def extract_attention_map(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Extract self-attention weights from the final Context Encoder block.
+        Input: [B, 5, 5, C] -> Output: [B, num_heads, 25, 25]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        tokens, pos = self.tokenizer(x)
+        _, attn = self.context_encoder(tokens, pos, return_attention=True)
+        return attn

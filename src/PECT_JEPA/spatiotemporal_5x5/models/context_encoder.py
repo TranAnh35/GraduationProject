@@ -35,8 +35,20 @@ class ContextEncoder5x5(nn.Module):
         ])
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, context_tokens: torch.Tensor, context_pos: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        context_tokens: torch.Tensor,
+        context_pos: torch.Tensor,
+        return_attention: bool = False,
+    ):
         h = context_tokens + context_pos
-        for blk in self.blocks:
-            h = blk(h)
-        return self.norm(h)
+        last_attn = None
+        for i, blk in enumerate(self.blocks):
+            if return_attention and i == len(self.blocks) - 1:
+                h, last_attn = blk(h, return_attention=True)
+            else:
+                h = blk(h)
+        h = self.norm(h)
+        if return_attention:
+            return h, last_attn
+        return h

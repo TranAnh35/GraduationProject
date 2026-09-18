@@ -29,15 +29,14 @@ from ..configs.config import Spatiotemporal5x5Config
 from ..models.jepa_5x5 import PECT_JEPA_5x5
 from ..utils.logger import PECTExperimentLogger5x5
 from ..evaluation.liftoff_invariance import compute_effective_rank
-from ..evaluation.anomaly_detection import (
-    AnomalyDetector5x5,
-    compute_anomaly_metrics,
-    plot_anomaly_heatmap_5x5,
-    plot_latent_representation_quality,
-    evaluate_anomaly_ground_truth,
-)
 from ..evaluation.manifold_dimension import estimate_twonn_dimension
-from ..evaluation.cscan_extractor import extract_full_cscan_map, load_cscan_from_tdms
+from .diagnostics import (
+    compute_spatial_variogram,
+    extract_attention_receptive_fields,
+    compute_liftoff_invariance_diagnostic,
+    compute_domain_similarity_matrix,
+    plot_foundation_diagnostics_dashboard,
+)
 from .optimizer import build_optimizer_5x5, WarmupCosineLRScheduler5x5, MomentumScheduler5x5
 
 
@@ -126,78 +125,13 @@ class Trainer5x5:
         if config.log_dir:
             os.makedirs(config.log_dir, exist_ok=True)
 
-        # Pre-load optional validation TDMS scan for epoch-by-epoch downstream defect probing
-        self.probe_file = probe_file or getattr(config, "probe_file", None)
-        self.probe_grid = None
-        self.probe_fname = None
-        self.probe_gt_mask = None
-        if self.probe_file and os.path.isfile(self.probe_file):
-            try:
-                self.probe_grid = load_cscan_from_tdms(
-                    file_path=self.probe_file,
-                    time_samples=config.time_samples,
-                    temporal_samples=config.temporal_samples,
-                    resample_mode=config.resample_mode,
-                    normalization=config.normalization,
-                    raster_correction=config.raster_correction,
-                    crop_border=config.crop_border,
-                    apply_lowpass=getattr(config, "apply_lowpass", True),
-                    lowpass_cutoff=getattr(config, "lowpass_cutoff", 2500.0),
-                    lowpass_order=getattr(config, "lowpass_order", 4),
-                )
-                self.probe_fname = os.path.splitext(os.path.basename(self.probe_file))[0]
-                if self.logger:
-                    self.logger.info(
-                        f"[Probe] Pre-loaded validation C-scan for downstream probing: {self.probe_fname} "
-                        f"(grid: {self.probe_grid.shape[0]}x{self.probe_grid.shape[1]}, C={self.probe_grid.shape[2]})"
-                    )
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"[Probe] Could not pre-load probe file '{self.probe_file}': {e}")
-
-            # Locate and load authoritative CAD Ground Truth mask
-            if self.probe_file:
-                try:
-                    from ..data.ground_truth import get_ground_truth_manager
-                    gt_mgr = get_ground_truth_manager(data_dir=config.data_dir)
-                    self.probe_gt_mask = gt_mgr.get_ground_truth_mask_for_file(self.probe_file, aligned_scan=True)
-                    if self.logger and self.probe_gt_mask is not None:
-                        self.logger.info(
-                            f"[Probe GT] Loaded authoritative CAD mask for '{self.probe_fname}': "
-                            f"(shape: {self.probe_gt_mask.shape}, defects: {int(np.sum(self.probe_gt_mask == 1))})"
-                        )
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"[Probe GT] Could not load authoritative mask via manager: {e}")
-
-            if self.probe_gt_mask is None:
-                fname_lower = os.path.basename(self.probe_file).lower()
-                specimen_key = None
-                if "corosion" in fname_lower or "corrosion" in fname_lower:
-                    specimen_key = "corrosion"
-                elif "rivet_v1" in fname_lower or "rivet1" in fname_lower:
-                    specimen_key = "rivet_v1"
-                elif "rivet_v2" in fname_lower or "rivet2" in fname_lower or "mixed" in fname_lower:
-                    specimen_key = "rivet_v2"
-
-                if specimen_key:
-                    candidates = [
-                        os.path.join(config.data_dir, "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
-                        os.path.join("data", "ground_truth", specimen_key, f"{specimen_key}_gt_mask.npy"),
-                    ]
-                    for c_gt in candidates:
-                        if os.path.isfile(c_gt):
-                            try:
-                                self.probe_gt_mask = np.load(c_gt)
-                                if self.logger:
-                                    self.logger.info(
-                                        f"[Probe GT] Loaded ground-truth mask fallback for '{specimen_key}': {c_gt} "
-                                        f"(mask shape: {self.probe_gt_mask.shape}, defects: {int(np.sum(self.probe_gt_mask == 1))})"
-                                    )
-                                break
-                            except Exception as e:
-                                if self.logger:
-                                    self.logger.warning(f"[Probe GT] Could not load mask '{c_gt}': {e}")
+        # Foundation training diagnostics tracking
+        self.diagnostics_dir = os.path.join(self.logger.run_dir if self.logger else config.experiment_dir, "training_diagnostics")
+        os.makedirs(self.diagnostics_dir, exist_ok=True)
+        self.latest_val_pred = float("nan")
+        self.latest_twonn_dim = 0.0
+        self.latest_uniformity = float("nan")
+        self.latest_val_batch = None
 
         target_resume = resume_checkpoint or getattr(config, "resume", None)
         if target_resume:
@@ -377,94 +311,87 @@ class Trainer5x5:
         return res
 
     @torch.no_grad()
-    def run_downstream_probe(self, epoch: int) -> Optional[Dict[str, float]]:
+    def run_training_diagnostics(self, epoch: int, sample_batch: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
-        Runs full C-scan feature extraction and unsupervised anomaly detection on self.probe_grid,
-        plots the 2D anomaly heatmap, logs to TensorBoard, and returns defect metrics (CNR, etc.).
+        Runs physics-grounded self-supervised training diagnostics after each epoch:
+        - Panel 1: Lift-Off Invariance Trajectory on sound metal (z1 vs z2 vs z3).
+        - Panel 2: Empirical Latent Spatial Variogram gamma(r).
+        - Panel 3: Multi-Physics Cross-Domain Similarity Matrix.
+        - Panel 4: 2D Spatial Attention Receptive Fields (4 Heads on 5x5 grid).
+        Saves dashboard to training_diagnostics/epoch_{epoch:02d}_diagnostics.png and logs to TensorBoard.
         """
-        if self.probe_grid is None:
-            return None
         self.model.eval()
+        diag_dir = os.path.join(self.logger.run_dir if self.logger else "experiments/5x5", "training_diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+        save_path = os.path.join(diag_dir, f"epoch_{epoch:02d}_diagnostics.png")
+
         try:
-            # 1. Extract 1-to-1 C-Scan feature map
-            feature_map = extract_full_cscan_map(
-                model=self.model,
-                full_cscan_3d=self.probe_grid,
-                batch_size=512,
-                device=self.device.type,
-                show_pbar=False,
-            )
-
-            # 2. Fit unsupervised anomaly detector on representations
-            detector = AnomalyDetector5x5(n_clusters=2, detrend=True)
-            detector.fit(feature_map)
-            score_map = detector.score_map(feature_map, detrend=True)
-            raw_score_map = detector.score_map(feature_map, detrend=False)
-
-            # 3. Compute quantitative defect contrast metrics & ground-truth AUC (True Label-based when mask present)
-            metrics = compute_anomaly_metrics(score_map, gt_mask=self.probe_gt_mask)
-            cnr = metrics["contrast_ratio_cnr"]
-            raw_metrics = compute_anomaly_metrics(raw_score_map, gt_mask=self.probe_gt_mask)
-            raw_cnr = float(raw_metrics["contrast_ratio_cnr"])
-            metrics["raw_cnr"] = raw_cnr
-
-            probe_gt_auc = metrics.get("auc_roc")
-            probe_gt_ap = metrics.get("average_precision")
-            probe_gt_f1 = metrics.get("best_f1")
-            metrics["probe_gt_auc"] = probe_gt_auc
-            metrics["probe_gt_ap"] = probe_gt_ap
-            metrics["probe_gt_f1"] = probe_gt_f1
-
-            # 4. Save heatmap images to disk
-            probe_dir = os.path.join(self.logger.run_dir if self.logger else "experiments/5x5", "probe_heatmaps")
-            os.makedirs(probe_dir, exist_ok=True)
-            if probe_gt_auc is not None:
-                heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_auc_{probe_gt_auc:.4f}.png")
-                title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | GT AUC: {probe_gt_auc:.4f} (AP: {probe_gt_ap:.4f}, CNR: {cnr:.2f})"
+            # 1. Spatial Variogram & Attention Receptive Fields on sample grids
+            if sample_batch is not None and "data" in sample_batch:
+                sample_grids = sample_batch["data"].to(self.device)
+            elif self.val_loader is not None and len(self.val_loader) > 0:
+                sample_grids = next(iter(self.val_loader))["data"].to(self.device)
+            elif self.train_loader is not None and len(self.train_loader) > 0:
+                sample_grids = next(iter(self.train_loader))["data"].to(self.device)
             else:
-                heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_cnr_{cnr:.2f}.png")
-                title = f"Epoch {epoch:02d} | Probe: {self.probe_fname} | CNR: {cnr:.2f} (Raw CNR: {raw_cnr:.2f})"
-            fig = plot_anomaly_heatmap_5x5(score_map, save_path=heatmap_path, title=title, close_fig=False)
+                sample_grids = torch.randn(8, 5, 5, self.config.in_channels, device=self.device)
 
-            # Also save raw latent anomaly heatmap for transparent representation inspection
-            raw_heatmap_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_raw_latent_cnr_{raw_cnr:.2f}.png")
-            raw_title = f"Epoch {epoch:02d} (Raw Latent) | Probe: {self.probe_fname} | Raw CNR: {raw_cnr:.2f}"
-            fig_raw = plot_anomaly_heatmap_5x5(raw_score_map, save_path=raw_heatmap_path, title=raw_title, close_fig=False)
-            if fig_raw is not None:
-                import matplotlib.pyplot as plt
-                plt.close(fig_raw)
+            unique_lags, gamma_r = compute_spatial_variogram(self.model, sample_grids, self.device)
+            attn_maps = extract_attention_receptive_fields(self.model, sample_grids, self.device)
 
-            # 5. Generate Latent Representation Quality Visualizer (PCA-RGB + Hypersphere Angular Distance + CAD Overlay)
-            lq_path = os.path.join(probe_dir, f"epoch_{epoch:02d}_latent_quality.png")
-            lq_res = plot_latent_representation_quality(
-                feature_map=feature_map,
-                gt_mask=self.probe_gt_mask,
-                save_path=lq_path,
-                title_prefix=f"Epoch {epoch:02d} | Probe: {self.probe_fname}",
+            # 2. Lift-off Invariance Diagnostic (grouped slices of batch)
+            B_sub = sample_grids.shape[0]
+            liftoff_feats = {}
+            if B_sub >= 3:
+                chunk = B_sub // 3
+                z_all = self.model.extract_center_feature(sample_grids).detach().cpu().numpy()
+                liftoff_feats["z1"] = z_all[:chunk]
+                liftoff_feats["z2"] = z_all[chunk:2*chunk]
+                liftoff_feats["z3"] = z_all[2*chunk:]
+            liftoff_sims = compute_liftoff_invariance_diagnostic(liftoff_feats)
+
+            # 3. Domain Cross-Similarity Matrix across available representation subsets
+            half_b = max(1, B_sub // 2)
+            z_c = self.model.extract_center_feature(sample_grids).detach().cpu().numpy()
+            domain_feats = {
+                "Domain_A": z_c[:half_b],
+                "Domain_B": z_c[half_b:],
+            }
+            domain_names, domain_sim_matrix = compute_domain_similarity_matrix(domain_feats)
+
+            # 4. Render and save dashboard figure
+            val_pred = self.latest_val_pred if not np.isnan(self.latest_val_pred) else 0.0
+            twonn_dim = self.latest_twonn_dim
+            uniformity = self.latest_uniformity
+
+            fig = plot_foundation_diagnostics_dashboard(
+                epoch=epoch,
+                val_loss_pred=val_pred,
+                unique_lags=unique_lags,
+                gamma_r=gamma_r,
+                attn_maps=attn_maps,
+                liftoff_sims=liftoff_sims,
+                domain_names=domain_names,
+                domain_sim_matrix=domain_sim_matrix,
+                twonn_dim=twonn_dim,
+                uniformity=uniformity,
+                save_path=save_path,
                 close_fig=False,
             )
-            if self.logger and lq_res.get("fig") is not None:
-                self.logger.log_figure("representation/latent_quality", lq_res["fig"], global_step=epoch)
-                import matplotlib.pyplot as plt
-                plt.close(lq_res["fig"])
 
-            if lq_res.get("angular_cnr") is not None and not np.isnan(lq_res["angular_cnr"]):
-                metrics["latent_angular_cnr"] = float(lq_res["angular_cnr"])
-            if lq_res.get("angular_auc") is not None:
-                metrics["latent_angular_auc"] = float(lq_res["angular_auc"])
-            if lq_res.get("total_3pc_variance") is not None:
-                metrics["latent_total_3pc_variance"] = float(lq_res["total_3pc_variance"])
-
-            # 6. Log figure to TensorBoard & WandB
             if self.logger and fig is not None:
-                self.logger.log_figure("downstream_probe/anomaly_heatmap", fig, global_step=epoch)
+                self.logger.log_figure("diagnostics/foundation_dashboard", fig, global_step=epoch)
                 import matplotlib.pyplot as plt
                 plt.close(fig)
 
-            return metrics
+            return {
+                "dashboard_path": save_path,
+                "sim_z1_z2": liftoff_sims.get("sim_z1_z2", 0.0),
+                "sim_z1_z3": liftoff_sims.get("sim_z1_z3", 0.0),
+            }
         except Exception as e:
             if self.logger:
-                self.logger.warning(f"[Probe Epoch {epoch}] Downstream probing failed: {e}")
+                self.logger.warning(f"[Diagnostics Epoch {epoch}] Failed: {e}")
             return None
 
     def save_checkpoint(
@@ -653,45 +580,11 @@ class Trainer5x5:
             val_metrics = self.validate()
             dt = time.time() - t0
 
-            # Downstream defect probing on validation scan
-            probe_metrics = None
-            if self.probe_grid is not None and getattr(self.config, "probe_interval", 1) > 0:
-                if (epoch + 1) % self.config.probe_interval == 0:
-                    probe_metrics = self.run_downstream_probe(epoch=epoch + 1)
-                    probe_improved = False
-                    msg_probe = ""
-                    if probe_metrics and "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
-                        auc_val = float(probe_metrics["probe_gt_auc"])
-                        if not np.isnan(auc_val) and auc_val > self.best_probe_gt_auc:
-                            self.best_probe_gt_auc = auc_val
-                            probe_improved = True
-                            msg_probe = f"  --> Saved new best downstream probe checkpoint (GT AUC: {auc_val:.4f}, AP: {probe_metrics['probe_gt_ap']:.4f})"
-                    elif probe_metrics and "contrast_ratio_cnr" in probe_metrics:
-                        cnr = float(probe_metrics["contrast_ratio_cnr"])
-                        if not np.isnan(cnr) and cnr > self.best_probe_cnr:
-                            self.best_probe_cnr = cnr
-                            probe_improved = True
-                            msg_probe = f"  --> Saved new best downstream probe checkpoint (CNR: {cnr:.2f})"
-
-                    if probe_improved:
-                        eff_rank = val_metrics.get("effective_rank") if val_metrics else None
-                        unif_val = val_metrics.get("uniformity") if val_metrics else None
-                        twonn_val = val_metrics.get("twonn_dim") if val_metrics else None
-                        best_probe_path = os.path.join(self.config.save_dir, "best_probe_model_5x5.pt")
-                        self.save_checkpoint(
-                            best_probe_path,
-                            val_loss=val_metrics.get("val_loss") if val_metrics else None,
-                            val_loss_pred=val_metrics.get("val_loss_pred") if val_metrics else None,
-                            effective_rank=eff_rank,
-                            uniformity=unif_val,
-                            twonn_dim=twonn_val,
-                            probe_gt_auc=probe_metrics.get("probe_gt_auc") if probe_metrics else None,
-                        )
-                        msg_full = f"{msg_probe}: {best_probe_path}"
-                        if self.logger:
-                            self.logger.info(msg_full)
-                        else:
-                            print(msg_full)
+            # Run Foundation Training Diagnostics (Physics-Grounded Dashboard)
+            diag_metrics = None
+            if getattr(self.config, "diagnostics_interval", 1) > 0:
+                if (epoch + 1) % self.config.diagnostics_interval == 0:
+                    diag_metrics = self.run_training_diagnostics(epoch=epoch + 1)
 
             val_str = ""
             if val_metrics:
@@ -707,27 +600,20 @@ class Trainer5x5:
             twonn_val = val_metrics.get("twonn_dim") if val_metrics else None
             twonn_str = f" | Two-NN: {twonn_val:.1f}D" if twonn_val is not None and twonn_val > 0 else ""
 
-            probe_str = ""
-            if probe_metrics:
-                if "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
-                    probe_str = f" | Probe GT-AUC: {probe_metrics['probe_gt_auc']:.4f} (AP: {probe_metrics['probe_gt_ap']:.4f})"
-                elif "contrast_ratio_cnr" in probe_metrics:
-                    probe_str = f" | Probe CNR: {probe_metrics['contrast_ratio_cnr']:.2f}"
+            diag_str = ""
+            if diag_metrics:
+                diag_str = f" | LiftOff-Sim: {diag_metrics.get('sim_z1_z2', 0.0):.2f}"
 
             pred_loss_str = f"(Pred: {train_metrics['loss_pred']:.4f})" if "loss_pred" in train_metrics else ""
             log_line = (
                 f"[Epoch {epoch + 1:02d}/{self.config.epochs:02d}] "
                 f"Train Loss: {train_metrics['loss']:.4f} {pred_loss_str}"
-                f"{val_str}{unif_str}{twonn_str}{probe_str} [{dt:.1f}s]"
+                f"{val_str}{unif_str}{twonn_str}{diag_str} [{dt:.1f}s]"
             )
             if self.logger:
                 self.logger.info(log_line)
-                if probe_metrics:
-                    if "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
-                        self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_auc_{probe_metrics['probe_gt_auc']:.4f}.png")
-                    elif "contrast_ratio_cnr" in probe_metrics:
-                        self.logger.info(f"  --> [Probe Heatmap] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_cnr_{probe_metrics['contrast_ratio_cnr']:.2f}.png")
-                    self.logger.info(f"  --> [Latent Quality Figure] Saved: probe_heatmaps/epoch_{epoch + 1:02d}_latent_quality.png")
+                if diag_metrics and "dashboard_path" in diag_metrics:
+                    self.logger.info(f"  --> [Foundation Diagnostics] Saved: {diag_metrics['dashboard_path']}")
             else:
                 print(log_line)
 
@@ -747,21 +633,9 @@ class Trainer5x5:
                         epoch_data["uniformity"] = val_metrics["uniformity"]
                     if "twonn_dim" in val_metrics and val_metrics["twonn_dim"] > 0:
                         epoch_data["twonn_dim"] = val_metrics["twonn_dim"]
-                    if "effective_rank" in val_metrics:
-                        epoch_data["effective_rank"] = val_metrics["effective_rank"]
-                if probe_metrics:
-                    if "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None:
-                        epoch_data["probe_gt_auc"] = probe_metrics["probe_gt_auc"]
-                    if "probe_gt_ap" in probe_metrics and probe_metrics["probe_gt_ap"] is not None:
-                        epoch_data["probe_gt_ap"] = probe_metrics["probe_gt_ap"]
-                    if "contrast_ratio_cnr" in probe_metrics:
-                        epoch_data["probe_cnr"] = probe_metrics["contrast_ratio_cnr"]
-                    if "latent_angular_auc" in probe_metrics and probe_metrics["latent_angular_auc"] is not None:
-                        epoch_data["latent_angular_auc"] = probe_metrics["latent_angular_auc"]
-                    if "latent_angular_cnr" in probe_metrics and not np.isnan(probe_metrics["latent_angular_cnr"]):
-                        epoch_data["latent_angular_cnr"] = probe_metrics["latent_angular_cnr"]
-                    if "latent_total_3pc_variance" in probe_metrics:
-                        epoch_data["latent_total_3pc_variance"] = probe_metrics["latent_total_3pc_variance"]
+                if diag_metrics:
+                    if "sim_z1_z2" in diag_metrics:
+                        epoch_data["sim_z1_z2"] = diag_metrics["sim_z1_z2"]
                 self.logger.log_epoch(epoch=epoch + 1, metrics=epoch_data, step=self.global_step)
 
             # Checkpoint saving
@@ -770,7 +644,6 @@ class Trainer5x5:
             twonn_val = val_metrics.get("twonn_dim") if val_metrics else None
             val_loss = val_metrics.get("val_loss") if val_metrics else None
             val_loss_pred = val_metrics.get("val_loss_pred") if val_metrics else None
-            probe_gt_auc_val = probe_metrics.get("probe_gt_auc") if probe_metrics else None
             latest_path = os.path.join(self.config.save_dir, "latest_model_5x5.pt")
             self.save_checkpoint(
                 latest_path,
@@ -779,40 +652,23 @@ class Trainer5x5:
                 effective_rank=eff_rank,
                 uniformity=unif_val,
                 twonn_dim=twonn_val,
-                probe_gt_auc=probe_gt_auc_val,
             )
 
             # Early stopping & best checkpoint evaluation
             monitor_metric = getattr(self.config, "early_stopping_metric", "val_loss_pred")
             improved = False
-            metric_info = ""
+            cur_metric = None
 
-            if monitor_metric == "val_loss_pred":
-                cur_metric = val_loss_pred if val_loss_pred is not None else train_metrics["loss_pred"]
-                if not np.isnan(cur_metric) and cur_metric < self.best_val_loss_pred:
-                    self.best_val_loss_pred = cur_metric
-                    improved = True
-                metric_info = f"val_loss_pred: {cur_metric:.4f} (best: {self.best_val_loss_pred:.4f})"
-            elif monitor_metric in ("probe_gt_auc", "gt_auc"):
-                cur_metric = float(probe_metrics["probe_gt_auc"]) if (probe_metrics and "probe_gt_auc" in probe_metrics and probe_metrics["probe_gt_auc"] is not None) else float("-inf")
-                if not np.isnan(cur_metric) and cur_metric > getattr(self, "best_probe_gt_auc", -float("inf")):
-                    self.best_probe_gt_auc = cur_metric
-                    improved = True
-                metric_info = f"probe_gt_auc: {cur_metric:.4f} (best: {self.best_probe_gt_auc:.4f})"
-            elif monitor_metric == "val_loss":
-                cur_metric = val_loss if val_loss is not None else train_metrics["loss"]
-                if not np.isnan(cur_metric) and cur_metric < self.best_val_loss:
+            if monitor_metric == "val_loss":
+                cur_metric = val_loss
+                if cur_metric is not None and not np.isnan(cur_metric) and cur_metric < self.best_val_loss:
                     self.best_val_loss = cur_metric
                     improved = True
-                metric_info = f"val_loss: {cur_metric:.4f} (best: {self.best_val_loss:.4f})"
-            elif monitor_metric == "probe_cnr":
-                cur_metric = float(probe_metrics["contrast_ratio_cnr"]) if (probe_metrics and "contrast_ratio_cnr" in probe_metrics) else float("nan")
-                if not np.isnan(cur_metric) and cur_metric > self.best_probe_cnr:
-                    improved = True
-                metric_info = f"probe_cnr: {cur_metric:.2f} (best: {self.best_probe_cnr:.2f})"
-            else:
-                cur_metric = val_loss_pred if val_loss_pred is not None else train_metrics["loss_pred"]
-                if not np.isnan(cur_metric) and cur_metric < self.best_val_loss_pred:
+                metric_info = f"val_loss: {cur_metric:.4f} (best: {self.best_val_loss:.4f})" if cur_metric is not None else "val_loss: N/A"
+
+            else:  # default 'val_loss_pred'
+                cur_metric = val_loss_pred
+                if cur_metric is not None and not np.isnan(cur_metric) and cur_metric < self.best_val_loss_pred:
                     self.best_val_loss_pred = cur_metric
                     improved = True
                 metric_info = f"val_loss_pred: {cur_metric:.4f} (best: {self.best_val_loss_pred:.4f})"
@@ -833,7 +689,6 @@ class Trainer5x5:
                     effective_rank=eff_rank,
                     uniformity=unif_val,
                     twonn_dim=twonn_val,
-                    probe_gt_auc=probe_gt_auc_val,
                 )
                 msg_best = f"  --> Saved new best checkpoint (monitored {monitor_metric}): {best_path}"
                 if self.logger:

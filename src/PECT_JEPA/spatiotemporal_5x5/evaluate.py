@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -66,7 +67,6 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.cscan_extractor import (
     load_cscan_from_tdms,
 )
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import (
-    AnomalyDetector5x5,
     plot_anomaly_heatmap_5x5,
     plot_latent_representation_quality,
     compute_anomaly_metrics,
@@ -300,10 +300,16 @@ def evaluate_single_file(
     crop_border: int = 10,
 ) -> Dict[str, Any]:
     """
-    Runs full C-scan feature extraction and unsupervised anomaly detection on one TDMS file.
+    Runs full C-scan feature extraction and downstream linear probe evaluation on one TDMS file.
+    Saves outputs into modular flaw_detection/<specimen>/ directories.
     """
     fname_base = os.path.splitext(os.path.basename(file_path))[0]
     meta = extract_file_metadata(file_path)
+    specimen_key = meta.get("specimen", "unknown").lower()
+
+    # Modular task directory per specimen
+    specimen_dir = os.path.join(output_dir, "flaw_detection", specimen_key)
+    os.makedirs(specimen_dir, exist_ok=True)
 
     print(f"\n--- Extracting C-Scan Features: {os.path.basename(file_path)} ---")
     grid_3d = load_cscan_from_tdms(
@@ -330,67 +336,70 @@ def evaluate_single_file(
     # Locate matching Ground Truth mask for this specimen
     gt_mask = find_ground_truth_mask(file_path, data_dir=getattr(model.config, "data_dir", "data"))
 
-    # Fit unsupervised anomaly detector on representations with spatial detrending
-    detector = AnomalyDetector5x5(n_clusters=2, detrend=True)
-    detector.fit(feature_map)
-    score_map = detector.score_map(feature_map, detrend=True)
-
-    # Compute quantitative defect metrics (True Label-based when gt_mask is available)
-    metrics = compute_anomaly_metrics(score_map, gt_mask=gt_mask)
-
-    # If Ground Truth mask is present, evaluate SSL Linear Probe & k-NN (Standard SSL benchmark)
     probe_metrics = None
-    probe_heatmap_path = None
+    probe_prob_map = None
+    prob_heatmap_path = None
+    metrics: Dict[str, Any] = {}
+
     if gt_mask is not None:
         try:
             min_Y = min(feature_map.shape[0], gt_mask.shape[0])
             min_X = min(feature_map.shape[1], gt_mask.shape[1])
+            sub_feat = feature_map[:min_Y, :min_X]
+            sub_gt = gt_mask[:min_Y, :min_X]
+
             evaluator = LinearProbeEvaluator(n_splits=5)
             probe_metrics, probe_prob_map = evaluator.fit_and_predict_probability_map(
-                feature_map[:min_Y, :min_X], gt_mask[:min_Y, :min_X]
+                sub_feat, sub_gt
             )
-            probe_cnr_res = compute_anomaly_metrics(probe_prob_map, gt_mask=gt_mask[:min_Y, :min_X])
+            probe_cnr_res = compute_anomaly_metrics(probe_prob_map, gt_mask=sub_gt)
             probe_cnr = probe_cnr_res.get("contrast_ratio_cnr", 0.0)
-            probe_metrics["linear_probe_cnr"] = probe_cnr
-            metrics["linear_probe_cnr"] = probe_cnr
-            metrics["linear_probe_auc_roc"] = probe_metrics["linear_probe_auc_roc"]
-            metrics["linear_probe_average_precision"] = probe_metrics["linear_probe_average_precision"]
-            metrics["linear_probe_f1"] = probe_metrics["linear_probe_f1"]
-            metrics["knn_5_accuracy"] = probe_metrics["knn_5_accuracy"]
-            metrics["knn_5_f1"] = probe_metrics["knn_5_f1"]
+            peak_cnr = probe_cnr_res.get("peak_contrast_ratio", 0.0)
+            probe_metrics["linear_probe_cnr"] = float(probe_cnr)
+            probe_metrics["peak_contrast_ratio"] = float(peak_cnr)
 
-            # Plot and save Frozen JEPA + Linear Probe Probability Heatmap
-            probe_heatmap_path = os.path.join(output_dir, f"{fname_base}_linear_probe_heatmap.png")
+            metrics["contrast_ratio_cnr"] = float(probe_cnr)
+            metrics["peak_contrast_ratio"] = float(peak_cnr)
+            metrics["auc_roc"] = probe_metrics.get("linear_probe_auc_roc")
+            metrics["average_precision"] = probe_metrics.get("linear_probe_average_precision")
+            metrics["best_f1"] = probe_metrics.get("linear_probe_f1")
+            metrics["knn_5_accuracy"] = probe_metrics.get("knn_5_accuracy")
+            metrics["knn_5_f1"] = probe_metrics.get("knn_5_f1")
+            metrics["has_ground_truth"] = True
+
+            # Save Frozen JEPA + Linear Probe Defect Probability Heatmap
+            prob_heatmap_path = os.path.join(specimen_dir, f"{fname_base}_prob_heatmap.png")
             probe_title = (
-                f"Frozen PECT-JEPA + Linear Probe | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
+                f"Linear Probe Defect Prob Map | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
                 f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')} | Probe CNR: {probe_cnr:.2f} | AUC: {probe_metrics['linear_probe_auc_roc']:.4f}"
             )
             plot_anomaly_heatmap_5x5(
                 anomaly_map=probe_prob_map,
-                save_path=probe_heatmap_path,
+                save_path=prob_heatmap_path,
                 title=probe_title,
             )
         except Exception as e:
-            print(f"    [Probe Warning] Linear probe failed: {e}")
-
-    # Plot and save high-contrast unsupervised K-Means heatmap
-    heatmap_path = os.path.join(output_dir, f"{fname_base}_anomaly_heatmap.png")
-    gt_header = ""
-    if metrics.get("auc_roc") is not None:
-        gt_header = f" | GT AUC: {metrics['auc_roc']:.4f} (AP: {metrics['average_precision']:.4f})"
-    cnr_label = "True CNR" if metrics.get("has_ground_truth") else "CNR"
-    title = (
-        f"PECT-JEPA 5x5 Anomaly Map (K-Means) | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
-        f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')} | {cnr_label}: {metrics['contrast_ratio_cnr']:.2f}{gt_header}"
-    )
-    plot_anomaly_heatmap_5x5(
-        anomaly_map=score_map,
-        save_path=heatmap_path,
-        title=title,
-    )
+            print(f"    [Probe Warning] Linear probe evaluation failed: {e}")
+            metrics = {
+                "contrast_ratio_cnr": 0.0,
+                "peak_contrast_ratio": 0.0,
+                "auc_roc": None,
+                "average_precision": None,
+                "best_f1": None,
+                "has_ground_truth": True,
+            }
+    else:
+        metrics = {
+            "contrast_ratio_cnr": 0.0,
+            "peak_contrast_ratio": 0.0,
+            "auc_roc": None,
+            "average_precision": None,
+            "best_f1": None,
+            "has_ground_truth": False,
+        }
 
     # Save Latent Quality 3-panel figure (PCA-RGB + Angular Distance + CAD Overlay)
-    latent_quality_path = os.path.join(output_dir, f"{fname_base}_latent_quality.png")
+    latent_quality_path = os.path.join(specimen_dir, f"{fname_base}_latent_quality.png")
     lq_dict = plot_latent_representation_quality(
         feature_map=feature_map,
         gt_mask=gt_mask,
@@ -401,23 +410,23 @@ def evaluate_single_file(
 
     # Optionally save full feature map
     if save_features:
-        feat_path = os.path.join(output_dir, f"{fname_base}_features_5x5.npy")
+        feat_path = os.path.join(specimen_dir, f"{fname_base}_features_5x5.npy")
         np.save(feat_path, feature_map)
 
     result = {
         "file": file_path,
         "file_name": os.path.basename(file_path),
+        "specimen": specimen_key,
         "metadata": meta,
         "metrics": metrics,
         "latent_quality": lq_dict,
         "probe_metrics": probe_metrics,
-        "heatmap_path": heatmap_path,
-        "linear_probe_heatmap_path": probe_heatmap_path,
+        "prob_heatmap_path": prob_heatmap_path,
         "latent_quality_path": latent_quality_path,
     }
-    auc_str = f" | GT AUC: {metrics['auc_roc']:.4f} | AP: {metrics['average_precision']:.4f}" if metrics.get("auc_roc") is not None else ""
-    lp_str = f" | Linear Probe AUC: {metrics['linear_probe_auc_roc']:.4f} (CNR: {metrics.get('linear_probe_cnr', 0.0):.2f})" if "linear_probe_auc_roc" in metrics else ""
-    print(f"  [Result] {cnr_label}: {metrics['contrast_ratio_cnr']:.2f}{auc_str}{lp_str} | Peak: {metrics['max_score']:.4f} | Heatmap: {heatmap_path}")
+    auc_str = f" | Linear Probe AUC: {metrics['auc_roc']:.4f} | AP: {metrics['average_precision']:.4f}" if metrics.get("auc_roc") is not None else ""
+    cnr_str = f" | Probe CNR: {metrics['contrast_ratio_cnr']:.2f}" if metrics.get("has_ground_truth") else ""
+    print(f"  [Result]{cnr_str}{auc_str} | Prob Heatmap: {prob_heatmap_path}")
     return result
 
 
@@ -499,7 +508,9 @@ def evaluate_liftoff_invariance(
                     })
 
     # Save lift-off invariance metrics
-    lo_json_path = os.path.join(output_dir, "liftoff_invariance_results.json")
+    liftoff_dir = os.path.join(output_dir, "liftoff_invariance")
+    os.makedirs(liftoff_dir, exist_ok=True)
+    lo_json_path = os.path.join(liftoff_dir, "liftoff_invariance_results.json")
     with open(lo_json_path, "w", encoding="utf-8") as f:
         json.dump(liftoff_results, f, indent=2)
     print(f"\nSaved lift-off invariance results to: {lo_json_path}")
@@ -680,8 +691,109 @@ def main():
     }
 
     report_path = os.path.join(args.output_dir, "evaluation_report.json")
+    summary_json_path = os.path.join(args.output_dir, "evaluation_summary.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    # 5. Modular Flaw Detection Summaries per Specimen (flaw_detection/<specimen>/metrics_summary.json)
+    specimen_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in file_results:
+        sp = r.get("specimen", "unknown")
+        specimen_groups.setdefault(sp, []).append(r)
+
+    for sp, sp_results in specimen_groups.items():
+        sp_dir = os.path.join(args.output_dir, "flaw_detection", sp)
+        os.makedirs(sp_dir, exist_ok=True)
+        sp_cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in sp_results if r["metrics"].get("has_ground_truth")]
+        sp_aucs = [r["metrics"]["auc_roc"] for r in sp_results if r["metrics"].get("auc_roc") is not None]
+        sp_aps = [r["metrics"]["average_precision"] for r in sp_results if r["metrics"].get("average_precision") is not None]
+        sp_f1s = [r["metrics"]["best_f1"] for r in sp_results if r["metrics"].get("best_f1") is not None]
+        sp_knn_acc = [r["metrics"]["knn_5_accuracy"] for r in sp_results if r["metrics"].get("knn_5_accuracy") is not None]
+
+        sp_summary = {
+            "specimen": sp,
+            "total_files": len(sp_results),
+            "labeled_files": len(sp_cnrs),
+            "mean_cnr": float(np.mean(sp_cnrs)) if sp_cnrs else None,
+            "std_cnr": float(np.std(sp_cnrs)) if sp_cnrs else None,
+            "max_cnr": float(np.max(sp_cnrs)) if sp_cnrs else None,
+            "mean_auc_roc": float(np.mean(sp_aucs)) if sp_aucs else None,
+            "mean_average_precision": float(np.mean(sp_aps)) if sp_aps else None,
+            "mean_f1": float(np.mean(sp_f1s)) if sp_f1s else None,
+            "mean_knn_accuracy": float(np.mean(sp_knn_acc)) if sp_knn_acc else None,
+            "files": [
+                {
+                    "file_name": r["file_name"],
+                    "sensor": r["metadata"].get("sensor"),
+                    "waveform": r["metadata"].get("waveform"),
+                    "liftoff": r["metadata"].get("liftoff"),
+                    "cnr": r["metrics"].get("contrast_ratio_cnr"),
+                    "auc_roc": r["metrics"].get("auc_roc"),
+                    "average_precision": r["metrics"].get("average_precision"),
+                    "f1": r["metrics"].get("best_f1"),
+                }
+                for r in sp_results
+            ],
+        }
+        with open(os.path.join(sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(sp_summary, f, indent=2)
+
+    # 6. Representation Geometry Aggregation (representation_geometry/geometry_metrics.json)
+    geom_dir = os.path.join(args.output_dir, "representation_geometry")
+    os.makedirs(geom_dir, exist_ok=True)
+    geom_data = []
+    for r in file_results:
+        lq = r.get("latent_quality", {})
+        if lq:
+            geom_data.append({
+                "file": r.get("file_name"),
+                "specimen": r.get("specimen"),
+                "pca_variance_explained": lq.get("pca_variance_explained"),
+                "total_3pc_variance": lq.get("total_3pc_variance"),
+                "angular_cnr": lq.get("angular_cnr"),
+                "angular_auc": lq.get("angular_auc"),
+                "angular_ap": lq.get("angular_ap"),
+            })
+    geom_summary = {
+        "files_count": len(geom_data),
+        "mean_total_3pc_variance": float(np.mean([g["total_3pc_variance"] for g in geom_data if g.get("total_3pc_variance") is not None])) if any(g.get("total_3pc_variance") is not None for g in geom_data) else None,
+        "mean_angular_cnr": float(np.mean([g["angular_cnr"] for g in geom_data if g.get("angular_cnr") is not None and not np.isnan(g["angular_cnr"])])) if any(g.get("angular_cnr") is not None for g in geom_data) else None,
+        "mean_angular_auc": float(np.mean([g["angular_auc"] for g in geom_data if g.get("angular_auc") is not None and not np.isnan(g["angular_auc"])])) if any(g.get("angular_auc") is not None for g in geom_data) else None,
+        "per_file": geom_data,
+    }
+    with open(os.path.join(geom_dir, "geometry_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(geom_summary, f, indent=2)
+
+    # 7. Tabular Evaluation Summary CSV (evaluation_summary.csv)
+    csv_path = os.path.join(args.output_dir, "evaluation_summary.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "file_name", "specimen", "sensor", "waveform", "liftoff",
+            "linear_probe_cnr", "auc_roc", "average_precision", "f1",
+            "knn_5_accuracy", "total_3pc_variance", "angular_cnr", "angular_auc"
+        ])
+        for r in file_results:
+            m = r.get("metrics", {})
+            meta = r.get("metadata", {})
+            lq = r.get("latent_quality", {})
+            writer.writerow([
+                r.get("file_name"),
+                r.get("specimen"),
+                meta.get("sensor", ""),
+                meta.get("waveform", ""),
+                meta.get("liftoff", ""),
+                f"{m.get('contrast_ratio_cnr', 0.0):.4f}" if m.get('contrast_ratio_cnr') is not None else "",
+                f"{m.get('auc_roc', 0.0):.4f}" if m.get('auc_roc') is not None else "",
+                f"{m.get('average_precision', 0.0):.4f}" if m.get('average_precision') is not None else "",
+                f"{m.get('best_f1', 0.0):.4f}" if m.get('best_f1') is not None else "",
+                f"{m.get('knn_5_accuracy', 0.0):.4f}" if m.get('knn_5_accuracy') is not None else "",
+                f"{lq.get('total_3pc_variance', 0.0):.4f}" if lq.get('total_3pc_variance') is not None else "",
+                f"{lq.get('angular_cnr', 0.0):.4f}" if lq.get('angular_cnr') is not None else "",
+                f"{lq.get('angular_auc', 0.0):.4f}" if lq.get('angular_auc') is not None else "",
+            ])
 
     print("\n" + "=" * 70)
     print("  EVALUATION SUMMARY REPORT")
@@ -707,7 +819,12 @@ def main():
         print(f"Lift-off Linear CKA Score: Mean = {np.mean(ckas):.4f} across {len(ckas)} pairs")
     if cos_sims:
         print(f"Lift-off Cosine Similarity: Mean = {np.mean(cos_sims):.4f}")
-    print(f"\nFull evaluation report saved to: {report_path}")
+    print(f"\nSaved modular task artifacts to:")
+    print(f"  - Flaw Detection:        {os.path.join(args.output_dir, 'flaw_detection')}")
+    print(f"  - Liftoff Invariance:    {os.path.join(args.output_dir, 'liftoff_invariance')}")
+    print(f"  - Representation Geom:   {geom_dir}")
+    print(f"  - Summary Report JSON:   {report_path}")
+    print(f"  - Summary Report CSV:    {csv_path}")
     print("=" * 70 + "\n")
 
 

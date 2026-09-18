@@ -14,9 +14,9 @@ import torch
 
 from ..configs.config import Spatiotemporal5x5Config
 from ..models.jepa_5x5 import PECT_JEPA_5x5
-from ..evaluation.anomaly_detection import AnomalyDetector5x5
+from ..evaluation.linear_probe import LinearProbeEvaluator
+from ..evaluation.anomaly_detection import compute_anomaly_metrics, plot_latent_representation_quality
 from ..evaluation.liftoff_invariance import compute_linear_cka, compute_feature_similarity_matrix, compute_effective_rank
-from ..evaluate import compute_anomaly_metrics
 
 
 class TestEvaluationPipeline(unittest.TestCase):
@@ -34,31 +34,32 @@ class TestEvaluationPipeline(unittest.TestCase):
         self.model = PECT_JEPA_5x5(self.config)
         self.model.eval()
 
-    def test_anomaly_detector_and_metrics(self):
-        """Verify unsupervised anomaly detector and contrast metrics."""
+    def test_linear_probe_and_metrics(self):
+        """Verify LinearProbeEvaluator defect probability map and True CNR metrics."""
         np.random.seed(42)
-        # Create synthetic feature map: 30x30 with 64 dimensions
         sY, sX, D = 30, 30, 64
-        # Normal sound metal background (cluster 0)
+        # Normal sound metal background (class 0)
         features = np.random.randn(sY, sX, D).astype(np.float32) * 0.1
+        gt_mask = np.zeros((sY, sX), dtype=np.int32)
         # Add a localized defect at center (12:18, 12:18)
-        features[12:18, 12:18, :] += 2.0
+        features[12:18, 12:18, :] += 2.5
+        gt_mask[12:18, 12:18] = 1
 
-        detector = AnomalyDetector5x5(n_clusters=2)
-        detector.fit(features)
-        score_map = detector.score_map(features)
+        evaluator = LinearProbeEvaluator(n_splits=3)
+        metrics, prob_map = evaluator.fit_and_predict_probability_map(features, gt_mask)
 
-        self.assertEqual(score_map.shape, (sY, sX))
-        # Defect zone should have substantially higher score than sound background
-        defect_score = np.mean(score_map[12:18, 12:18])
-        bg_score = np.mean(score_map[0:10, 0:10])
-        self.assertGreater(defect_score, bg_score)
+        self.assertEqual(prob_map.shape, (sY, sX))
+        self.assertIn("linear_probe_auc_roc", metrics)
+        self.assertGreater(metrics["linear_probe_auc_roc"], 0.90)
 
-        metrics = compute_anomaly_metrics(score_map, top_percentile=95.0)
-        self.assertIn("contrast_ratio_cnr", metrics)
-        self.assertIn("peak_contrast_ratio", metrics)
-        self.assertGreater(metrics["contrast_ratio_cnr"], 1.0, "CNR should be distinct for inserted defect")
-        self.assertGreater(metrics["max_score"], metrics["background_mean"])
+        # Defect zone should have substantially higher predicted probability than sound background
+        defect_prob = np.mean(prob_map[12:18, 12:18])
+        bg_prob = np.mean(prob_map[0:10, 0:10])
+        self.assertGreater(defect_prob, bg_prob)
+
+        cnr_res = compute_anomaly_metrics(prob_map, gt_mask=gt_mask)
+        self.assertIn("contrast_ratio_cnr", cnr_res)
+        self.assertGreater(cnr_res["contrast_ratio_cnr"], 2.0, "CNR should be distinct for inserted defect")
 
     def test_linear_cka_properties(self):
         """Verify Linear CKA mathematical properties (1.0 for self, ~0 for independent)."""

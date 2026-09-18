@@ -14,7 +14,7 @@ import numpy as np
 
 from src.PECT_JEPA.spatiotemporal_5x5.losses.jepa_loss import JEPALoss5x5
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.liftoff_invariance import compute_effective_rank
-from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import AnomalyDetector5x5, compute_anomaly_metrics
+from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import compute_anomaly_metrics, plot_latent_representation_quality
 from src.PECT_JEPA.spatiotemporal_5x5.configs.config import Spatiotemporal5x5Config
 
 
@@ -105,32 +105,30 @@ class TestRankBarrierLoss(unittest.TestCase):
         final_rank = compute_effective_rank(z.detach().numpy())
         self.assertGreater(final_rank, init_rank * 3.0, "Rank should at least triple after 40 optimization steps")
 
-    def test_anomaly_detector_raw_scoring(self):
-        """Test that AnomalyDetector5x5 can score test maps with detrend=False."""
+    def test_raw_latent_quality_metrics(self):
+        """Test that plot_latent_representation_quality computes raw latent angular distance and PCA metrics."""
         sY, sX, D = 20, 20, 16
-        train_map = np.random.randn(sY, sX, D).astype(np.float32)
-        test_map = np.random.randn(sY, sX, D).astype(np.float32)
+        base_dir = np.random.randn(1, 1, D).astype(np.float32)
+        base_dir = base_dir / np.linalg.norm(base_dir)
+        test_map = np.tile(base_dir, (sY, sX, 1)) + 0.05 * np.random.randn(sY, sX, D).astype(np.float32)
+        gt_mask = np.zeros((sY, sX), dtype=np.int32)
 
-        # Inject anomaly at center
-        test_map[9:12, 9:12, :] += 5.0
+        # Inject anomaly at center pointing away from nominal vector
+        test_map[9:12, 9:12, :] = -base_dir + 0.05 * np.random.randn(3, 3, D).astype(np.float32)
+        gt_mask[9:12, 9:12] = 1
 
-        detector = AnomalyDetector5x5(n_clusters=2, metric="euclidean", detrend=True)
-        detector.fit(train_map)
+        lq_res = plot_latent_representation_quality(
+            feature_map=test_map,
+            gt_mask=gt_mask,
+            close_fig=True,
+        )
 
-        # Test both modes
-        detrended_scores = detector.score_map(test_map, detrend=True)
-        raw_scores = detector.score_map(test_map, detrend=False)
-
-        self.assertEqual(detrended_scores.shape, (sY, sX))
-        self.assertEqual(raw_scores.shape, (sY, sX))
-
-        metrics_raw = compute_anomaly_metrics(raw_scores)
-        metrics_det = compute_anomaly_metrics(detrended_scores)
-
-        self.assertIn("contrast_ratio_cnr", metrics_raw)
-        self.assertIn("contrast_ratio_cnr", metrics_det)
-        self.assertTrue(np.isfinite(metrics_raw["contrast_ratio_cnr"]))
-        self.assertTrue(np.isfinite(metrics_det["contrast_ratio_cnr"]))
+        self.assertIn("pca_variance_explained", lq_res)
+        self.assertIn("total_3pc_variance", lq_res)
+        self.assertIn("angular_cnr", lq_res)
+        self.assertIn("angular_auc", lq_res)
+        self.assertTrue(np.isfinite(lq_res["angular_cnr"]))
+        self.assertGreater(lq_res["angular_cnr"], 1.0)
 
     def test_config_rank_barrier_defaults(self):
         """Verify Spatiotemporal5x5Config includes rank_barrier_weight and rank_barrier_eps."""
