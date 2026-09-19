@@ -18,6 +18,7 @@ Computes the Representation Gap (MLP - Linear) to rigorously audit:
 
 import os
 import json
+import warnings
 from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
 
@@ -34,9 +35,10 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
-
-
 from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 
 class DownstreamBenchmarkSuite:
@@ -108,9 +110,11 @@ class DownstreamBenchmarkSuite:
             # 1. Linear Probe (Logistic Regression) with Balanced Weighting
             lr = LogisticRegression(
                 C=1.0,
-                max_iter=self.max_iter,
+                max_iter=max(500, self.max_iter),
+                tol=1e-3,
                 class_weight=self.class_weight,
-                random_state=self.random_state
+                random_state=self.random_state,
+                solver="lbfgs",
             )
             lr.fit(X_tr_s, y_tr)
             p_lr = lr.predict_proba(X_te_s)[:, 1]
@@ -206,9 +210,11 @@ class DownstreamBenchmarkSuite:
             # Linear Probe (Multinomial Logistic Regression) with Balanced Weighting
             lr = LogisticRegression(
                 C=1.0,
-                max_iter=self.max_iter,
+                max_iter=max(500, self.max_iter),
+                tol=1e-3,
                 class_weight=self.class_weight,
-                random_state=self.random_state
+                random_state=self.random_state,
+                solver="lbfgs",
             )
             lr.fit(X_tr_s, y_tr)
             y_pred_lr = lr.predict(X_te_s)

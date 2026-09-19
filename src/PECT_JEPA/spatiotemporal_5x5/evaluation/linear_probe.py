@@ -19,6 +19,7 @@ Scientific Rationale for Advisor/Supervisor:
   meaning any suboptimal visualization in unsupervised clustering was caused by K-Means assumptions, not representation failure.
 """
 
+import warnings
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 from sklearn.linear_model import LogisticRegression
@@ -36,6 +37,9 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 
 class LinearProbeEvaluator:
@@ -139,7 +143,8 @@ class LinearProbeEvaluator:
             # 1. Linear Probe (Logistic Regression with class weighting)
             clf = LogisticRegression(
                 C=self.c_reg,
-                max_iter=self.max_iter,
+                max_iter=max(500, self.max_iter),
+                tol=1e-3,
                 class_weight="balanced",
                 random_state=self.random_state,
                 solver="lbfgs",
@@ -271,7 +276,8 @@ class LinearProbeEvaluator:
 
         clf = LogisticRegression(
             C=self.c_reg,
-            max_iter=self.max_iter,
+            max_iter=max(500, self.max_iter),
+            tol=1e-3,
             class_weight="balanced",
             random_state=self.random_state,
             solver="lbfgs",

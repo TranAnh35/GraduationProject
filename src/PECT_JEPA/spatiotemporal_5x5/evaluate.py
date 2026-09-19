@@ -53,6 +53,7 @@ except Exception:
     fake_dynamo.disable = lambda fn=None, *args, **kwargs: (fn if fn is not None else (lambda f: f))
     sys.modules["torch._dynamo"] = fake_dynamo
 
+import warnings
 import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression, Ridge
@@ -69,6 +70,9 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
 )
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if ROOT_DIR not in sys.path:
@@ -531,7 +535,7 @@ def evaluate_single_file(
                 sc = StandardScaler()
                 X_tr_s = sc.fit_transform(X_v[tr])
                 X_te_s = sc.transform(X_v[te])
-                lr = LogisticRegression(C=1.0, class_weight="balanced", max_iter=150, random_state=42)
+                lr = LogisticRegression(C=1.0, class_weight="balanced", max_iter=500, tol=1e-3, random_state=42, solver="lbfgs")
                 lr.fit(X_tr_s, y_v[tr])
                 preds = lr.predict(X_te_s)
                 y_true_all.append(y_v[te])
