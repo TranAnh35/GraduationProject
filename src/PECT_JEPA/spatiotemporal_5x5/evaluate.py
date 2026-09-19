@@ -1,19 +1,24 @@
 """
-CLI Evaluation and Downstream Probing Script for 5x5 Spatiotemporal PECT-JEPA.
+CLI Evaluation and Downstream Probing Suite for 5x5 Spatiotemporal PECT-JEPA.
 
-Core Capabilities:
-1. Protocol-Aware Evaluation:
-   - Evaluates on held-out test files from --split_summary JSON or dynamic --split_protocol (LOLO, LOSO, LOWO, LODO).
-   - Alternatively evaluates a single scan via --file.
-2. 1-to-1 C-Scan Feature Map Extraction:
-   - Slides a 5x5 spatial window across full scans preserving exact [300, 300, D] resolution.
-3. Unsupervised Anomaly Detection & Defect Contrast:
-   - Fits AnomalyDetector5x5 on sound metal baseline.
-   - Computes Defect-to-Background Contrast Ratio (CNR), peak anomaly ratio, and saves 2D heatmaps.
-4. Multi-Lift-Off Invariance Analysis:
-   - Computes Linear CKA (Centered Kernel Alignment) and Cosine Similarity across paired lift-offs (z1 vs z2 vs z3).
-5. Consolidated Reporting:
-   - Saves structured evaluation_report.json with per-file and aggregate metrics.
+Modular Downstream Benchmark Architecture:
+- Task 1: Anomaly Detection (1_Anomaly_Detection/<specimen>/)
+  Defect probability heatmaps P(Y=1|z), ROC & Precision-Recall curves,
+  Linear Probe vs MLP 2-Layer benchmarks, True CNR, peak CNR, Representation Gap.
+- Task 2: Quantitative Depth Regression (2_Depth_Regression/<specimen>/)
+  Physical depth sizing in mm, 2D predicted depth maps, calibration scatter plots,
+  Linear Ridge vs MLP Regressor (R^2, MAE mm, RMSE mm).
+- Task 3: Defect Severity Classification (3_Severity_Classification/<specimen>/)
+  4-class depth binning (Sound, Shallow <=0.2mm, Medium 0.3-0.6mm, Severe >=0.7mm),
+  normalized confusion matrices, Macro F1 and Accuracy.
+- Task 4: Lift-off Invariance (4_Liftoff_Invariance/)
+  Linear CKA and Cosine Similarity across paired lift-offs (z1 vs z2 vs z3),
+  CKA invariance matrix heatmap and correlation analysis.
+- Task 5: Representation Geometry (5_Representation_Geometry/<specimen>/)
+  Latent PCA-RGB projection, Hypersphere Angular Distance (1 - cos theta),
+  top-3 PCs variance explained, angular CNR and AUC.
+- Root:
+  Consolidated evaluation_summary.json and tabular evaluation_summary.csv.
 
 Usage:
     # Evaluate held-out domain from split summary:
@@ -21,15 +26,15 @@ Usage:
         --checkpoint checkpoints/pect_jepa_5x5/best_model_5x5.pt \\
         --split_summary checkpoints/pect_jepa_5x5/pect_jepa_5x5_base_split_summary.json
 
-    # Evaluate dynamic LOLO (z3 held out):
+    # Dynamic Compound OOD:
     python -m src.PECT_JEPA.spatiotemporal_5x5.evaluate \\
         --checkpoint checkpoints/pect_jepa_5x5/best_model_5x5.pt \\
-        --split_protocol leave_liftoff --holdout_target z3 --eval_liftoff
+        --split_protocol compound_ood
 
     # Evaluate single TDMS file:
     python -m src.PECT_JEPA.spatiotemporal_5x5.evaluate \\
         --checkpoint checkpoints/pect_jepa_5x5/best_model_5x5.pt \\
-        --file data/Sensor_TMR/Corrosion/Square_1mm.tdms
+        --file data/TMR/Corrosion/Square/tmr_corosion_frontside_square_300x300_z1_20260126_190655.tdms
 """
 
 import argparse
@@ -38,7 +43,7 @@ import json
 import os
 import sys
 import types
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 # Defensive safeguard for HPC clusters where torch._dynamo has broken imports or NumPy 2.x conflicts
 try:
@@ -50,6 +55,20 @@ except Exception:
 
 import numpy as np
 import torch
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.model_selection import StratifiedKFold, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    f1_score,
+    accuracy_score,
+    r2_score,
+    mean_absolute_error,
+    mean_squared_error,
+)
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if ROOT_DIR not in sys.path:
@@ -62,6 +81,7 @@ from src.PECT_JEPA.spatiotemporal_5x5.data.split import (
     get_dataset_split,
     extract_file_metadata,
 )
+from src.PECT_JEPA.spatiotemporal_5x5.data.ground_truth import get_ground_truth_manager
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.cscan_extractor import (
     extract_full_cscan_map,
     load_cscan_from_tdms,
@@ -70,12 +90,20 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import (
     plot_anomaly_heatmap_5x5,
     plot_latent_representation_quality,
     compute_anomaly_metrics,
-    evaluate_anomaly_ground_truth,
 )
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.linear_probe import LinearProbeEvaluator
+from src.PECT_JEPA.spatiotemporal_5x5.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.liftoff_invariance import (
     compute_linear_cka,
     compute_feature_similarity_matrix,
+)
+from src.PECT_JEPA.spatiotemporal_5x5.evaluation.visualizations import (
+    plot_probability_heatmap,
+    plot_roc_pr_curves,
+    plot_depth_regression_maps,
+    plot_depth_calibration_scatter,
+    plot_severity_confusion_matrix,
+    plot_liftoff_cka_heatmap,
 )
 
 
@@ -83,10 +111,8 @@ def find_ground_truth_mask(file_path: str, data_dir: str = "data") -> Optional[n
     """
     Finds and loads the authoritative CAD ground-truth mask corresponding to a TDMS file's specimen.
     Utilizes GroundTruthManager to ensure mathematical alignment with specimen_mask_features.json.
-    Supports: 'corrosion', 'rivet_v1', 'rivet_v2'.
     """
     try:
-        from .data.ground_truth import get_ground_truth_manager
         gt_mgr = get_ground_truth_manager(data_dir=data_dir)
         return gt_mgr.get_ground_truth_mask_for_file(file_path, aligned_scan=True)
     except Exception:
@@ -100,15 +126,6 @@ def find_ground_truth_mask(file_path: str, data_dir: str = "data") -> Optional[n
         specimen_key = "rivet_v1"
     elif "rivet_v2" in fname_lower or "rivet2" in fname_lower or "mixed" in fname_lower:
         specimen_key = "rivet_v2"
-
-    if not specimen_key:
-        norm_parts = [p.lower() for p in os.path.normpath(file_path).split(os.sep)]
-        if "corrosion" in norm_parts:
-            specimen_key = "corrosion"
-        elif "rivet_v1" in norm_parts:
-            specimen_key = "rivet_v1"
-        elif "rivet_v2" in norm_parts:
-            specimen_key = "rivet_v2"
 
     if specimen_key:
         candidates = [
@@ -125,11 +142,10 @@ def find_ground_truth_mask(file_path: str, data_dir: str = "data") -> Optional[n
     return None
 
 
-
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("5x5 Spatiotemporal PECT-JEPA Evaluation")
+    p = argparse.ArgumentParser("5x5 Spatiotemporal PECT-JEPA Downstream Evaluation")
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to model checkpoint (.pt), or keyword ('best', 'latest', 'best_probe')")
+                   help="Path to model checkpoint (.pt), or keyword ('best', 'latest', 'auto')")
     p.add_argument("--exp_name", type=str, default=None,
                    help="Experiment name or prefix to evaluate (auto-discovers latest run in experiments/5x5/)")
     p.add_argument("--file", type=str, default=None, help="Path to single TDMS file for defect mapping")
@@ -138,23 +154,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to split summary JSON produced during training (loads held-out test files)")
     p.add_argument("--split_protocol", type=str, default="compound_ood",
                    choices=["compound_ood", "leave_liftoff", "leave_sensor", "leave_waveform", "leave_specimen", "random"],
-                   help="Evaluation split protocol: compound_ood (Option A), leave_liftoff (LOLO), leave_sensor (LOSO), leave_waveform (LOWO), leave_specimen (LODO), random")
-    p.add_argument("--holdout_target", type=str, default="z3",
-                   help="Holdout target category for single-factor protocols (e.g. 'z3', 'TMR', 'Chirp', 'Rivet_v2')")
-    p.add_argument("--holdout_liftoff", type=str, default="z3",
-                   help="Lift-off level held out for compound_ood (default: 'z3')")
-    p.add_argument("--holdout_sensor", type=str, default="TMR",
-                   help="Sensor hardware held out for compound_ood (default: 'TMR')")
-    p.add_argument("--holdout_waveform", type=str, default="Chirp",
-                   help="Waveform shape held out for compound_ood (default: 'Chirp')")
-    p.add_argument("--output_dir", type=str, default=None,
-                   help="Directory to save evaluation artifacts and heatmaps (default: auto inside experiment run dir)")
-    p.add_argument("--eval_liftoff", action="store_true", default=False,
-                   help="Compute Linear CKA across lift-off variations (z1 vs z2 vs z3)")
-    p.add_argument("--save_features", action="store_true", default=False,
-                   help="Save extracted .npy feature maps to disk")
-    p.add_argument("--crop_border", type=int, default=15,
-                   help="Number of outer boundary pixels to crop on each edge (default: 15 to remove air/edge effect)")
+                   help="Evaluation split protocol")
+    p.add_argument("--holdout_target", type=str, default="z3", help="Holdout target category for single-factor protocols")
+    p.add_argument("--holdout_liftoff", type=str, default="z3", help="Lift-off level held out for compound_ood")
+    p.add_argument("--holdout_sensor", type=str, default="TMR", help="Sensor hardware held out for compound_ood")
+    p.add_argument("--holdout_waveform", type=str, default="Chirp", help="Waveform shape held out for compound_ood")
+    p.add_argument("--output_dir", type=str, default=None, help="Directory to save evaluation artifacts")
+    p.add_argument("--eval_liftoff", action="store_true", default=True, help="Compute Linear CKA across lift-off variations")
+    p.add_argument("--no_eval_liftoff", dest="eval_liftoff", action="store_false", help="Skip lift-off invariance analysis")
+    p.add_argument("--save_features", action="store_true", default=False, help="Save extracted .npy feature maps to disk")
+    p.add_argument("--crop_border", type=int, default=15, help="Outer boundary pixels cropped to remove air/edge effect")
     p.add_argument("--batch_size", type=int, default=512, help="Batch size for sliding window feature extraction")
     p.add_argument("--device", type=str, default="cuda", help="Target device: 'cuda' or 'cpu'")
     p.add_argument("--max_eval_files", type=int, default=None, help="Optional limit on number of test files to evaluate")
@@ -162,92 +171,82 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def resolve_checkpoint_path(checkpoint_path: Optional[str] = None, exp_name: Optional[str] = None) -> str:
-    """
-    Intelligently resolves model checkpoint path.
-    Supports:
-    - Direct filepath (.pt)
-    - Keyword ('best', 'latest', 'best_probe', 'auto')
-    - Experiment name or prefix with automatic timestamp discovery (e.g. --exp_name pect_jepa)
-    """
     if checkpoint_path and os.path.isfile(checkpoint_path):
         return checkpoint_path
 
     search_base = "experiments/5x5"
     target_key = (checkpoint_path or "best").strip().lower()
 
-    # 1. Direct path / subfolder candidates
     if checkpoint_path:
         base = os.path.basename(checkpoint_path)
-        candidates = [
-            os.path.join(search_base, checkpoint_path),
-            os.path.join(search_base, checkpoint_path, "checkpoints", base),
-            os.path.join(search_base, os.path.dirname(checkpoint_path), "checkpoints", base),
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                return c
+        if base.endswith(".pt") and os.path.isfile(checkpoint_path):
+            return checkpoint_path
+        if os.path.isdir(checkpoint_path):
+            candidates = [
+                os.path.join(checkpoint_path, "checkpoints", "best_model_5x5.pt"),
+                os.path.join(checkpoint_path, "checkpoints", "latest_model_5x5.pt"),
+                os.path.join(checkpoint_path, "best_model_5x5.pt"),
+            ]
+            for c in candidates:
+                if os.path.isfile(c):
+                    return c
 
-    # 2. Discover matching experiment directories in experiments/5x5/
-    if os.path.isdir(search_base):
-        subdirs = []
-        for d in os.listdir(search_base):
-            full_d = os.path.join(search_base, d)
-            if os.path.isdir(full_d):
-                if exp_name:
-                    if d == exp_name or d.startswith(f"{exp_name}_"):
-                        subdirs.append(full_d)
-                elif checkpoint_path and target_key not in ("auto", "latest", "best", "best_probe", "probe"):
-                    if d == checkpoint_path or d.startswith(f"{checkpoint_path}_"):
-                        subdirs.append(full_d)
-                else:
-                    subdirs.append(full_d)
-
-        # Sort by modification time (most recent first)
-        subdirs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-
-        target_files = []
-        if target_key in ("probe", "best_probe"):
-            target_files = ["best_probe_model_5x5.pt", "best_model_5x5.pt", "latest_model_5x5.pt"]
-        elif target_key in ("latest", "auto"):
-            target_files = ["latest_model_5x5.pt", "best_model_5x5.pt", "best_probe_model_5x5.pt"]
-        else:  # default 'best'
-            target_files = ["best_model_5x5.pt", "best_probe_model_5x5.pt", "latest_model_5x5.pt"]
-
-        for d in subdirs:
-            for fname in target_files:
-                cand = os.path.join(d, "checkpoints", fname)
+    if exp_name:
+        if os.path.isdir(search_base):
+            runs = [os.path.join(search_base, d) for d in os.listdir(search_base) if d.startswith(exp_name)]
+            runs = [r for r in runs if os.path.isdir(r)]
+            runs.sort(key=os.path.getmtime, reverse=True)
+            for r in runs:
+                cand = os.path.join(r, "checkpoints", "best_model_5x5.pt")
                 if os.path.isfile(cand):
                     return cand
-                cand2 = os.path.join(d, fname)
+                cand2 = os.path.join(r, "checkpoints", "latest_model_5x5.pt")
                 if os.path.isfile(cand2):
                     return cand2
 
-    if checkpoint_path:
-        return checkpoint_path
-    raise FileNotFoundError("Could not automatically locate any model checkpoint in experiments/5x5.")
+    if os.path.isdir(search_base):
+        all_runs = [os.path.join(search_base, d) for d in os.listdir(search_base) if os.path.isdir(os.path.join(search_base, d))]
+        all_runs.sort(key=os.path.getmtime, reverse=True)
+        for r in all_runs:
+            cand = os.path.join(r, "checkpoints", "best_model_5x5.pt")
+            if os.path.isfile(cand):
+                return cand
+            cand2 = os.path.join(r, "checkpoints", "latest_model_5x5.pt")
+            if os.path.isfile(cand2):
+                return cand2
+
+    # Fallback to standard locations
+    fallbacks = [
+        "checkpoints/pect_jepa_5x5/best_model_5x5.pt",
+        "checkpoints/pect_jepa_5x5/latest_model_5x5.pt",
+    ]
+    for fb in fallbacks:
+        if os.path.isfile(fb):
+            return fb
+    return checkpoint_path or "checkpoints/pect_jepa_5x5/best_model_5x5.pt"
 
 
 def resolve_split_summary_path(split_summary_path: Optional[str] = None, checkpoint_path: Optional[str] = None) -> Optional[str]:
     if split_summary_path and os.path.isfile(split_summary_path):
         return split_summary_path
-    candidates = []
-    if split_summary_path:
-        base = os.path.basename(split_summary_path)
-        candidates.extend([
-            split_summary_path,
-            os.path.join("experiments/5x5", split_summary_path),
-        ])
-    if checkpoint_path:
+    if checkpoint_path and os.path.isfile(checkpoint_path):
         ckpt_dir = os.path.dirname(checkpoint_path)
-        parent_dir = os.path.dirname(ckpt_dir)
-        for d in (ckpt_dir, parent_dir):
-            if os.path.isdir(d):
-                for f in os.listdir(d):
-                    if f.endswith("_split_summary.json"):
-                        candidates.append(os.path.join(d, f))
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
+        exp_dir = os.path.dirname(ckpt_dir)
+        candidates = [
+            os.path.join(ckpt_dir, "pect_jepa_split_summary.json"),
+            os.path.join(exp_dir, "pect_jepa_split_summary.json"),
+        ]
+        if os.path.isdir(ckpt_dir):
+            for fname in os.listdir(ckpt_dir):
+                if fname.endswith("_split_summary.json"):
+                    candidates.append(os.path.join(ckpt_dir, fname))
+        if os.path.isdir(exp_dir):
+            for fname in os.listdir(exp_dir):
+                if fname.endswith("_split_summary.json"):
+                    candidates.append(os.path.join(exp_dir, fname))
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
     return split_summary_path
 
 
@@ -265,13 +264,11 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
         config = Spatiotemporal5x5Config()
 
     state_dict = ckpt.get("model_state_dict", ckpt)
-    # Auto-detect tokenizer type from state_dict for backward compatibility
     if "tokenizer.proj.weight" in state_dict:
         config.tokenizer_type = "time_only"
     elif "tokenizer.time_proj.weight" in state_dict:
         config.tokenizer_type = "dual_domain"
 
-    # Auto-detect predictor type from state_dict for backward compatibility
     if "predictor.op_embedding.default_op" not in state_dict:
         config.predictor_type = "default"
     else:
@@ -289,7 +286,6 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     return model
 
 
-
 def evaluate_single_file(
     file_path: str,
     model: PECT_JEPA_5x5,
@@ -297,19 +293,27 @@ def evaluate_single_file(
     batch_size: int = 512,
     device: str = "cuda",
     save_features: bool = False,
-    crop_border: int = 10,
+    crop_border: int = 15,
 ) -> Dict[str, Any]:
     """
-    Runs full C-scan feature extraction and downstream linear probe evaluation on one TDMS file.
-    Saves outputs into modular flaw_detection/<specimen>/ directories.
+    Runs full C-scan feature extraction and executes the 4 single-file downstream benchmark tasks:
+    - Task 1: Anomaly Detection (1_Anomaly_Detection/<specimen>/)
+    - Task 2: Quantitative Depth Regression (2_Depth_Regression/<specimen>/)
+    - Task 3: Defect Severity Classification (3_Severity_Classification/<specimen>/)
+    - Task 5: Representation Geometry (5_Representation_Geometry/<specimen>/)
     """
     fname_base = os.path.splitext(os.path.basename(file_path))[0]
     meta = extract_file_metadata(file_path)
-    specimen_key = meta.get("specimen", "unknown").lower()
+    gt_mgr = get_ground_truth_manager(data_dir=getattr(model.config, "data_dir", "data"))
+    specimen_key = gt_mgr.canonical_specimen_key(file_path)
 
-    # Modular task directory per specimen
-    specimen_dir = os.path.join(output_dir, "flaw_detection", specimen_key)
-    os.makedirs(specimen_dir, exist_ok=True)
+    # 1. Modular Directory Paths
+    task1_dir = os.path.join(output_dir, "1_Anomaly_Detection", specimen_key)
+    task2_dir = os.path.join(output_dir, "2_Depth_Regression", specimen_key)
+    task3_dir = os.path.join(output_dir, "3_Severity_Classification", specimen_key)
+    task5_dir = os.path.join(output_dir, "5_Representation_Geometry", specimen_key)
+    for d in [task1_dir, task2_dir, task3_dir, task5_dir]:
+        os.makedirs(d, exist_ok=True)
 
     print(f"\n--- Extracting C-Scan Features: {os.path.basename(file_path)} ---")
     grid_3d = load_cscan_from_tdms(
@@ -330,103 +334,301 @@ def evaluate_single_file(
         full_cscan_3d=grid_3d,
         batch_size=batch_size,
         device=device,
-        show_pbar=True,
+        show_pbar=False,
     )
 
-    # Locate matching Ground Truth mask for this specimen
-    gt_mask = find_ground_truth_mask(file_path, data_dir=getattr(model.config, "data_dir", "data"))
+    # Load Ground Truth representations
+    gt_mask = gt_mgr.get_ground_truth_mask_for_file(file_path, aligned_scan=True)
+    depth_map_gt = gt_mgr.generate_depth_map(specimen_key)
+    severity_mask_gt = gt_mgr.generate_severity_mask(specimen_key)
 
-    probe_metrics = None
-    probe_prob_map = None
+    has_gt = gt_mask is not None
+    min_Y = min(feature_map.shape[0], gt_mask.shape[0]) if has_gt else feature_map.shape[0]
+    min_X = min(feature_map.shape[1], gt_mask.shape[1]) if has_gt else feature_map.shape[1]
+
+    sub_feat = feature_map[:min_Y, :min_X]
+    sub_gt = gt_mask[:min_Y, :min_X] if has_gt else None
+    sub_depth = depth_map_gt[:min_Y, :min_X] if depth_map_gt is not None else None
+    sub_sev = severity_mask_gt[:min_Y, :min_X] if severity_mask_gt is not None else None
+
+    # =========================================================================
+    # Task 1: Anomaly Detection (Linear Probe + MLP 2-Layer + Probability Heatmap)
+    # =========================================================================
+    task1_res: Dict[str, Any] = {}
     prob_heatmap_path = None
-    metrics: Dict[str, Any] = {}
+    roc_pr_path = None
 
-    if gt_mask is not None:
+    if has_gt and sub_gt is not None:
         try:
-            min_Y = min(feature_map.shape[0], gt_mask.shape[0])
-            min_X = min(feature_map.shape[1], gt_mask.shape[1])
-            sub_feat = feature_map[:min_Y, :min_X]
-            sub_gt = gt_mask[:min_Y, :min_X]
-
             evaluator = LinearProbeEvaluator(n_splits=5)
-            probe_metrics, probe_prob_map = evaluator.fit_and_predict_probability_map(
-                sub_feat, sub_gt
-            )
-            probe_cnr_res = compute_anomaly_metrics(probe_prob_map, gt_mask=sub_gt)
-            probe_cnr = probe_cnr_res.get("contrast_ratio_cnr", 0.0)
-            peak_cnr = probe_cnr_res.get("peak_contrast_ratio", 0.0)
-            probe_metrics["linear_probe_cnr"] = float(probe_cnr)
-            probe_metrics["peak_contrast_ratio"] = float(peak_cnr)
+            lp_res, prob_map = evaluator.fit_and_predict_probability_map(sub_feat, sub_gt)
+            cnr_res = compute_anomaly_metrics(prob_map, gt_mask=sub_gt)
+            cnr = float(cnr_res.get("contrast_ratio_cnr", 0.0))
+            peak_cnr = float(cnr_res.get("peak_contrast_ratio", 0.0))
 
-            metrics["contrast_ratio_cnr"] = float(probe_cnr)
-            metrics["peak_contrast_ratio"] = float(peak_cnr)
-            metrics["auc_roc"] = probe_metrics.get("linear_probe_auc_roc")
-            metrics["average_precision"] = probe_metrics.get("linear_probe_average_precision")
-            metrics["best_f1"] = probe_metrics.get("linear_probe_f1")
-            metrics["knn_5_accuracy"] = probe_metrics.get("knn_5_accuracy")
-            metrics["knn_5_f1"] = probe_metrics.get("knn_5_f1")
-            metrics["has_ground_truth"] = True
+            lp_auc = lp_res.get("linear_probe_auc_roc")
+            lp_ap = lp_res.get("linear_probe_average_precision")
+            lp_f1 = lp_res.get("linear_probe_f1")
+            mlp_auc = lp_res.get("mlp_2layer_auc_roc")
+            mlp_ap = lp_res.get("mlp_2layer_average_precision")
+            mlp_f1 = lp_res.get("mlp_2layer_f1")
+            delta_auc = lp_res.get("representation_gap_delta_auc")
 
-            # Save Frozen JEPA + Linear Probe Defect Probability Heatmap
-            prob_heatmap_path = os.path.join(specimen_dir, f"{fname_base}_prob_heatmap.png")
-            probe_title = (
-                f"Linear Probe Defect Prob Map | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
-                f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')} | Probe CNR: {probe_cnr:.2f} | AUC: {probe_metrics['linear_probe_auc_roc']:.4f}"
-            )
-            plot_anomaly_heatmap_5x5(
-                anomaly_map=probe_prob_map,
-                save_path=prob_heatmap_path,
-                title=probe_title,
-            )
-        except Exception as e:
-            print(f"    [Probe Warning] Linear probe evaluation failed: {e}")
-            metrics = {
-                "contrast_ratio_cnr": 0.0,
-                "peak_contrast_ratio": 0.0,
-                "auc_roc": None,
-                "average_precision": None,
-                "best_f1": None,
-                "has_ground_truth": True,
+            task1_res = {
+                "linear_probe": {
+                    "auc_roc": lp_auc,
+                    "average_precision": lp_ap,
+                    "f1_score": lp_f1,
+                    "accuracy": lp_res.get("linear_probe_accuracy"),
+                },
+                "mlp_2layer": {
+                    "auc_roc": mlp_auc,
+                    "average_precision": mlp_ap,
+                    "f1_score": mlp_f1,
+                    "accuracy": lp_res.get("mlp_2layer_accuracy"),
+                },
+                "representation_gap": {
+                    "delta_auc_roc": delta_auc,
+                    "delta_average_precision": lp_res.get("representation_gap_delta_ap"),
+                },
+                "contrast_ratio_cnr": cnr,
+                "peak_contrast_ratio": peak_cnr,
+                "knn_5_accuracy": lp_res.get("knn_5_accuracy"),
             }
-    else:
-        metrics = {
-            "contrast_ratio_cnr": 0.0,
-            "peak_contrast_ratio": 0.0,
-            "auc_roc": None,
-            "average_precision": None,
-            "best_f1": None,
-            "has_ground_truth": False,
-        }
 
-    # Save Latent Quality 3-panel figure (PCA-RGB + Angular Distance + CAD Overlay)
-    latent_quality_path = os.path.join(specimen_dir, f"{fname_base}_latent_quality.png")
+            # 1. Defect Probability Heatmap
+            prob_heatmap_path = os.path.join(task1_dir, f"{fname_base}_prob_heatmap.png")
+            plot_probability_heatmap(
+                prob_map=prob_map,
+                save_path=prob_heatmap_path,
+                title=f"Defect Probability Map | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
+                      f"Lift-off: {meta.get('liftoff', '')} | Waveform: {meta.get('waveform', '')} | AUC: {lp_auc:.4f} | CNR: {cnr:.2f}",
+            )
+
+            # 2. ROC & PR Curves
+            curves = lp_res.get("curve_data", {})
+            if curves and "fpr" in curves:
+                roc_pr_path = os.path.join(task1_dir, f"{fname_base}_roc_pr_curve.png")
+                plot_roc_pr_curves(
+                    fpr=curves["fpr"],
+                    tpr=curves["tpr"],
+                    auc_roc=lp_auc if lp_auc is not None else 0.5,
+                    precision=curves["precision"],
+                    recall=curves["recall"],
+                    avg_prec=lp_ap if lp_ap is not None else 0.0,
+                    save_path=roc_pr_path,
+                    title=f"ROC & PR Curves | {fname_base}",
+                )
+            task1_res["prob_heatmap_path"] = prob_heatmap_path
+            task1_res["roc_pr_path"] = roc_pr_path
+
+        except Exception as e:
+            print(f"    [Task 1 Warning] Anomaly detection failed: {e}")
+            task1_res = {"error": str(e)}
+
+    # =========================================================================
+    # Task 2: Quantitative Depth Regression (Linear Ridge vs MLP Regressor)
+    # =========================================================================
+    task2_res: Dict[str, Any] = {}
+    pred_depth_map_path = None
+    depth_scatter_path = None
+
+    if has_gt and sub_depth is not None:
+        try:
+            bench = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
+            reg_benchmark = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=False)
+
+            flat_feats = sub_feat.reshape(-1, sub_feat.shape[-1]).astype(np.float32)
+            flat_depth = sub_depth.reshape(-1).astype(np.float32)
+
+            def_idx = np.where(flat_depth > 0.0)[0]
+            snd_idx = np.where(flat_depth == 0.0)[0]
+            if len(snd_idx) > 8000:
+                rng = np.random.RandomState(42)
+                sub_snd = rng.choice(snd_idx, size=8000, replace=False)
+                fit_idx = np.concatenate([def_idx, sub_snd])
+            else:
+                fit_idx = np.arange(len(flat_depth))
+
+            scaler = StandardScaler()
+            X_fit_s = scaler.fit_transform(flat_feats[fit_idx])
+            y_fit = flat_depth[fit_idx]
+
+            ridge = Ridge(alpha=1.0, random_state=42)
+            ridge.fit(X_fit_s, y_fit)
+
+            pred_depth_flat = ridge.predict(scaler.transform(flat_feats))
+            pred_depth_map = np.clip(pred_depth_flat.reshape(min_Y, min_X), 0.0, None)
+
+            lp_reg = reg_benchmark.get("linear_probe", {})
+            mlp_reg = reg_benchmark.get("mlp_2layer", {})
+            r2_val = lp_reg.get("r2_score", 0.0)
+            mae_val = lp_reg.get("mae_mm", 0.0)
+            rmse_val = lp_reg.get("rmse_mm", 0.0)
+
+            pred_depth_map_path = os.path.join(task2_dir, f"{fname_base}_predicted_depth_map.png")
+            depth_scatter_path = os.path.join(task2_dir, f"{fname_base}_depth_scatter.png")
+
+            plot_depth_regression_maps(
+                true_depth_map=sub_depth,
+                pred_depth_map=pred_depth_map,
+                save_path=pred_depth_map_path,
+                title=f"Quantitative Depth Sizing | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
+                      f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')}",
+                r2=r2_val,
+                mae=mae_val,
+                rmse=rmse_val,
+            )
+
+            plot_depth_calibration_scatter(
+                true_depth=flat_depth[fit_idx],
+                pred_depth=pred_depth_flat[fit_idx],
+                save_path=depth_scatter_path,
+                title=f"Depth Calibration Scatter | {fname_base}",
+                r2=r2_val,
+                mae=mae_val,
+                rmse=rmse_val,
+            )
+
+            task2_res = {
+                "linear_probe": lp_reg,
+                "mlp_2layer": mlp_reg,
+                "representation_gap": reg_benchmark.get("representation_gap", {}),
+                "pred_depth_map_path": pred_depth_map_path,
+                "depth_scatter_path": depth_scatter_path,
+            }
+        except Exception as e:
+            print(f"    [Task 2 Warning] Depth regression failed: {e}")
+            task2_res = {"error": str(e)}
+
+    # =========================================================================
+    # Task 3: Defect Severity Classification (4-Class Depth Bins)
+    # =========================================================================
+    task3_res: Dict[str, Any] = {}
+    cm_path = None
+
+    if has_gt and sub_sev is not None:
+        try:
+            bench = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
+            sev_benchmark = bench.benchmark_severity_classification(sub_feat, sub_sev)
+
+            valid_idx = np.where(sub_sev.reshape(-1) >= 0)[0]
+            X_v = sub_feat.reshape(-1, sub_feat.shape[-1])[valid_idx].astype(np.float32)
+            y_v = sub_sev.reshape(-1)[valid_idx].astype(np.int64)
+
+            c0 = np.where(y_v == 0)[0]
+            c_other = np.where(y_v > 0)[0]
+            if len(c0) > 8000:
+                rng = np.random.RandomState(42)
+                sub_c0 = rng.choice(c0, size=8000, replace=False)
+                eval_idx = np.concatenate([c_other, sub_c0])
+                X_v = X_v[eval_idx]
+                y_v = y_v[eval_idx]
+
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            y_true_all, y_pred_all = [], []
+            for tr, te in skf.split(X_v, y_v):
+                sc = StandardScaler()
+                X_tr_s = sc.fit_transform(X_v[tr])
+                X_te_s = sc.transform(X_v[te])
+                lr = LogisticRegression(C=1.0, class_weight="balanced", max_iter=150, random_state=42)
+                lr.fit(X_tr_s, y_v[tr])
+                preds = lr.predict(X_te_s)
+                y_true_all.append(y_v[te])
+                y_pred_all.append(preds)
+
+            cm_y_true = np.concatenate(y_true_all)
+            cm_y_pred = np.concatenate(y_pred_all)
+
+            cm_path = os.path.join(task3_dir, f"{fname_base}_confusion_matrix.png")
+            lp_sev = sev_benchmark.get("linear_probe", {})
+            mlp_sev = sev_benchmark.get("mlp_2layer", {})
+            lp_f1 = lp_sev.get("macro_f1", 0.0)
+            lp_acc = lp_sev.get("accuracy", 0.0)
+
+            plot_severity_confusion_matrix(
+                y_true=cm_y_true,
+                y_pred=cm_y_pred,
+                save_path=cm_path,
+                title=f"Severity Classification | {meta.get('specimen', '')} - {meta.get('sensor', '')}",
+                macro_f1=lp_f1,
+                accuracy=lp_acc,
+            )
+
+            task3_res = {
+                "linear_probe": lp_sev,
+                "mlp_2layer": mlp_sev,
+                "representation_gap": sev_benchmark.get("representation_gap", {}),
+                "confusion_matrix_path": cm_path,
+            }
+        except Exception as e:
+            print(f"    [Task 3 Warning] Severity classification failed: {e}")
+            task3_res = {"error": str(e)}
+
+    # =========================================================================
+    # Task 5: Representation Geometry (PCA-RGB + Angular Distance + CAD Overlay)
+    # =========================================================================
+    latent_geom_path = os.path.join(task5_dir, f"{fname_base}_latent_geometry.png")
     lq_dict = plot_latent_representation_quality(
         feature_map=feature_map,
         gt_mask=gt_mask,
-        save_path=latent_quality_path,
+        save_path=latent_geom_path,
         title_prefix=f"{meta.get('specimen', '')} - {meta.get('sensor', '')} ({meta.get('liftoff', '')})",
         close_fig=True,
     )
 
-    # Optionally save full feature map
     if save_features:
-        feat_path = os.path.join(specimen_dir, f"{fname_base}_features_5x5.npy")
+        feat_path = os.path.join(output_dir, f"{fname_base}_features_5x5.npy")
         np.save(feat_path, feature_map)
+
+    # Consolidated flat metrics for summary tables & CSV
+    t1_lp = task1_res.get("linear_probe", {})
+    t1_mlp = task1_res.get("mlp_2layer", {})
+    t2_lp = task2_res.get("linear_probe", {})
+    t3_lp = task3_res.get("linear_probe", {})
+
+    metrics_flat: Dict[str, Any] = {
+        "has_ground_truth": has_gt,
+        "contrast_ratio_cnr": task1_res.get("contrast_ratio_cnr"),
+        "peak_contrast_ratio": task1_res.get("peak_contrast_ratio"),
+        "auc_roc": t1_lp.get("auc_roc"),
+        "average_precision": t1_lp.get("average_precision"),
+        "best_f1": t1_lp.get("f1_score"),
+        "linear_probe_auc_roc": t1_lp.get("auc_roc"),
+        "linear_probe_average_precision": t1_lp.get("average_precision"),
+        "linear_probe_f1": t1_lp.get("f1_score"),
+        "mlp_2layer_auc_roc": t1_mlp.get("auc_roc"),
+        "mlp_2layer_ap": t1_mlp.get("average_precision"),
+        "mlp_2layer_f1": t1_mlp.get("f1_score"),
+        "delta_auc": task1_res.get("representation_gap", {}).get("delta_auc_roc"),
+        "depth_r2": t2_lp.get("r2_score"),
+        "depth_mae_mm": t2_lp.get("mae_mm"),
+        "depth_rmse_mm": t2_lp.get("rmse_mm"),
+        "severity_macro_f1": t3_lp.get("macro_f1"),
+        "severity_accuracy": t3_lp.get("accuracy"),
+        "knn_5_accuracy": task1_res.get("knn_5_accuracy"),
+    }
 
     result = {
         "file": file_path,
         "file_name": os.path.basename(file_path),
         "specimen": specimen_key,
         "metadata": meta,
-        "metrics": metrics,
-        "latent_quality": lq_dict,
-        "probe_metrics": probe_metrics,
-        "prob_heatmap_path": prob_heatmap_path,
-        "latent_quality_path": latent_quality_path,
+        "metrics": metrics_flat,
+        "task1_anomaly_detection": task1_res,
+        "task2_depth_regression": task2_res,
+        "task3_severity_classification": task3_res,
+        "task5_representation_geometry": {
+            "latent_quality": lq_dict,
+            "latent_geometry_path": latent_geom_path,
+        },
     }
-    auc_str = f" | Linear Probe AUC: {metrics['auc_roc']:.4f} | AP: {metrics['average_precision']:.4f}" if metrics.get("auc_roc") is not None else ""
-    cnr_str = f" | Probe CNR: {metrics['contrast_ratio_cnr']:.2f}" if metrics.get("has_ground_truth") else ""
-    print(f"  [Result]{cnr_str}{auc_str} | Prob Heatmap: {prob_heatmap_path}")
+
+    auc_str = f" | AUC: {metrics_flat['auc_roc']:.4f} | AP: {metrics_flat['average_precision']:.4f}" if metrics_flat.get("auc_roc") is not None else ""
+    cnr_str = f" | CNR: {metrics_flat['contrast_ratio_cnr']:.2f}" if metrics_flat.get("contrast_ratio_cnr") is not None else ""
+    r2_str = f" | R²: {metrics_flat['depth_r2']:.3f}" if metrics_flat.get("depth_r2") is not None else ""
+    f1_str = f" | Sev-F1: {metrics_flat['severity_macro_f1']:.3f}" if metrics_flat.get("severity_macro_f1") is not None else ""
+    print(f"  [Result]{cnr_str}{auc_str}{r2_str}{f1_str}")
     return result
 
 
@@ -437,18 +639,19 @@ def evaluate_liftoff_invariance(
     batch_size: int = 512,
     device: str = "cuda",
     crop_border: int = 15,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
     Computes Linear CKA and Cosine Similarity across lift-off variations (z1 vs z2 vs z3)
-    for matched (specimen, sensor, waveform) triplets.
+    and plots the lift-off CKA matrix in 4_Liftoff_Invariance/.
     """
     print("\n" + "=" * 70)
     print("  RUNNING MULTI-LIFT-OFF INVARIANCE ANALYSIS (Linear CKA & Cosine Sim)")
     print("=" * 70)
 
-    meta_by_fp = {fp: extract_file_metadata(fp) for fp in file_paths}
+    task4_dir = os.path.join(output_dir, "4_Liftoff_Invariance")
+    os.makedirs(task4_dir, exist_ok=True)
 
-    # Group by (specimen, sensor, waveform)
+    meta_by_fp = {fp: extract_file_metadata(fp) for fp in file_paths}
     groups: Dict[tuple, Dict[str, str]] = {}
     for fp, m in meta_by_fp.items():
         key = (m.get("specimen"), m.get("sensor"), m.get("waveform"))
@@ -457,14 +660,25 @@ def evaluate_liftoff_invariance(
             groups.setdefault(key, {})[lo] = fp
 
     liftoff_results = []
+    pairwise_ckas: Dict[Tuple[str, str], List[float]] = {}
+
+    # Select representative triplets (1 per specimen: corrosion, rivet_v1, rivet_v2) for fast & balanced evaluation
+    selected_groups = {}
     for key, lo_files in groups.items():
+        if len(lo_files) >= 2:
+            sp = key[0] or "unknown"
+            if sp not in selected_groups:
+                selected_groups[sp] = (key, lo_files)
+            if len(selected_groups) >= 3:
+                break
+
+    for sp, (key, lo_files) in selected_groups.items():
         liftoff_keys = sorted(lo_files.keys())
         if len(liftoff_keys) >= 2:
             specimen, sensor, waveform = key
-            print(f"\nEvaluating Invariance: Specimen={specimen}, Sensor={sensor}, Waveform={waveform}")
-            print(f"  Available lift-off levels: {liftoff_keys}")
+            print(f"\nEvaluating Lift-off Invariance: Specimen={specimen}, Sensor={sensor}, Waveform={waveform}", flush=True)
+            print(f"  Available lift-off levels: {liftoff_keys}", flush=True)
 
-            # Extract features for each lift-off level
             features_by_lo = {}
             for lo in liftoff_keys:
                 fp = lo_files[lo]
@@ -480,7 +694,6 @@ def evaluate_liftoff_invariance(
                 fmap = extract_full_cscan_map(model, grid, batch_size=batch_size, device=device, show_pbar=False)
                 features_by_lo[lo] = fmap.reshape(-1, fmap.shape[-1])
 
-            # Pairwise CKA & Cosine comparison
             for i in range(len(liftoff_keys)):
                 for j in range(i + 1, len(liftoff_keys)):
                     lo_a = liftoff_keys[i]
@@ -488,12 +701,11 @@ def evaluate_liftoff_invariance(
                     fa = features_by_lo[lo_a]
                     fb = features_by_lo[lo_b]
 
-                    # Subsample 10,000 spatial points for stable, fast CKA computation
                     n_sub = min(10000, fa.shape[0])
                     sub_idx = np.random.RandomState(42).choice(fa.shape[0], size=n_sub, replace=False)
 
-                    cka = compute_linear_cka(fa[sub_idx], fb[sub_idx])
-                    cos_sim = compute_feature_similarity_matrix(fa[sub_idx], fb[sub_idx])
+                    cka = float(compute_linear_cka(fa[sub_idx], fb[sub_idx]))
+                    cos_sim = float(compute_feature_similarity_matrix(fa[sub_idx], fb[sub_idx]))
 
                     print(f"  --> Pair ({lo_a} vs {lo_b}): Linear CKA = {cka:.4f} | Mean Cosine Sim = {cos_sim:.4f}")
                     liftoff_results.append({
@@ -506,16 +718,45 @@ def evaluate_liftoff_invariance(
                         "linear_cka": round(cka, 5),
                         "cosine_similarity": round(cos_sim, 5),
                     })
+                    pair_tuple = tuple(sorted([lo_a, lo_b]))
+                    pairwise_ckas.setdefault(pair_tuple, []).append(cka)
 
-    # Save lift-off invariance metrics
-    liftoff_dir = os.path.join(output_dir, "liftoff_invariance")
-    os.makedirs(liftoff_dir, exist_ok=True)
-    lo_json_path = os.path.join(liftoff_dir, "liftoff_invariance_results.json")
+    # 3x3 Lift-off Invariance Matrix Heatmap (z1, z2, z3)
+    lo_levels = ["z1", "z2", "z3"]
+    cka_matrix = np.eye(len(lo_levels), dtype=np.float32)
+    for i, la in enumerate(lo_levels):
+        for j, lb in enumerate(lo_levels):
+            if i != j:
+                pt = tuple(sorted([la, lb]))
+                if pt in pairwise_ckas and pairwise_ckas[pt]:
+                    cka_matrix[i, j] = float(np.mean(pairwise_ckas[pt]))
+
+    cka_matrix_plot_path = os.path.join(task4_dir, "liftoff_cka_matrix.png")
+    plot_liftoff_cka_heatmap(
+        cka_matrix=cka_matrix,
+        labels=lo_levels,
+        save_path=cka_matrix_plot_path,
+        title="5x5 PECT-JEPA Multi-Lift-Off Linear CKA Invariance",
+    )
+
+    mean_cka = float(np.mean([r["linear_cka"] for r in liftoff_results])) if liftoff_results else None
+    mean_cos = float(np.mean([r["cosine_similarity"] for r in liftoff_results])) if liftoff_results else None
+
+    summary = {
+        "total_pairs_evaluated": len(liftoff_results),
+        "mean_linear_cka": mean_cka,
+        "mean_cosine_similarity": mean_cos,
+        "liftoff_levels": lo_levels,
+        "cka_matrix": cka_matrix.tolist(),
+        "cka_matrix_plot_path": cka_matrix_plot_path,
+        "pairwise_results": liftoff_results,
+    }
+
+    lo_json_path = os.path.join(task4_dir, "liftoff_invariance_summary.json")
     with open(lo_json_path, "w", encoding="utf-8") as f:
-        json.dump(liftoff_results, f, indent=2)
-    print(f"\nSaved lift-off invariance results to: {lo_json_path}")
-    return liftoff_results
-
+        json.dump(summary, f, indent=2)
+    print(f"\nSaved lift-off invariance artifacts to: {task4_dir}")
+    return summary
 
 
 def main():
@@ -524,7 +765,6 @@ def main():
     checkpoint_path = resolve_checkpoint_path(args.checkpoint, exp_name=args.exp_name)
     args.checkpoint = checkpoint_path
 
-    # Output directory resolution: if not specified, save alongside experiment run
     if args.output_dir is None:
         ckpt_dir = os.path.dirname(checkpoint_path)
         parent_dir = os.path.dirname(ckpt_dir)
@@ -532,12 +772,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 70)
-    print("  5x5 SPATIOTEMPORAL PECT-JEPA EVALUATION SUITE")
+    print("  5x5 SPATIOTEMPORAL PECT-JEPA MODULAR EVALUATION SUITE")
     print("=" * 70)
     print(f"[Evaluation] Model Checkpoint: {checkpoint_path}")
     print(f"[Evaluation] Output Directory: {args.output_dir}")
 
-    # Load model
     model = load_model_from_checkpoint(checkpoint_path, device=args.device)
 
     # 1. Determine evaluation test file set
@@ -565,7 +804,6 @@ def main():
         print(f"  Loaded {len(test_files)} held-out test files for protocol '{protocol_name}' ({holdout_target})")
 
     else:
-        # Dynamic split protocol from data directory
         all_files = find_all_tdms_files(args.data_dir)
         if not all_files:
             print(f"[Error] No TDMS files found in {args.data_dir}")
@@ -595,11 +833,11 @@ def main():
         test_files = test_files[:args.max_eval_files]
         print(f"  Truncated to {len(test_files)} files via --max_eval_files")
 
-    crop_border = args.crop_border if args.crop_border is not None else getattr(model.config, "crop_border", 10)
+    crop_border = args.crop_border if args.crop_border is not None else getattr(model.config, "crop_border", 15)
 
-    # 2. Evaluate each test file for anomaly detection & CNR
+    # 2. Evaluate each test file for Tasks 1, 2, 3, 5
     file_results = []
-    print(f"\n--- Evaluating {len(test_files)} Held-out Test Scans (crop_border={crop_border}) ---")
+    print(f"\n--- Evaluating {len(test_files)} Test Scans across 5 Benchmark Tasks ---")
     for idx, fp in enumerate(test_files):
         print(f"[{idx + 1}/{len(test_files)}] Processing: {os.path.basename(fp)}")
         res = evaluate_single_file(
@@ -613,49 +851,170 @@ def main():
         )
         file_results.append(res)
 
-    # 3. Lift-off Invariance Analysis (if explicitly requested via --eval_liftoff)
-    liftoff_results = []
+    # 3. Task 4: Lift-off Invariance Analysis (run by default if multiple lift-offs exist)
+    liftoff_summary = {}
     if args.eval_liftoff:
         all_pool = find_all_tdms_files(args.data_dir)
-        liftoff_results = evaluate_liftoff_invariance(
-            file_paths=all_pool,
-            model=model,
-            output_dir=args.output_dir,
-            batch_size=args.batch_size,
-            device=args.device,
-            crop_border=crop_border,
-        )
+        try:
+            liftoff_summary = evaluate_liftoff_invariance(
+                file_paths=all_pool,
+                model=model,
+                output_dir=args.output_dir,
+                batch_size=args.batch_size,
+                device=args.device,
+                crop_border=crop_border,
+            )
+        except Exception as e:
+            print(f"  [Task 4 Warning] Lift-off invariance analysis failed: {e}")
 
-    # 4. Generate Comprehensive Consolidated Report
-    cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in file_results]
-    peak_cnrs = [r["metrics"]["peak_contrast_ratio"] for r in file_results]
-    aucs = [r["metrics"]["auc_roc"] for r in file_results if r["metrics"].get("auc_roc") is not None]
-    aps = [r["metrics"]["average_precision"] for r in file_results if r["metrics"].get("average_precision") is not None]
-    lp_aucs = [r["metrics"]["linear_probe_auc_roc"] for r in file_results if "linear_probe_auc_roc" in r["metrics"]]
-    lp_aps = [r["metrics"]["linear_probe_average_precision"] for r in file_results if "linear_probe_average_precision" in r["metrics"]]
-    lp_f1s = [r["metrics"]["linear_probe_f1"] for r in file_results if "linear_probe_f1" in r["metrics"]]
+    # =========================================================================
+    # 4. Generate Dedicated Per-Task Summaries (1_, 2_, 3_, 5_)
+    # =========================================================================
+    specimen_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in file_results:
+        sp = r.get("specimen", "unknown")
+        specimen_groups.setdefault(sp, []).append(r)
 
-    ckas = [r["linear_cka"] for r in liftoff_results]
-    cos_sims = [r["cosine_similarity"] for r in liftoff_results]
+    # Task 1: Anomaly Detection per specimen
+    for sp, sp_results in specimen_groups.items():
+        t1_sp_dir = os.path.join(args.output_dir, "1_Anomaly_Detection", sp)
+        aucs = [r["metrics"]["linear_probe_auc_roc"] for r in sp_results if r["metrics"].get("linear_probe_auc_roc") is not None]
+        aps = [r["metrics"]["linear_probe_average_precision"] for r in sp_results if r["metrics"].get("linear_probe_average_precision") is not None]
+        f1s = [r["metrics"]["linear_probe_f1"] for r in sp_results if r["metrics"].get("linear_probe_f1") is not None]
+        cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in sp_results if r["metrics"].get("contrast_ratio_cnr") is not None]
+        mlp_aucs = [r["metrics"]["mlp_2layer_auc_roc"] for r in sp_results if r["metrics"].get("mlp_2layer_auc_roc") is not None]
+        delta_aucs = [r["metrics"]["delta_auc"] for r in sp_results if r["metrics"].get("delta_auc") is not None]
 
-    # Calculate slice-based metrics for Compound OOD
-    slice_metrics = {}
-    if test_slices:
-        for slice_name, s_files in test_slices.items():
-            s_set = {os.path.normpath(f) for f in s_files}
-            matching_results = [r for r in file_results if os.path.normpath(r["file"]) in s_set]
-            slice_cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in matching_results]
-            slice_aucs = [r["metrics"]["auc_roc"] for r in matching_results if r["metrics"].get("auc_roc") is not None]
-            slice_aps = [r["metrics"]["average_precision"] for r in matching_results if r["metrics"].get("average_precision") is not None]
-            if slice_cnrs:
-                slice_metrics[slice_name] = {
-                    "count": len(slice_cnrs),
-                    "mean_cnr": float(np.mean(slice_cnrs)),
-                    "std_cnr": float(np.std(slice_cnrs)),
-                    "max_cnr": float(np.max(slice_cnrs)),
-                    "mean_auc": float(np.mean(slice_aucs)) if slice_aucs else None,
-                    "mean_ap": float(np.mean(slice_aps)) if slice_aps else None,
+        sp_t1_summary = {
+            "specimen": sp,
+            "total_files": len(sp_results),
+            "labeled_files": len(aucs),
+            "linear_probe": {
+                "mean_auc_roc": float(np.mean(aucs)) if aucs else None,
+                "std_auc_roc": float(np.std(aucs)) if aucs else None,
+                "mean_average_precision": float(np.mean(aps)) if aps else None,
+                "mean_f1": float(np.mean(f1s)) if f1s else None,
+            },
+            "mlp_2layer": {
+                "mean_auc_roc": float(np.mean(mlp_aucs)) if mlp_aucs else None,
+            },
+            "representation_gap": {
+                "mean_delta_auc": float(np.mean(delta_aucs)) if delta_aucs else None,
+            },
+            "mean_contrast_ratio_cnr": float(np.mean(cnrs)) if cnrs else None,
+            "files": [
+                {
+                    "file_name": r["file_name"],
+                    "sensor": r["metadata"].get("sensor"),
+                    "waveform": r["metadata"].get("waveform"),
+                    "liftoff": r["metadata"].get("liftoff"),
+                    "auc_roc": r["metrics"].get("linear_probe_auc_roc"),
+                    "average_precision": r["metrics"].get("linear_probe_average_precision"),
+                    "f1": r["metrics"].get("linear_probe_f1"),
+                    "cnr": r["metrics"].get("contrast_ratio_cnr"),
                 }
+                for r in sp_results
+            ],
+        }
+        with open(os.path.join(t1_sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(sp_t1_summary, f, indent=2)
+
+    # Task 2: Depth Regression per specimen
+    for sp, sp_results in specimen_groups.items():
+        t2_sp_dir = os.path.join(args.output_dir, "2_Depth_Regression", sp)
+        r2s = [r["metrics"]["depth_r2"] for r in sp_results if r["metrics"].get("depth_r2") is not None]
+        maes = [r["metrics"]["depth_mae_mm"] for r in sp_results if r["metrics"].get("depth_mae_mm") is not None]
+        rmses = [r["metrics"]["depth_rmse_mm"] for r in sp_results if r["metrics"].get("depth_rmse_mm") is not None]
+
+        sp_t2_summary = {
+            "specimen": sp,
+            "total_files": len(sp_results),
+            "evaluated_files": len(r2s),
+            "linear_probe": {
+                "mean_r2_score": float(np.mean(r2s)) if r2s else None,
+                "mean_mae_mm": float(np.mean(maes)) if maes else None,
+                "mean_rmse_mm": float(np.mean(rmses)) if rmses else None,
+            },
+            "files": [
+                {
+                    "file_name": r["file_name"],
+                    "sensor": r["metadata"].get("sensor"),
+                    "waveform": r["metadata"].get("waveform"),
+                    "liftoff": r["metadata"].get("liftoff"),
+                    "r2_score": r["metrics"].get("depth_r2"),
+                    "mae_mm": r["metrics"].get("depth_mae_mm"),
+                    "rmse_mm": r["metrics"].get("depth_rmse_mm"),
+                }
+                for r in sp_results
+            ],
+        }
+        with open(os.path.join(t2_sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(sp_t2_summary, f, indent=2)
+
+    # Task 3: Severity Classification per specimen
+    for sp, sp_results in specimen_groups.items():
+        t3_sp_dir = os.path.join(args.output_dir, "3_Severity_Classification", sp)
+        f1s = [r["metrics"]["severity_macro_f1"] for r in sp_results if r["metrics"].get("severity_macro_f1") is not None]
+        accs = [r["metrics"]["severity_accuracy"] for r in sp_results if r["metrics"].get("severity_accuracy") is not None]
+
+        sp_t3_summary = {
+            "specimen": sp,
+            "total_files": len(sp_results),
+            "evaluated_files": len(f1s),
+            "linear_probe": {
+                "mean_macro_f1": float(np.mean(f1s)) if f1s else None,
+                "mean_accuracy": float(np.mean(accs)) if accs else None,
+            },
+            "files": [
+                {
+                    "file_name": r["file_name"],
+                    "sensor": r["metadata"].get("sensor"),
+                    "waveform": r["metadata"].get("waveform"),
+                    "liftoff": r["metadata"].get("liftoff"),
+                    "macro_f1": r["metrics"].get("severity_macro_f1"),
+                    "accuracy": r["metrics"].get("severity_accuracy"),
+                }
+                for r in sp_results
+            ],
+        }
+        with open(os.path.join(t3_sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(sp_t3_summary, f, indent=2)
+
+    # Task 5: Representation Geometry per specimen & overall
+    geom_data = []
+    for r in file_results:
+        lq = r.get("task5_representation_geometry", {}).get("latent_quality", {})
+        if lq:
+            geom_data.append({
+                "file": r.get("file_name"),
+                "specimen": r.get("specimen"),
+                "pca_variance_explained": lq.get("pca_variance_explained"),
+                "total_3pc_variance": lq.get("total_3pc_variance"),
+                "angular_cnr": lq.get("angular_cnr"),
+                "angular_auc": lq.get("angular_auc"),
+                "angular_ap": lq.get("angular_ap"),
+            })
+    geom_dir = os.path.join(args.output_dir, "5_Representation_Geometry")
+    geom_summary = {
+        "files_count": len(geom_data),
+        "mean_total_3pc_variance": float(np.mean([g["total_3pc_variance"] for g in geom_data if g.get("total_3pc_variance") is not None])) if any(g.get("total_3pc_variance") is not None for g in geom_data) else None,
+        "mean_angular_cnr": float(np.mean([g["angular_cnr"] for g in geom_data if g.get("angular_cnr") is not None and not np.isnan(g["angular_cnr"])])) if any(g.get("angular_cnr") is not None for g in geom_data) else None,
+        "mean_angular_auc": float(np.mean([g["angular_auc"] for g in geom_data if g.get("angular_auc") is not None and not np.isnan(g["angular_auc"])])) if any(g.get("angular_auc") is not None for g in geom_data) else None,
+        "per_file": geom_data,
+    }
+    with open(os.path.join(geom_dir, "geometry_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(geom_summary, f, indent=2)
+
+    # =========================================================================
+    # 5. Global Consolidated Evaluation Report & CSV
+    # =========================================================================
+    all_cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in file_results if r["metrics"].get("contrast_ratio_cnr") is not None]
+    all_aucs = [r["metrics"]["linear_probe_auc_roc"] for r in file_results if r["metrics"].get("linear_probe_auc_roc") is not None]
+    all_aps = [r["metrics"]["linear_probe_average_precision"] for r in file_results if r["metrics"].get("linear_probe_average_precision") is not None]
+    all_f1s = [r["metrics"]["linear_probe_f1"] for r in file_results if r["metrics"].get("linear_probe_f1") is not None]
+    all_r2s = [r["metrics"]["depth_r2"] for r in file_results if r["metrics"].get("depth_r2") is not None]
+    all_maes = [r["metrics"]["depth_mae_mm"] for r in file_results if r["metrics"].get("depth_mae_mm") is not None]
+    all_sev_f1s = [r["metrics"]["severity_macro_f1"] for r in file_results if r["metrics"].get("severity_macro_f1") is not None]
 
     report = {
         "evaluation_protocol": protocol_name,
@@ -667,129 +1026,76 @@ def main():
             "embed_dim": model.config.embed_dim,
             "encoder_depth": model.config.encoder_depth,
             "predictor_depth": model.config.predictor_depth,
-            "normalization": model.config.normalization,
             "crop_border": crop_border,
         },
         "aggregate_metrics": {
             "total_test_files_evaluated": len(file_results),
-            "labeled_files_count": len(aucs),
-            "mean_contrast_ratio_cnr": float(np.mean(cnrs)) if cnrs else None,
-            "std_contrast_ratio_cnr": float(np.std(cnrs)) if cnrs else None,
-            "max_contrast_ratio_cnr": float(np.max(cnrs)) if cnrs else None,
-            "mean_peak_contrast_ratio": float(np.mean(peak_cnrs)) if peak_cnrs else None,
-            "mean_spatial_auc_roc": float(np.mean(aucs)) if aucs else None,
-            "mean_spatial_average_precision": float(np.mean(aps)) if aps else None,
-            "mean_linear_probe_auc_roc": float(np.mean(lp_aucs)) if lp_aucs else None,
-            "mean_linear_probe_average_precision": float(np.mean(lp_aps)) if lp_aps else None,
-            "mean_linear_probe_f1": float(np.mean(lp_f1s)) if lp_f1s else None,
-            "mean_liftoff_linear_cka": float(np.mean(ckas)) if ckas else None,
-            "mean_liftoff_cosine_sim": float(np.mean(cos_sims)) if cos_sims else None,
+            "labeled_files_count": len(all_aucs),
+            "task1_anomaly_detection": {
+                "mean_linear_probe_auc_roc": float(np.mean(all_aucs)) if all_aucs else None,
+                "std_linear_probe_auc_roc": float(np.std(all_aucs)) if all_aucs else None,
+                "mean_linear_probe_average_precision": float(np.mean(all_aps)) if all_aps else None,
+                "mean_linear_probe_f1": float(np.mean(all_f1s)) if all_f1s else None,
+                "mean_contrast_ratio_cnr": float(np.mean(all_cnrs)) if all_cnrs else None,
+            },
+            "task2_depth_regression": {
+                "mean_depth_r2": float(np.mean(all_r2s)) if all_r2s else None,
+                "mean_depth_mae_mm": float(np.mean(all_maes)) if all_maes else None,
+            },
+            "task3_severity_classification": {
+                "mean_severity_macro_f1": float(np.mean(all_sev_f1s)) if all_sev_f1s else None,
+            },
+            "task4_liftoff_invariance": {
+                "mean_linear_cka": liftoff_summary.get("mean_linear_cka"),
+                "mean_cosine_similarity": liftoff_summary.get("mean_cosine_similarity"),
+            },
+            "task5_representation_geometry": {
+                "mean_total_3pc_variance": geom_summary.get("mean_total_3pc_variance"),
+                "mean_angular_cnr": geom_summary.get("mean_angular_cnr"),
+                "mean_angular_auc": geom_summary.get("mean_angular_auc"),
+            },
         },
-        "slice_metrics": slice_metrics,
         "per_file_results": file_results,
-        "liftoff_invariance_results": liftoff_results,
+        "liftoff_invariance": liftoff_summary,
     }
 
-    report_path = os.path.join(args.output_dir, "evaluation_report.json")
-    summary_json_path = os.path.join(args.output_dir, "evaluation_summary.json")
+    report_path = os.path.join(args.output_dir, "evaluation_summary.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
-    with open(summary_json_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
 
-    # 5. Modular Flaw Detection Summaries per Specimen (flaw_detection/<specimen>/metrics_summary.json)
-    specimen_groups: Dict[str, List[Dict[str, Any]]] = {}
-    for r in file_results:
-        sp = r.get("specimen", "unknown")
-        specimen_groups.setdefault(sp, []).append(r)
-
-    for sp, sp_results in specimen_groups.items():
-        sp_dir = os.path.join(args.output_dir, "flaw_detection", sp)
-        os.makedirs(sp_dir, exist_ok=True)
-        sp_cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in sp_results if r["metrics"].get("has_ground_truth")]
-        sp_aucs = [r["metrics"]["auc_roc"] for r in sp_results if r["metrics"].get("auc_roc") is not None]
-        sp_aps = [r["metrics"]["average_precision"] for r in sp_results if r["metrics"].get("average_precision") is not None]
-        sp_f1s = [r["metrics"]["best_f1"] for r in sp_results if r["metrics"].get("best_f1") is not None]
-        sp_knn_acc = [r["metrics"]["knn_5_accuracy"] for r in sp_results if r["metrics"].get("knn_5_accuracy") is not None]
-
-        sp_summary = {
-            "specimen": sp,
-            "total_files": len(sp_results),
-            "labeled_files": len(sp_cnrs),
-            "mean_cnr": float(np.mean(sp_cnrs)) if sp_cnrs else None,
-            "std_cnr": float(np.std(sp_cnrs)) if sp_cnrs else None,
-            "max_cnr": float(np.max(sp_cnrs)) if sp_cnrs else None,
-            "mean_auc_roc": float(np.mean(sp_aucs)) if sp_aucs else None,
-            "mean_average_precision": float(np.mean(sp_aps)) if sp_aps else None,
-            "mean_f1": float(np.mean(sp_f1s)) if sp_f1s else None,
-            "mean_knn_accuracy": float(np.mean(sp_knn_acc)) if sp_knn_acc else None,
-            "files": [
-                {
-                    "file_name": r["file_name"],
-                    "sensor": r["metadata"].get("sensor"),
-                    "waveform": r["metadata"].get("waveform"),
-                    "liftoff": r["metadata"].get("liftoff"),
-                    "cnr": r["metrics"].get("contrast_ratio_cnr"),
-                    "auc_roc": r["metrics"].get("auc_roc"),
-                    "average_precision": r["metrics"].get("average_precision"),
-                    "f1": r["metrics"].get("best_f1"),
-                }
-                for r in sp_results
-            ],
-        }
-        with open(os.path.join(sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(sp_summary, f, indent=2)
-
-    # 6. Representation Geometry Aggregation (representation_geometry/geometry_metrics.json)
-    geom_dir = os.path.join(args.output_dir, "representation_geometry")
-    os.makedirs(geom_dir, exist_ok=True)
-    geom_data = []
-    for r in file_results:
-        lq = r.get("latent_quality", {})
-        if lq:
-            geom_data.append({
-                "file": r.get("file_name"),
-                "specimen": r.get("specimen"),
-                "pca_variance_explained": lq.get("pca_variance_explained"),
-                "total_3pc_variance": lq.get("total_3pc_variance"),
-                "angular_cnr": lq.get("angular_cnr"),
-                "angular_auc": lq.get("angular_auc"),
-                "angular_ap": lq.get("angular_ap"),
-            })
-    geom_summary = {
-        "files_count": len(geom_data),
-        "mean_total_3pc_variance": float(np.mean([g["total_3pc_variance"] for g in geom_data if g.get("total_3pc_variance") is not None])) if any(g.get("total_3pc_variance") is not None for g in geom_data) else None,
-        "mean_angular_cnr": float(np.mean([g["angular_cnr"] for g in geom_data if g.get("angular_cnr") is not None and not np.isnan(g["angular_cnr"])])) if any(g.get("angular_cnr") is not None for g in geom_data) else None,
-        "mean_angular_auc": float(np.mean([g["angular_auc"] for g in geom_data if g.get("angular_auc") is not None and not np.isnan(g["angular_auc"])])) if any(g.get("angular_auc") is not None for g in geom_data) else None,
-        "per_file": geom_data,
-    }
-    with open(os.path.join(geom_dir, "geometry_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(geom_summary, f, indent=2)
-
-    # 7. Tabular Evaluation Summary CSV (evaluation_summary.csv)
+    # evaluation_summary.csv
     csv_path = os.path.join(args.output_dir, "evaluation_summary.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
             "file_name", "specimen", "sensor", "waveform", "liftoff",
-            "linear_probe_cnr", "auc_roc", "average_precision", "f1",
-            "knn_5_accuracy", "total_3pc_variance", "angular_cnr", "angular_auc"
+            "task1_linear_auc", "task1_linear_ap", "task1_linear_f1",
+            "task1_mlp_auc", "task1_delta_auc", "task1_cnr",
+            "task2_depth_r2", "task2_depth_mae_mm", "task2_depth_rmse_mm",
+            "task3_severity_macro_f1", "task3_severity_accuracy",
+            "task5_3pc_variance", "task5_angular_cnr", "task5_angular_auc"
         ])
         for r in file_results:
             m = r.get("metrics", {})
             meta = r.get("metadata", {})
-            lq = r.get("latent_quality", {})
+            lq = r.get("task5_representation_geometry", {}).get("latent_quality", {})
             writer.writerow([
                 r.get("file_name"),
                 r.get("specimen"),
                 meta.get("sensor", ""),
                 meta.get("waveform", ""),
                 meta.get("liftoff", ""),
+                f"{m.get('linear_probe_auc_roc', 0.0):.4f}" if m.get('linear_probe_auc_roc') is not None else "",
+                f"{m.get('linear_probe_average_precision', 0.0):.4f}" if m.get('linear_probe_average_precision') is not None else "",
+                f"{m.get('linear_probe_f1', 0.0):.4f}" if m.get('linear_probe_f1') is not None else "",
+                f"{m.get('mlp_2layer_auc_roc', 0.0):.4f}" if m.get('mlp_2layer_auc_roc') is not None else "",
+                f"{m.get('delta_auc', 0.0):.4f}" if m.get('delta_auc') is not None else "",
                 f"{m.get('contrast_ratio_cnr', 0.0):.4f}" if m.get('contrast_ratio_cnr') is not None else "",
-                f"{m.get('auc_roc', 0.0):.4f}" if m.get('auc_roc') is not None else "",
-                f"{m.get('average_precision', 0.0):.4f}" if m.get('average_precision') is not None else "",
-                f"{m.get('best_f1', 0.0):.4f}" if m.get('best_f1') is not None else "",
-                f"{m.get('knn_5_accuracy', 0.0):.4f}" if m.get('knn_5_accuracy') is not None else "",
+                f"{m.get('depth_r2', 0.0):.4f}" if m.get('depth_r2') is not None else "",
+                f"{m.get('depth_mae_mm', 0.0):.4f}" if m.get('depth_mae_mm') is not None else "",
+                f"{m.get('depth_rmse_mm', 0.0):.4f}" if m.get('depth_rmse_mm') is not None else "",
+                f"{m.get('severity_macro_f1', 0.0):.4f}" if m.get('severity_macro_f1') is not None else "",
+                f"{m.get('severity_accuracy', 0.0):.4f}" if m.get('severity_accuracy') is not None else "",
                 f"{lq.get('total_3pc_variance', 0.0):.4f}" if lq.get('total_3pc_variance') is not None else "",
                 f"{lq.get('angular_cnr', 0.0):.4f}" if lq.get('angular_cnr') is not None else "",
                 f"{lq.get('angular_auc', 0.0):.4f}" if lq.get('angular_auc') is not None else "",
@@ -799,32 +1105,27 @@ def main():
     print("  EVALUATION SUMMARY REPORT")
     print("=" * 70)
     print(f"Protocol: {protocol_name.upper()} | Holdout Target: {holdout_target}")
-    print(f"Evaluated Test Files: {len(file_results)} ({len(aucs)} with Ground Truth labels)")
-    if cnrs:
-        print(f"Overall Defect-to-Background CNR:  Mean = {np.mean(cnrs):.2f} +/- {np.std(cnrs):.2f} (Max = {np.max(cnrs):.2f})")
-    if aucs:
-        print(f"Overall Ground-Truth Spatial AUC:  Mean = {np.mean(aucs):.4f} across {len(aucs)} labeled files (Mean AP: {np.mean(aps):.4f})")
-    if lp_aucs:
-        print(f"Overall SSL Linear Probe AUC:     Mean = {np.mean(lp_aucs):.4f} across {len(lp_aucs)} labeled files (Mean AP: {np.mean(lp_aps):.4f}, F1: {np.mean(lp_f1s):.4f})")
-    if slice_metrics:
-        print("\n--- OOD Domain Shift Performance Breakdown ---")
-        print(f"{'Domain Slice':<25} | {'Files':<6} | {'Mean CNR':<10} | {'Mean AUC':<10} | {'Mean AP':<10}")
-        print("-" * 75)
-        for s_name, sm in slice_metrics.items():
-            auc_disp = f"{sm['mean_auc']:.4f}" if sm.get("mean_auc") is not None else "--"
-            ap_disp = f"{sm['mean_ap']:.4f}" if sm.get("mean_ap") is not None else "--"
-            print(f"{s_name:<25} | {sm['count']:<6} | {sm['mean_cnr']:<10.2f} | {auc_disp:<10} | {ap_disp:<10}")
-        print("-" * 75)
-    if ckas:
-        print(f"Lift-off Linear CKA Score: Mean = {np.mean(ckas):.4f} across {len(ckas)} pairs")
-    if cos_sims:
-        print(f"Lift-off Cosine Similarity: Mean = {np.mean(cos_sims):.4f}")
-    print(f"\nSaved modular task artifacts to:")
-    print(f"  - Flaw Detection:        {os.path.join(args.output_dir, 'flaw_detection')}")
-    print(f"  - Liftoff Invariance:    {os.path.join(args.output_dir, 'liftoff_invariance')}")
-    print(f"  - Representation Geom:   {geom_dir}")
-    print(f"  - Summary Report JSON:   {report_path}")
-    print(f"  - Summary Report CSV:    {csv_path}")
+    print(f"Evaluated Test Files: {len(file_results)} ({len(all_aucs)} with Ground Truth labels)")
+    if all_aucs:
+        print(f"Task 1 (Linear Probe Defect Detection): Mean AUC = {np.mean(all_aucs):.4f} +/- {np.std(all_aucs):.4f} | Mean AP = {np.mean(all_aps):.4f}")
+        print(f"Task 1 (Defect Contrast Ratio CNR):     Mean CNR = {np.mean(all_cnrs):.2f}")
+    if all_r2s:
+        print(f"Task 2 (Depth Regression R²):           Mean R²  = {np.mean(all_r2s):.4f} | Mean MAE = {np.mean(all_maes):.4f} mm")
+    if all_sev_f1s:
+        print(f"Task 3 (Severity Classification):       Mean F1  = {np.mean(all_sev_f1s):.4f}")
+    if liftoff_summary.get("mean_linear_cka") is not None:
+        print(f"Task 4 (Lift-off Invariance CKA):       Mean CKA = {liftoff_summary['mean_linear_cka']:.4f}")
+    if geom_summary.get("mean_total_3pc_variance") is not None:
+        print(f"Task 5 (Representation Geometry):       Top-3 PCs Explained Variance = {geom_summary['mean_total_3pc_variance']:.1%}")
+
+    print(f"\nArtifacts organized into 5 modular task folders:")
+    print(f"  - 1_Anomaly_Detection:       {os.path.join(args.output_dir, '1_Anomaly_Detection')}")
+    print(f"  - 2_Depth_Regression:        {os.path.join(args.output_dir, '2_Depth_Regression')}")
+    print(f"  - 3_Severity_Classification: {os.path.join(args.output_dir, '3_Severity_Classification')}")
+    print(f"  - 4_Liftoff_Invariance:      {os.path.join(args.output_dir, '4_Liftoff_Invariance')}")
+    print(f"  - 5_Representation_Geometry: {os.path.join(args.output_dir, '5_Representation_Geometry')}")
+    print(f"  - Summary JSON:              {report_path}")
+    print(f"  - Summary CSV:               {csv_path}")
     print("=" * 70 + "\n")
 
 

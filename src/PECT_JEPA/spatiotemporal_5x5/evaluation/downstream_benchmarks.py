@@ -51,7 +51,7 @@ class DownstreamBenchmarkSuite:
         n_splits: int = 5,
         random_state: int = 42,
         mlp_hidden_dim: int = 64,
-        max_iter: int = 500,
+        max_iter: int = 150,
         class_weight: str = "balanced",
     ):
         self.n_splits = n_splits
@@ -65,15 +65,17 @@ class DownstreamBenchmarkSuite:
     # =========================================================================
     def benchmark_binary_detection(
         self,
-        features: np.ndarray,  # [N, D]
-        labels: np.ndarray,    # [N] (1 = defect, 0 = sound, -1 = buffer ignore)
+        features: np.ndarray,  # [N, D] or [sY, sX, D]
+        labels: np.ndarray,    # [N] or [sY, sX] (1 = defect, 0 = sound, -1 = buffer ignore)
     ) -> Dict[str, Any]:
         """
         Benchmarks Linear vs MLP 2-Layer on binary defect detection.
         """
-        valid_idx = np.where(labels >= 0)[0]
-        X = features[valid_idx].astype(np.float32)
-        y = labels[valid_idx].astype(np.int64)
+        flat_feats = features.reshape(-1, features.shape[-1])
+        flat_labels = labels.reshape(-1)
+        valid_idx = np.where(flat_labels >= 0)[0]
+        X = flat_feats[valid_idx].astype(np.float32)
+        y = flat_labels[valid_idx].astype(np.int64)
 
         n_def = int(np.sum(y == 1))
         if n_def < self.n_splits:
@@ -124,7 +126,8 @@ class DownstreamBenchmarkSuite:
                 hidden_layer_sizes=(self.mlp_hidden_dim,),
                 activation="relu",
                 max_iter=self.max_iter,
-                early_stopping=False,
+                early_stopping=True,
+                n_iter_no_change=10,
                 random_state=self.random_state,
             )
             sample_weights = compute_sample_weight("balanced", y_tr) if self.class_weight == "balanced" else None
@@ -165,12 +168,14 @@ class DownstreamBenchmarkSuite:
     # =========================================================================
     def benchmark_multiclass_semantic(
         self,
-        features: np.ndarray,   # [N, D]
-        labels: np.ndarray,     # [N] (0: sound, 1: free corrosion, 2: sound rivet, 3: rivet+corrosion, -1: buffer)
+        features: np.ndarray,   # [N, D] or [sY, sX, D]
+        labels: np.ndarray,     # [N] or [sY, sX] (0: sound, 1: free corrosion, 2: sound rivet, 3: rivet+corrosion, -1: buffer)
     ) -> Dict[str, Any]:
-        valid_idx = np.where(labels >= 0)[0]
-        X = features[valid_idx].astype(np.float32)
-        y = labels[valid_idx].astype(np.int64)
+        flat_feats = features.reshape(-1, features.shape[-1])
+        flat_labels = labels.reshape(-1)
+        valid_idx = np.where(flat_labels >= 0)[0]
+        X = flat_feats[valid_idx].astype(np.float32)
+        y = flat_labels[valid_idx].astype(np.int64)
 
         classes, counts = np.unique(y, return_counts=True)
         if len(classes) < 2:
@@ -215,7 +220,8 @@ class DownstreamBenchmarkSuite:
                 hidden_layer_sizes=(self.mlp_hidden_dim,),
                 activation="relu",
                 max_iter=self.max_iter,
-                early_stopping=False,
+                early_stopping=True,
+                n_iter_no_change=10,
                 random_state=self.random_state,
             )
             sample_weights = compute_sample_weight("balanced", y_tr) if self.class_weight == "balanced" else None
@@ -317,7 +323,8 @@ class DownstreamBenchmarkSuite:
                 hidden_layer_sizes=(self.mlp_hidden_dim,),
                 activation="relu",
                 max_iter=self.max_iter,
-                early_stopping=False,
+                early_stopping=True,
+                n_iter_no_change=10,
                 random_state=self.random_state,
             )
             mlp.fit(X_tr_s, y_tr)
