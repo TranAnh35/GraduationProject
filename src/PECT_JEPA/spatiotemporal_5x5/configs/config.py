@@ -48,7 +48,7 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "standard"    # 'standard' (Pure Spatial Contextual Predictor) | 'operator_diffusion'
+    predictor_type: str = "operator_diffusion" # 'operator_diffusion' (Harmonic Helmholtz Diffusion Predictor) | 'standard'
     predictor_depth: int = 2
     predictor_heads: int = 4
     mlp_ratio: float = 4.0
@@ -59,6 +59,8 @@ class Spatiotemporal5x5Config:
 
     # ------------------------------------------------------------------- Loss
     loss_type: str = "smooth_l1"         # 'smooth_l1' (Pure I-JEPA Smooth L1) | 'l1' | 'l2' | 'cosine'
+    liftoff_invar_weight: float = 0.05   # Lift-off invariance loss weight (decouples lift-off from depth)
+    phase_align_weight: float = 0.05     # Phase-depth monotonicity loss weight (enforces monotonic depth manifold)
     var_weight: float = 0.0              # Zeroed: Pure JEPA relies on EMA target encoder to prevent collapse
     cov_weight: float = 0.0              # Zeroed: Avoids artificial isotropic whitening of physical eddy currents
     var_gamma: float = 1.0               # Target variance standard deviation (if var_weight > 0)

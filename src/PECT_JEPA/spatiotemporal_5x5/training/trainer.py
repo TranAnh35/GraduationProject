@@ -140,6 +140,8 @@ class Trainer5x5:
         self.model.train()
         total_loss = 0.0
         total_pred = 0.0
+        total_liftoff = 0.0
+        total_phase = 0.0
         total_var = 0.0
         total_cov = 0.0
         total_rank_barrier = 0.0
@@ -173,9 +175,9 @@ class Trainer5x5:
             self.scaler.scale(loss).backward()
 
             grad_norm = 0.0
-            if self.config.grad_clip > 0:
+            if self.config.grad_clip > 0.0:
                 self.scaler.unscale_(self.optimizer)
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip))
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip).item())
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -185,12 +187,16 @@ class Trainer5x5:
 
             loss_val = float(loss.item())
             pred_val = float(loss_dict["loss_pred"].item())
+            liftoff_val = float(loss_dict.get("loss_liftoff", torch.tensor(0.0)).item())
+            phase_val = float(loss_dict.get("loss_phase", torch.tensor(0.0)).item())
             var_val = float(loss_dict["loss_var"].item())
             cov_val = float(loss_dict["loss_cov"].item())
             rank_barrier_val = float(loss_dict.get("loss_rank_barrier", torch.tensor(0.0)).item())
 
             total_loss += loss_val
             total_pred += pred_val
+            total_liftoff += liftoff_val
+            total_phase += phase_val
             total_var += var_val
             total_cov += cov_val
             total_rank_barrier += rank_barrier_val
@@ -202,6 +208,8 @@ class Trainer5x5:
                     metrics={
                         "loss": loss_val,
                         "loss_pred": pred_val,
+                        "loss_liftoff": liftoff_val,
+                        "loss_phase": phase_val,
                         "loss_var": var_val,
                         "loss_cov": cov_val,
                         "loss_rank_barrier": rank_barrier_val,
@@ -217,12 +225,16 @@ class Trainer5x5:
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
                 "pred": f"{pred_val:.4f}",
+                "lift": f"{liftoff_val:.3f}",
+                "ph": f"{phase_val:.3f}",
                 "lr": f"{lr:.1e}"
             })
 
         metrics = {
             "loss": total_loss / max(1, n_batches),
             "loss_pred": total_pred / max(1, n_batches),
+            "loss_liftoff": total_liftoff / max(1, n_batches),
+            "loss_phase": total_phase / max(1, n_batches),
             "loss_var": total_var / max(1, n_batches),
             "loss_cov": total_cov / max(1, n_batches),
             "loss_rank_barrier": total_rank_barrier / max(1, n_batches),

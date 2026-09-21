@@ -7,6 +7,7 @@ ContextEncoder5x5, TargetEncoder5x5, Predictor5x5, and JEPALoss5x5.
 from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..configs.config import Spatiotemporal5x5Config, get_default_config_5x5
 from .tokenizer_5x5 import SpatialGridTokenizer5x5, DualDomainGridTokenizer5x5, DualDomainAttentionTokenizer5x5, build_tokenizer_5x5
@@ -61,16 +62,28 @@ class PECT_JEPA_5x5(nn.Module):
         # 5. Predictor (Physics Operator Diffusion Predictor or Standard)
         self.predictor = build_predictor_5x5(config)
 
-        # 6. Loss Function
+        # 6. Loss Function with Physics-Informed Regularization
         self.loss_fn = JEPALoss5x5(
             loss_type=config.loss_type,
             eps=config.eps,
+            liftoff_invar_weight=getattr(config, "liftoff_invar_weight", 0.0),
+            phase_align_weight=getattr(config, "phase_align_weight", 0.0),
             var_weight=config.var_weight,
             cov_weight=config.cov_weight,
             var_gamma=config.var_gamma,
             vicreg_target=getattr(config, "vicreg_target", "context"),
-            rank_barrier_weight=getattr(config, "rank_barrier_weight", 0.05),
+            rank_barrier_weight=getattr(config, "rank_barrier_weight", 0.0),
             rank_barrier_eps=getattr(config, "rank_barrier_eps", 1e-4),
+        )
+
+        # 7. Physical Alignment Modules (Option B)
+        self.depth_head = nn.Linear(config.embed_dim, 1, bias=False)
+        nn.init.trunc_normal_(self.depth_head.weight, std=0.02)
+
+        self.target_harmonic_proj = nn.Sequential(
+            nn.Linear(2, config.embed_dim),
+            nn.GELU(),
+            nn.Linear(config.embed_dim, config.embed_dim),
         )
 
     def _init_target_encoder(self):
@@ -93,7 +106,7 @@ class PECT_JEPA_5x5(nn.Module):
         freq_condition: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward self-supervised step.
+        Forward self-supervised step with Physics Operator Diffusion & Physical Alignment.
         Args:
             x: [B, 5, 5, C] input grid
             custom_context_indices: optional override [B, N_ctx]
@@ -129,8 +142,9 @@ class PECT_JEPA_5x5(nn.Module):
         # 4. Context Encoder (only sees visible context tokens)
         H_ctx = self.context_encoder(context_tokens, context_pos)
 
-        # 5. Predictor (Standard Spatial Contextual Predictor or Physics Operator)
-        if hasattr(self.predictor, "op_embedding"):
+        # 5. Predictor (Physics Operator Diffusion Predictor or Standard)
+        is_operator_diff = hasattr(self.predictor, "op_embedding") and getattr(self.config, "predictor_type", "") == "operator_diffusion"
+        if is_operator_diff:
             if freq_condition is None:
                 if self.training:
                     freq_condition = torch.randint(1, getattr(self.config, "num_freq_bins", 14) + 1, (B,), device=device)
@@ -142,10 +156,56 @@ class PECT_JEPA_5x5(nn.Module):
 
         # 6. Target Encoder (EMA, detached)
         with torch.no_grad():
-            H_tgt = self.target_encoder(target_tokens, target_pos)
+            H_tgt_base = self.target_encoder(target_tokens, target_pos)
 
-        # 7. JEPA Loss + Anti-collapse (C-JEPA regularizes H_ctx by default)
-        loss_dict = self.loss_fn(H_pred, H_tgt, H_ctx=H_ctx)
+        # 6b. Frequency-Resolved Target for Operator Diffusion JEPA
+        if is_operator_diff and freq_condition is not None:
+            # Extract harmonic feature (phase & log-magnitude) of harmonic k at target locations
+            x_flat = x.reshape(B, self.config.grid_size * self.config.grid_size, self.config.in_channels)
+            x_tgt_raw = x_flat[batch_arange, target_indices]  # [B, N_tgt, C]
+            X_tgt_fft = torch.fft.rfft(x_tgt_raw.float(), dim=-1)  # [B, N_tgt, C//2 + 1]
+            k_expand = freq_condition.view(B, 1, 1).expand(-1, target_indices.shape[1], 1)
+            X_k = torch.gather(X_tgt_fft, dim=-1, index=k_expand).squeeze(-1)  # [B, N_tgt]
+            phase_k = torch.angle(X_k) / torch.pi
+            mag_k = torch.log1p(torch.abs(X_k))
+            harm_feat = torch.stack([phase_k, mag_k], dim=-1)  # [B, N_tgt, 2]
+            harm_emb = self.target_harmonic_proj(harm_feat)  # [B, N_tgt, D]
+            H_tgt = F.layer_norm(H_tgt_base + harm_emb, (self.config.embed_dim,))
+        else:
+            H_tgt = H_tgt_base
+
+        # 7a. Compute Lift-Off Perturbation (if liftoff_invar_weight > 0)
+        H_ctx_pert = None
+        if self.training and getattr(self.config, "liftoff_invar_weight", 0.0) > 0.0:
+            alpha = 0.70 + 0.25 * torch.rand(B, 1, 1, 1, device=device, dtype=x.dtype)
+            x_fft_full = torch.fft.rfft(x.float(), dim=-1)
+            num_bins = x_fft_full.shape[-1]
+            decay = torch.linspace(1.0, 0.85, num_bins, device=device, dtype=x.dtype).view(1, 1, 1, -1)
+            x_pert_fft = x_fft_full * alpha * decay
+            x_pert = torch.fft.irfft(x_pert_fft, n=self.config.in_channels, dim=-1).to(x.dtype)
+            tokens_pert, _ = self.tokenizer(x_pert)
+            context_tokens_pert = tokens_pert[batch_arange, context_indices]
+            H_ctx_pert = self.context_encoder(context_tokens_pert, context_pos)
+
+        # 7b. Compute Fundamental Harmonic Phase for Phase-Depth Alignment (if phase_align_weight > 0)
+        z_depth = None
+        phase_ctx = None
+        if getattr(self.config, "phase_align_weight", 0.0) > 0.0:
+            x_flat = x.reshape(B, self.config.grid_size * self.config.grid_size, self.config.in_channels)
+            X_fft = torch.fft.rfft(x_flat.float(), dim=-1)
+            phase_1 = torch.angle(X_fft[:, :, 1]) / torch.pi  # [B, 25] in [-1, 1]
+            phase_ctx = phase_1[batch_arange, context_indices]  # [B, N_ctx]
+            z_depth = self.depth_head(H_ctx).squeeze(-1)  # [B, N_ctx]
+
+        # 7c. Compute Combined JEPA Loss
+        loss_dict = self.loss_fn(
+            H_pred=H_pred,
+            H_target=H_tgt,
+            H_ctx=H_ctx,
+            H_ctx_pert=H_ctx_pert,
+            z_depth=z_depth,
+            phase_ctx=phase_ctx,
+        )
         loss_dict.update({
             "H_pred": H_pred,
             "H_tgt": H_tgt,

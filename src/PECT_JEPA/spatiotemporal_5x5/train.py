@@ -105,8 +105,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
     p.add_argument("--tokenizer_type", type=str, default="dual_domain_attention", choices=["dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
                    help="Tokenizer architecture: 'dual_domain_attention' (Time + FFT Multi-Head Attention Fusion), 'dual_domain', or 'time_only' (default: dual_domain_attention)")
-    p.add_argument("--predictor_type", type=str, default="standard", choices=["standard", "operator_diffusion"],
-                   help="Predictor architecture: 'standard' (pure spatial context inpainting) or 'operator_diffusion' (default: standard)")
+    p.add_argument("--predictor_type", type=str, default="operator_diffusion", choices=["operator_diffusion", "standard"],
+                   help="Predictor architecture: 'operator_diffusion' (Harmonic Helmholtz Diffusion Predictor) or 'standard' (default: operator_diffusion)")
+    p.add_argument("--liftoff_invar_weight", type=float, default=0.05,
+                   help="Physical lift-off invariance loss weight (default: 0.05)")
+    p.add_argument("--phase_align_weight", type=float, default=0.05,
+                   help="Self-supervised phase-depth monotonicity alignment loss weight (default: 0.05)")
     p.add_argument("--num_freq_bins", type=int, default=14,
                    help="Number of FFT frequency bins for spectral branch (default: 14, covers 0-2800 Hz)")
     p.add_argument("--spectral_features", type=str, default="phase_and_mag", choices=["phase_and_mag", "phase_only"],
@@ -189,6 +193,8 @@ def main():
         normalization=args.normalization,
         learning_rate=args.learning_rate,
         loss_type=args.loss_type,
+        liftoff_invar_weight=args.liftoff_invar_weight,
+        phase_align_weight=args.phase_align_weight,
         cov_weight=args.cov_weight,
         var_weight=args.var_weight,
         rank_barrier_weight=args.rank_barrier_weight,

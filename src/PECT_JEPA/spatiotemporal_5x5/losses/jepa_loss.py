@@ -18,6 +18,8 @@ class JEPALoss5x5(nn.Module):
         self,
         loss_type: str = "smooth_l1",
         eps: float = 1e-8,
+        liftoff_invar_weight: float = 0.0,
+        phase_align_weight: float = 0.0,
         var_weight: float = 0.0,
         cov_weight: float = 0.0,
         var_gamma: float = 1.0,
@@ -28,6 +30,8 @@ class JEPALoss5x5(nn.Module):
         super().__init__()
         self.loss_type = loss_type
         self.eps = eps
+        self.liftoff_invar_weight = liftoff_invar_weight
+        self.phase_align_weight = phase_align_weight
         self.var_weight = var_weight
         self.cov_weight = cov_weight
         self.var_gamma = var_gamma
@@ -109,46 +113,86 @@ class JEPALoss5x5(nn.Module):
         barrier = -logdet / D
         return torch.nan_to_num(barrier, nan=10.0, posinf=10.0, neginf=0.0)
 
+    def liftoff_invariance_loss(self, H_ctx: torch.Tensor, H_ctx_pert: torch.Tensor) -> torch.Tensor:
+        """
+        Cosine distance between representations of original and lift-off perturbed inputs:
+        L_liftoff = 1 - CosineSimilarity(H_ctx, H_ctx_pert)
+        Forces representation to be invariant to probe height / lift-off fluctuations.
+        """
+        safe_eps = max(self.eps, 1e-6)
+        h1 = F.normalize(H_ctx.float(), p=2, dim=-1, eps=safe_eps)
+        h2 = F.normalize(H_ctx_pert.float(), p=2, dim=-1, eps=safe_eps)
+        cos_sim = torch.sum(h1 * h2, dim=-1)
+        return torch.mean(1.0 - cos_sim)
+
+    def phase_depth_alignment_loss(self, z_depth: torch.Tensor, phase_ctx: torch.Tensor) -> torch.Tensor:
+        """
+        Pearson correlation loss between latent depth projection and physical fundamental harmonic phase:
+        L_phase = 1 - |PearsonCorr(z_depth, phase_ctx)|
+        Aligns the 1D manifold of latent features monotonically with physical penetration depth d ~ phase_1.
+        """
+        z_flat = z_depth.float().reshape(-1)
+        p_flat = phase_ctx.float().reshape(-1)
+        z_c = z_flat - z_flat.mean()
+        p_c = p_flat - p_flat.mean()
+        denom = (torch.sqrt(torch.sum(z_c ** 2)) * torch.sqrt(torch.sum(p_c ** 2))) + 1e-6
+        pearson_r = torch.sum(z_c * p_c) / denom
+        return 1.0 - torch.abs(pearson_r)
+
     def forward(
         self,
         H_pred: torch.Tensor,
         H_target: torch.Tensor,
         H_ctx: Optional[torch.Tensor] = None,
+        H_ctx_pert: Optional[torch.Tensor] = None,
+        z_depth: Optional[torch.Tensor] = None,
+        phase_ctx: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         l_pred = self.latent_prediction_loss(H_pred, H_target)
+        zero_loss = torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
 
-        # Pure I-JEPA Fast Path: Zero auxiliary computation overhead when regularization is zeroed
-        if self.var_weight == 0.0 and self.cov_weight == 0.0 and self.rank_barrier_weight == 0.0:
-            zero_loss = torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
-            return {
-                "loss": l_pred,
-                "loss_pred": l_pred.detach(),
-                "loss_var": zero_loss,
-                "loss_cov": zero_loss,
-                "loss_rank_barrier": zero_loss,
-            }
+        # Physical Lift-Off Invariance Loss
+        l_liftoff = zero_loss
+        if self.liftoff_invar_weight > 0.0 and H_ctx is not None and H_ctx_pert is not None:
+            l_liftoff = self.liftoff_invariance_loss(H_ctx, H_ctx_pert)
 
-        # Anti-collapse / decorrelation target (C-JEPA, NeurIPS 2024):
-        # 'context': regularizes Online Context Encoder directly (prevents dimensional collapse of representations)
-        # 'both': regularizes both H_ctx and H_pred
-        # 'predictor': regularizes H_pred only (legacy fallback)
-        if self.vicreg_target == "context" and H_ctx is not None:
-            l_var = self.variance_hinge(H_ctx)
-            l_cov = self.covariance_penalty(H_ctx)
-            l_rank = self.rank_barrier_loss(H_ctx) if self.rank_barrier_weight > 0.0 else torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
-        elif self.vicreg_target == "both" and H_ctx is not None:
-            l_var = 0.5 * (self.variance_hinge(H_ctx) + self.variance_hinge(H_pred))
-            l_cov = 0.5 * (self.covariance_penalty(H_ctx) + self.covariance_penalty(H_pred))
-            l_rank = 0.5 * (self.rank_barrier_loss(H_ctx) + self.rank_barrier_loss(H_pred)) if self.rank_barrier_weight > 0.0 else torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
-        else:
-            l_var = self.variance_hinge(H_pred)
-            l_cov = self.covariance_penalty(H_pred)
-            l_rank = self.rank_barrier_loss(H_pred) if self.rank_barrier_weight > 0.0 else torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
+        # Physical Phase-Depth Monotonicity Loss
+        l_phase = zero_loss
+        if self.phase_align_weight > 0.0 and z_depth is not None and phase_ctx is not None:
+            l_phase = self.phase_depth_alignment_loss(z_depth, phase_ctx)
 
-        total = l_pred + self.var_weight * l_var + self.cov_weight * l_cov + self.rank_barrier_weight * l_rank
+        # Auxiliary VICReg & Barrier losses (if activated)
+        l_var = zero_loss
+        l_cov = zero_loss
+        l_rank = zero_loss
+        if self.var_weight > 0.0 or self.cov_weight > 0.0 or self.rank_barrier_weight > 0.0:
+            if self.vicreg_target == "context" and H_ctx is not None:
+                l_var = self.variance_hinge(H_ctx)
+                l_cov = self.covariance_penalty(H_ctx)
+                l_rank = self.rank_barrier_loss(H_ctx) if self.rank_barrier_weight > 0.0 else zero_loss
+            elif self.vicreg_target == "both" and H_ctx is not None:
+                l_var = 0.5 * (self.variance_hinge(H_ctx) + self.variance_hinge(H_pred))
+                l_cov = 0.5 * (self.covariance_penalty(H_ctx) + self.covariance_penalty(H_pred))
+                l_rank = 0.5 * (self.rank_barrier_loss(H_ctx) + self.rank_barrier_loss(H_pred)) if self.rank_barrier_weight > 0.0 else zero_loss
+            else:
+                l_var = self.variance_hinge(H_pred)
+                l_cov = self.covariance_penalty(H_pred)
+                l_rank = self.rank_barrier_loss(H_pred) if self.rank_barrier_weight > 0.0 else zero_loss
+
+        total = (
+            l_pred
+            + self.liftoff_invar_weight * l_liftoff
+            + self.phase_align_weight * l_phase
+            + self.var_weight * l_var
+            + self.cov_weight * l_cov
+            + self.rank_barrier_weight * l_rank
+        )
+
         return {
             "loss": total,
             "loss_pred": l_pred.detach(),
+            "loss_liftoff": l_liftoff.detach(),
+            "loss_phase": l_phase.detach(),
             "loss_var": l_var.detach(),
             "loss_cov": l_cov.detach(),
             "loss_rank_barrier": l_rank.detach(),
