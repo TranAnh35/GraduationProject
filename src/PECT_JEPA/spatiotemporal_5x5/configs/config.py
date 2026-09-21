@@ -38,7 +38,7 @@ class Spatiotemporal5x5Config:
     max_masked: int = 15                # 60% of 25 tokens
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (Pure Multi-Head Attention Fusion) | 'dual_domain' | 'time_only'
+    tokenizer_type: str = "time_only"   # 'time_only' (SpatialGridTokenizer5x5) | 'dual_domain_attention' | 'dual_domain'
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
@@ -48,7 +48,7 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "operator_diffusion" # 'operator_diffusion' (Helmholtz diffusion query) | 'standard'
+    predictor_type: str = "standard"    # 'standard' (Pure Spatial Contextual Predictor) | 'operator_diffusion'
     predictor_depth: int = 2
     predictor_heads: int = 4
     mlp_ratio: float = 4.0
@@ -58,12 +58,12 @@ class Spatiotemporal5x5Config:
     use_momentum_schedule: bool = True
 
     # ------------------------------------------------------------------- Loss
-    loss_type: str = "smooth_l1"         # 'smooth_l1' | 'l1' | 'l2' | 'cosine'
-    var_weight: float = 1.0              # VICReg variance hinge weight
-    cov_weight: float = 2.0              # VICReg covariance decorrelation weight (boosted to 2.0 to maintain rank)
-    var_gamma: float = 1.0               # Target variance standard deviation
+    loss_type: str = "smooth_l1"         # 'smooth_l1' (Pure I-JEPA Smooth L1) | 'l1' | 'l2' | 'cosine'
+    var_weight: float = 0.0              # Zeroed: Pure JEPA relies on EMA target encoder to prevent collapse
+    cov_weight: float = 0.0              # Zeroed: Avoids artificial isotropic whitening of physical eddy currents
+    var_gamma: float = 1.0               # Target variance standard deviation (if var_weight > 0)
     vicreg_target: str = "context"       # 'context' (C-JEPA on H_ctx) | 'both' | 'predictor'
-    rank_barrier_weight: float = 0.5     # Log-Determinant Spectral Barrier weight (balanced at 0.5 to prevent rank collapse)
+    rank_barrier_weight: float = 0.0     # Zeroed: Preserves natural physical eigenvalue distribution
     rank_barrier_eps: float = 1e-4       # Interior point barrier regularizer epsilon
 
     # --------------------------------------------------------------- Training

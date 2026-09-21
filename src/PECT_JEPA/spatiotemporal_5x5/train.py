@@ -95,16 +95,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
     p.add_argument("--loss_type", type=str, default="smooth_l1", choices=["smooth_l1", "l1", "l2", "cosine"],
                    help="JEPA latent prediction loss function (default: smooth_l1)")
-    p.add_argument("--cov_weight", type=float, default=2.0, help="VICReg covariance penalty weight (default: 2.0)")
-    p.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (default: 1.0)")
-    p.add_argument("--rank_barrier_weight", type=float, default=0.5,
-                   help="Log-Determinant Spectral Barrier loss weight to prevent effective rank collapse (default: 0.5)")
+    p.add_argument("--cov_weight", type=float, default=0.0, help="VICReg covariance penalty weight (default: 0.0 for pure JEPA)")
+    p.add_argument("--var_weight", type=float, default=0.0, help="VICReg variance hinge weight (default: 0.0 for pure JEPA)")
+    p.add_argument("--rank_barrier_weight", type=float, default=0.0,
+                   help="Log-Determinant Spectral Barrier loss weight (default: 0.0 for pure JEPA)")
     p.add_argument("--rank_barrier_eps", type=float, default=1e-4,
                    help="Regularization epsilon for Log-Determinant Spectral Barrier (default: 1e-4)")
     p.add_argument("--vicreg_target", type=str, default="context", choices=["context", "both", "predictor"],
                    help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
-    p.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["dual_domain", "time_only"],
-                   help="Tokenizer architecture: 'dual_domain' (Time + FFT Spectral Phase/Mag) or 'time_only' (default: dual_domain)")
+    p.add_argument("--tokenizer_type", type=str, default="time_only", choices=["time_only", "spatial_grid", "dual_domain", "dual_domain_attention"],
+                   help="Tokenizer architecture: 'time_only' (SpatialGridTokenizer5x5) or 'dual_domain' (default: time_only)")
+    p.add_argument("--predictor_type", type=str, default="standard", choices=["standard", "operator_diffusion"],
+                   help="Predictor architecture: 'standard' (pure spatial context inpainting) or 'operator_diffusion' (default: standard)")
     p.add_argument("--num_freq_bins", type=int, default=14,
                    help="Number of FFT frequency bins for spectral branch (default: 14, covers 0-2800 Hz)")
     p.add_argument("--spectral_features", type=str, default="phase_and_mag", choices=["phase_and_mag", "phase_only"],
@@ -122,7 +124,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ema_momentum", type=float, default=0.996, help="Target encoder base EMA momentum (default: 0.996)")
     p.add_argument("--ema_momentum_end", type=float, default=0.999,
                    help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
-    p.add_argument("--embed_dim", type=int, default=32, help="Latent embedding dimension D (default: 32)")
+    p.add_argument("--embed_dim", type=int, default=64, help="Latent embedding dimension D (default: 64)")
     p.add_argument("--encoder_depth", type=int, default=4, help="Context/Target encoder Transformer depth")
     p.add_argument("--predictor_depth", type=int, default=2, help="Predictor Transformer depth")
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
@@ -204,6 +206,7 @@ def main():
         lowpass_order=args.lowpass_order,
         embed_dim=args.embed_dim,
         encoder_depth=args.encoder_depth,
+        predictor_type=args.predictor_type,
         predictor_depth=args.predictor_depth,
         device=args.device,
         seed=args.seed,

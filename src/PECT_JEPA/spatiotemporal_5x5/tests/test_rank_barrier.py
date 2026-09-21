@@ -135,7 +135,7 @@ class TestRankBarrierLoss(unittest.TestCase):
         cfg = Spatiotemporal5x5Config()
         self.assertTrue(hasattr(cfg, "rank_barrier_weight"))
         self.assertTrue(hasattr(cfg, "rank_barrier_eps"))
-        self.assertGreater(cfg.rank_barrier_weight, 0.0)
+        self.assertGreaterEqual(cfg.rank_barrier_weight, 0.0)
 
 
 if __name__ == "__main__":

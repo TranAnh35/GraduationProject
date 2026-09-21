@@ -670,7 +670,7 @@ class Trainer5x5:
                 if cur_metric is not None and not np.isnan(cur_metric) and cur_metric < self.best_val_loss_pred:
                     self.best_val_loss_pred = cur_metric
                     improved = True
-                metric_info = f"val_loss_pred: {cur_metric:.4f} (best: {self.best_val_loss_pred:.4f})"
+                metric_info = f"val_loss_pred: {cur_metric:.4f} (best: {self.best_val_loss_pred:.4f})" if cur_metric is not None else "val_loss_pred: N/A"
 
             # Keep best_val_loss and best_val_loss_pred updated tracking values
             if val_loss is not None and not np.isnan(val_loss) and val_loss < self.best_val_loss:

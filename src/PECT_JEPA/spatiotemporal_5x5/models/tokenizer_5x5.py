@@ -389,7 +389,7 @@ def build_tokenizer_5x5(config) -> nn.Module:
             pos_embed_type=config.pos_embed_type,
             dropout=config.dropout,
         )
-    elif tokenizer_type == "time_only":
+    elif tokenizer_type in ("time_only", "spatial_grid", "standard"):
         return SpatialGridTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,

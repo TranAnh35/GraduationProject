@@ -18,11 +18,11 @@ class JEPALoss5x5(nn.Module):
         self,
         loss_type: str = "smooth_l1",
         eps: float = 1e-8,
-        var_weight: float = 1.0,
-        cov_weight: float = 0.5,
+        var_weight: float = 0.0,
+        cov_weight: float = 0.0,
         var_gamma: float = 1.0,
         vicreg_target: str = "context",
-        rank_barrier_weight: float = 0.05,
+        rank_barrier_weight: float = 0.0,
         rank_barrier_eps: float = 1e-4,
     ):
         super().__init__()
@@ -116,6 +116,17 @@ class JEPALoss5x5(nn.Module):
         H_ctx: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         l_pred = self.latent_prediction_loss(H_pred, H_target)
+
+        # Pure I-JEPA Fast Path: Zero auxiliary computation overhead when regularization is zeroed
+        if self.var_weight == 0.0 and self.cov_weight == 0.0 and self.rank_barrier_weight == 0.0:
+            zero_loss = torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
+            return {
+                "loss": l_pred,
+                "loss_pred": l_pred.detach(),
+                "loss_var": zero_loss,
+                "loss_cov": zero_loss,
+                "loss_rank_barrier": zero_loss,
+            }
 
         # Anti-collapse / decorrelation target (C-JEPA, NeurIPS 2024):
         # 'context': regularizes Online Context Encoder directly (prevents dimensional collapse of representations)

@@ -129,14 +129,13 @@ class PECT_JEPA_5x5(nn.Module):
         # 4. Context Encoder (only sees visible context tokens)
         H_ctx = self.context_encoder(context_tokens, context_pos)
 
-        # 5. Predictor (queries predict target representations conditioned on diffusion operator)
-        if freq_condition is None:
-            if self.training:
-                freq_condition = torch.randint(1, getattr(self.config, "num_freq_bins", 14) + 1, (B,), device=device)
-            else:
-                freq_condition = None
-
+        # 5. Predictor (Standard Spatial Contextual Predictor or Physics Operator)
         if hasattr(self.predictor, "op_embedding"):
+            if freq_condition is None:
+                if self.training:
+                    freq_condition = torch.randint(1, getattr(self.config, "num_freq_bins", 14) + 1, (B,), device=device)
+                else:
+                    freq_condition = None
             H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos, freq_condition=freq_condition)
         else:
             H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos)
