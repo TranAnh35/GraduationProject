@@ -16,7 +16,7 @@ class JEPALoss5x5(nn.Module):
 
     def __init__(
         self,
-        loss_type: str = "smooth_l1",
+        loss_type: str = "l1",
         eps: float = 1e-8,
         liftoff_invar_weight: float = 0.0,
         phase_align_weight: float = 0.0,

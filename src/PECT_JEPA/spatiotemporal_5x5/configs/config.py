@@ -53,12 +53,12 @@ class Spatiotemporal5x5Config:
     predictor_heads: int = 4
     mlp_ratio: float = 4.0
     dropout: float = 0.0
-    ema_momentum: float = 0.996
+    ema_momentum: float = 0.990         # Start at 0.990 for fast early target evolution
     ema_momentum_end: float = 0.999      # Capped at 0.999 (never 1.0) to keep target encoder dynamic
     use_momentum_schedule: bool = True
 
     # ------------------------------------------------------------------- Loss
-    loss_type: str = "smooth_l1"         # 'smooth_l1' (Pure I-JEPA Smooth L1) | 'l1' | 'l2' | 'cosine'
+    loss_type: str = "l1"                # Pure I-JEPA L1 loss (preserves non-vanishing unit gradient)
     liftoff_invar_weight: float = 0.05   # Lift-off invariance loss weight (decouples lift-off from depth)
     phase_align_weight: float = 0.05     # Phase-depth monotonicity loss weight (enforces monotonic depth manifold)
     var_weight: float = 0.0              # Zeroed: Pure JEPA relies on EMA target encoder to prevent collapse
