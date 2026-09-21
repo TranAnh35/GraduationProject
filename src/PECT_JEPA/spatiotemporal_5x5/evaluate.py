@@ -262,21 +262,53 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     dev = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
     ckpt = torch.load(checkpoint_path, map_location=dev)
     cfg_dict = ckpt.get("config", {})
+
+    config = None
     if isinstance(cfg_dict, dict) and cfg_dict:
         config = Spatiotemporal5x5Config.from_dict(cfg_dict)
     else:
+        # Check adjacent directory for config_5x5.json or config.json
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        exp_dir = os.path.dirname(ckpt_dir)
+        for cand in [
+            os.path.join(ckpt_dir, "config_5x5.json"),
+            os.path.join(exp_dir, "config_5x5.json"),
+            os.path.join(ckpt_dir, "config.json"),
+            os.path.join(exp_dir, "config.json"),
+        ]:
+            if os.path.isfile(cand):
+                try:
+                    config = Spatiotemporal5x5Config.from_json(cand)
+                    break
+                except Exception:
+                    pass
+
+    if config is None:
         config = Spatiotemporal5x5Config()
 
     state_dict = ckpt.get("model_state_dict", ckpt)
-    if "tokenizer.proj.weight" in state_dict:
-        config.tokenizer_type = "time_only"
-    elif "tokenizer.time_proj.weight" in state_dict:
-        config.tokenizer_type = "dual_domain"
 
-    if "predictor.op_embedding.default_op" not in state_dict:
-        config.predictor_type = "default"
-    else:
-        config.predictor_type = "operator_diffusion"
+    # If tokenizer_type was not specified in checkpoint config, infer from state_dict
+    if not (isinstance(cfg_dict, dict) and "tokenizer_type" in cfg_dict):
+        if "tokenizer.cross_domain_attn.in_proj_weight" in state_dict or "tokenizer.fuse_proj.weight" in state_dict:
+            config.tokenizer_type = "dual_domain_attention"
+        elif "tokenizer.time_proj.weight" in state_dict:
+            config.tokenizer_type = "dual_domain"
+        elif "tokenizer.proj.weight" in state_dict:
+            config.tokenizer_type = "time_only"
+
+    # If predictor_type was not specified in checkpoint config, infer from state_dict
+    if not (isinstance(cfg_dict, dict) and "predictor_type" in cfg_dict):
+        if "predictor.op_embedding.default_op" in state_dict:
+            config.predictor_type = "operator_diffusion"
+        else:
+            config.predictor_type = "standard"
+
+    # Infer embed_dim from encoder positional embedding if needed
+    if "encoder.pos_embed" in state_dict:
+        actual_dim = state_dict["encoder.pos_embed"].shape[-1]
+        if config.embed_dim != actual_dim:
+            config.embed_dim = actual_dim
 
     model = PECT_JEPA_5x5(config)
     model.load_state_dict(state_dict)
@@ -286,7 +318,7 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     epoch_info = ckpt.get("epoch", "?")
     step_info = ckpt.get("global_step", "?")
     print(f"Loaded checkpoint from {checkpoint_path} (epoch: {epoch_info}, step: {step_info})")
-    print(f"  Model config: resample_mode={config.resample_mode}, C={config.in_channels}, embed_dim={config.embed_dim}")
+    print(f"  Model config: tokenizer_type={config.tokenizer_type}, predictor_type={config.predictor_type}, embed_dim={config.embed_dim}, C={config.in_channels}")
     return model
 
 

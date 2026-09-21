@@ -103,8 +103,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Regularization epsilon for Log-Determinant Spectral Barrier (default: 1e-4)")
     p.add_argument("--vicreg_target", type=str, default="context", choices=["context", "both", "predictor"],
                    help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
-    p.add_argument("--tokenizer_type", type=str, default="time_only", choices=["time_only", "spatial_grid", "dual_domain", "dual_domain_attention"],
-                   help="Tokenizer architecture: 'time_only' (SpatialGridTokenizer5x5) or 'dual_domain' (default: time_only)")
+    p.add_argument("--tokenizer_type", type=str, default="dual_domain_attention", choices=["dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'dual_domain_attention' (Time + FFT Multi-Head Attention Fusion), 'dual_domain', or 'time_only' (default: dual_domain_attention)")
     p.add_argument("--predictor_type", type=str, default="standard", choices=["standard", "operator_diffusion"],
                    help="Predictor architecture: 'standard' (pure spatial context inpainting) or 'operator_diffusion' (default: standard)")
     p.add_argument("--num_freq_bins", type=int, default=14,

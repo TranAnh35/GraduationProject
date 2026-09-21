@@ -38,7 +38,7 @@ class Spatiotemporal5x5Config:
     max_masked: int = 15                # 60% of 25 tokens
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "time_only"   # 'time_only' (SpatialGridTokenizer5x5) | 'dual_domain_attention' | 'dual_domain'
+    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (Pure Multi-Head Attention Fusion) | 'dual_domain' | 'time_only'
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
