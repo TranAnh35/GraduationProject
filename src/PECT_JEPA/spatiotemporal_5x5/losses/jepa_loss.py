@@ -14,8 +14,9 @@ import torch.nn.functional as F
 
 class JEPALoss5x5(nn.Module):
     """
-    JEPA latent prediction loss + Hypersphere Uniformity Dispersion.
-    Also supports Physical Lift-off Invariance and Phase-Depth Monotonicity alignment.
+    JEPA latent prediction loss + VICReg Coordinate-Wise Variance & Covariance Regularization.
+    Also supports Physical Lift-off Invariance, Phase-Depth Monotonicity alignment,
+    and optional Hypersphere Uniformity Dispersion.
     """
 
     def __init__(
@@ -24,10 +25,13 @@ class JEPALoss5x5(nn.Module):
         eps: float = 1e-8,
         liftoff_invar_weight: float = 0.0,
         phase_align_weight: float = 0.0,
-        uniformity_weight: float = 0.05,
+        var_weight: float = 1.0,
+        cov_weight: float = 1.0,
+        var_gamma: float = 1.0,
+        uniformity_weight: float = 0.0,
         uniformity_t: float = 2.0,
         uniformity_subsample: int = 1024,
-        norm_floor_weight: float = 0.1,
+        norm_floor_weight: float = 0.0,
         norm_floor_target: float = 1.0,
         **kwargs,
     ):
@@ -36,6 +40,9 @@ class JEPALoss5x5(nn.Module):
         self.eps = eps
         self.liftoff_invar_weight = liftoff_invar_weight
         self.phase_align_weight = phase_align_weight
+        self.var_weight = var_weight
+        self.cov_weight = cov_weight
+        self.var_gamma = var_gamma
         self.uniformity_weight = uniformity_weight
         self.uniformity_t = uniformity_t
         self.uniformity_subsample = uniformity_subsample
@@ -59,6 +66,37 @@ class JEPALoss5x5(nn.Module):
             return torch.mean(1.0 - torch.sum(pred * tgt, dim=-1))
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+    def variance_hinge(self, H_rep: torch.Tensor) -> torch.Tensor:
+        """
+        VICReg Variance Hinge Loss (Bardes et al., ICLR 2022).
+        L_var = (1/D) * sum_{d=1}^D max(0, gamma - std_b(z_{:, d}))
+        Forces batch variance along each dimension to be >= var_gamma (computed in FP32).
+        Acts as a rigid coordinate scale anchor in R^D, preventing EMA target encoder drift.
+        """
+        z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        B, N, D = z.shape
+        z = z.reshape(B * N, D)
+        safe_eps = max(self.eps, 1e-5)
+        var = torch.clamp(z.var(dim=0, unbiased=False), min=0.0)
+        std = torch.sqrt(var + safe_eps)
+        std = torch.nan_to_num(std, nan=0.0, posinf=self.var_gamma)
+        return torch.mean(F.relu(self.var_gamma - std))
+
+    def covariance_penalty(self, H_rep: torch.Tensor) -> torch.Tensor:
+        """
+        VICReg Covariance Decorrelation Loss (Bardes et al., ICLR 2022).
+        L_cov = (1/D) * sum_{i != j} [C(z)]_{ij}^2
+        Decorrelates embedding dimensions to prevent dimensional collapse and maximize representation capacity.
+        """
+        z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        B, N, D = z.shape
+        z = z.reshape(B * N, D)
+        z = z - z.mean(dim=0, keepdim=True)
+        cov = (z.T @ z) / max(1, z.shape[0] - 1)
+        off_diag = cov - torch.diag(torch.diag(cov))
+        cov_penalty = (off_diag ** 2).sum() / D
+        return torch.nan_to_num(cov_penalty, nan=0.0, posinf=10.0)
 
     def norm_floor_loss(self, H_rep: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -177,6 +215,15 @@ class JEPALoss5x5(nn.Module):
         if self.uniformity_weight > 0.0 and H_ctx is not None:
             l_unif = self.hypersphere_uniformity_loss(H_ctx)
 
+        # VICReg Coordinate-Wise Variance & Covariance Penalties
+        l_var = zero_loss
+        l_cov = zero_loss
+        if (self.var_weight > 0.0 or self.cov_weight > 0.0) and H_ctx is not None:
+            if self.var_weight > 0.0:
+                l_var = self.variance_hinge(H_ctx)
+            if self.cov_weight > 0.0:
+                l_cov = self.covariance_penalty(H_ctx)
+
         # Norm-Floor Barrier Loss (Anti Zero-Collapse)
         l_norm = zero_loss
         mean_norm = torch.tensor(1.0, device=H_pred.device, dtype=torch.float32)
@@ -187,6 +234,8 @@ class JEPALoss5x5(nn.Module):
             l_pred
             + self.liftoff_invar_weight * l_liftoff
             + self.phase_align_weight * l_phase
+            + self.var_weight * l_var
+            + self.cov_weight * l_cov
             + self.uniformity_weight * l_unif
             + self.norm_floor_weight * l_norm
         )
@@ -196,6 +245,8 @@ class JEPALoss5x5(nn.Module):
             "loss_pred": l_pred.detach(),
             "loss_liftoff": l_liftoff.detach(),
             "loss_phase": l_phase.detach(),
+            "loss_var": l_var.detach(),
+            "loss_cov": l_cov.detach(),
             "loss_unif": l_unif.detach(),
             "loss_norm": l_norm.detach(),
             "mean_norm": mean_norm.detach(),

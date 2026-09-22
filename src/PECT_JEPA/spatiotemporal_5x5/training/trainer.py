@@ -143,6 +143,8 @@ class Trainer5x5:
         total_pred = 0.0
         total_liftoff = 0.0
         total_phase = 0.0
+        total_var = 0.0
+        total_cov = 0.0
         total_unif = 0.0
         total_norm = 0.0
         total_mean_norm = 0.0
@@ -158,12 +160,12 @@ class Trainer5x5:
 
         for batch in pbar:
             x = batch["data"].to(self.device)
-
             lr = self.lr_scheduler.step(self.global_step)
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = lr
             momentum = self.momentum_scheduler.get_momentum(self.global_step)
 
-            self.optimizer.zero_grad()
-
+            self.optimizer.zero_grad(set_to_none=True)
             with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
                 loss_dict = self.model(x)
                 loss = loss_dict["loss"]
@@ -186,6 +188,8 @@ class Trainer5x5:
             pred_val = float(loss_dict["loss_pred"].item())
             liftoff_val = float(loss_dict.get("loss_liftoff", torch.tensor(0.0)).item())
             phase_val = float(loss_dict.get("loss_phase", torch.tensor(0.0)).item())
+            var_val = float(loss_dict.get("loss_var", torch.tensor(0.0)).item())
+            cov_val = float(loss_dict.get("loss_cov", torch.tensor(0.0)).item())
             unif_val = float(loss_dict.get("loss_unif", torch.tensor(0.0)).item())
             norm_val = float(loss_dict.get("loss_norm", torch.tensor(0.0)).item())
             mean_norm_val = float(loss_dict.get("mean_norm", torch.tensor(1.0)).item())
@@ -205,6 +209,8 @@ class Trainer5x5:
             total_pred += pred_val
             total_liftoff += liftoff_val
             total_phase += phase_val
+            total_var += var_val
+            total_cov += cov_val
             total_unif += unif_val
             total_norm += norm_val
             total_mean_norm += mean_norm_val
@@ -212,39 +218,51 @@ class Trainer5x5:
             n_batches += 1
 
             if self.logger:
+                step_metrics = {
+                    "loss": loss_val,
+                    "loss_pred": pred_val,
+                    "loss_liftoff": liftoff_val,
+                    "loss_phase": phase_val,
+                    "loss_unif": unif_val,
+                    "loss_norm": norm_val,
+                    "mean_norm": mean_norm_val,
+                    "inter_cos": inter_cos_val,
+                    "lr": lr,
+                    "momentum": momentum,
+                    "grad_norm": grad_norm,
+                }
+                if var_val > 0.0 or getattr(self.config, "var_weight", 0.0) > 0.0:
+                    step_metrics["loss_var"] = var_val
+                if cov_val > 0.0 or getattr(self.config, "cov_weight", 0.0) > 0.0:
+                    step_metrics["loss_cov"] = cov_val
                 self.logger.log_step(
                     step=self.global_step,
-                    metrics={
-                        "loss": loss_val,
-                        "loss_pred": pred_val,
-                        "loss_liftoff": liftoff_val,
-                        "loss_phase": phase_val,
-                        "loss_unif": unif_val,
-                        "loss_norm": norm_val,
-                        "mean_norm": mean_norm_val,
-                        "inter_cos": inter_cos_val,
-                        "lr": lr,
-                        "momentum": momentum,
-                        "grad_norm": grad_norm,
-                    },
+                    metrics=step_metrics,
                     epoch=self.current_epoch + 1
                 )
 
             self.global_step += 1
 
-            pbar.set_postfix({
+            postfix = {
                 "loss": f"{loss_val:.4f}",
                 "pred": f"{pred_val:.4f}",
+            }
+            if var_val > 0.0:
+                postfix["var"] = f"{var_val:.3f}"
+            postfix.update({
                 "norm": f"{mean_norm_val:.2f}",
                 "cos": f"{inter_cos_val:.3f}",
                 "lr": f"{lr:.1e}"
             })
+            pbar.set_postfix(postfix)
 
         metrics = {
             "loss": total_loss / max(1, n_batches),
             "loss_pred": total_pred / max(1, n_batches),
             "loss_liftoff": total_liftoff / max(1, n_batches),
             "loss_phase": total_phase / max(1, n_batches),
+            "loss_var": total_var / max(1, n_batches),
+            "loss_cov": total_cov / max(1, n_batches),
             "loss_unif": total_unif / max(1, n_batches),
             "loss_norm": total_norm / max(1, n_batches),
             "mean_norm": total_mean_norm / max(1, n_batches),
@@ -719,14 +737,19 @@ class Trainer5x5:
                     print(msg_best)
             else:
                 patience = getattr(self.config, "early_stopping_patience", 0)
+                early_stop_warmup = getattr(self.config, "early_stopping_warmup", 0)
+                in_warmup = (epoch + 1) <= early_stop_warmup
                 if patience > 0:
-                    self.patience_counter += 1
-                    msg_patience = f"  --> Early stopping patience: {self.patience_counter}/{patience} ({metric_info})"
+                    if in_warmup:
+                        msg_patience = f"  --> Warmup phase (Epoch {epoch + 1}/{early_stop_warmup}): early stopping patience paused ({metric_info})"
+                    else:
+                        self.patience_counter += 1
+                        msg_patience = f"  --> Early stopping patience: {self.patience_counter}/{patience} ({metric_info})"
                     if self.logger:
                         self.logger.info(msg_patience)
                     else:
                         print(msg_patience)
-                    if self.patience_counter >= patience:
+                    if not in_warmup and self.patience_counter >= patience:
                         msg_stop = f"[Early Stopping] Monitored metric '{monitor_metric}' did not improve for {patience} consecutive epochs ({metric_info}). Stopping training at Epoch {epoch + 1}."
                         if self.logger:
                             self.logger.info(msg_stop)

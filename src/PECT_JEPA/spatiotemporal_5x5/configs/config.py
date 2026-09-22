@@ -66,9 +66,10 @@ class Spatiotemporal5x5Config:
     loss_type: str = "l1"                # Pure I-JEPA L1 loss (preserves non-vanishing unit gradient)
     liftoff_invar_weight: float = 0.05   # Lift-off invariance loss weight (decouples lift-off from depth)
     phase_align_weight: float = 0.05     # Phase-depth monotonicity loss weight (enforces monotonic depth manifold)
-    var_weight: float = 0.0              # Deprecated (VICReg removed in favor of Hypersphere Uniformity)
-    cov_weight: float = 0.0              # Deprecated (VICReg removed in favor of Hypersphere Uniformity)
-    uniformity_weight: float = 0.05      # Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020)
+    var_weight: float = 1.0              # VICReg coordinate-wise variance hinge weight (Bardes et al., ICLR 2022)
+    cov_weight: float = 1.0              # VICReg covariance decorrelation penalty weight (Bardes et al., ICLR 2022)
+    var_gamma: float = 1.0               # VICReg target standard deviation threshold gamma (anchors coordinate scale)
+    uniformity_weight: float = 0.0       # Hypersphere Uniformity loss weight (0.0 to prevent artificial repulsion of sound metal)
     uniformity_t: float = 2.0            # Gaussian potential parameter t for hypersphere uniformity
     uniformity_subsample: int = 1024     # Subsample size for stable, memory-efficient pairwise similarity
     norm_floor_weight: float = 0.1       # Norm Floor Barrier weight to prevent zero-vector collapse (||z|| >= target)
@@ -100,6 +101,7 @@ class Spatiotemporal5x5Config:
     diagnostics_interval: int = 1        # Run physics-grounded training diagnostics every N epochs (0 to disable)
     early_stopping_metric: str = "val_loss_pred"  # 'val_loss_pred' | 'val_loss'
     early_stopping_patience: int = 10    # Stop training early if monitored metric fails to improve for N epochs (0 = disabled)
+    early_stopping_warmup: int = 0       # Grace period: pause early stopping patience counter during first N epochs (0 = disabled)
     seed: int = 42
     resume: Optional[str] = None         # Checkpoint path or 'latest' / 'auto' / 'best' to resume from
 

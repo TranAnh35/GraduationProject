@@ -203,6 +203,48 @@ class TestPhysicsOperatorAndLosses(unittest.TestCase):
         self.assertIsNotNone(model.predictor.raw_gamma.grad)
         self.assertIsNotNone(model.predictor.raw_beta.grad)
 
+    def test_vicreg_variance_and_covariance_mechanics(self):
+        loss_fn = JEPALoss5x5(
+            loss_type="l1",
+            var_weight=1.0,
+            cov_weight=1.0,
+            var_gamma=1.0,
+        )
+        B, N, D = 4, 16, 64
+
+        # 1. Collapsed representations (zero variance across batch)
+        # All points are identical constant vector -> std = 0 -> variance hinge must equal gamma = 1.0
+        H_collapsed = torch.ones(B, N, D, requires_grad=True)
+        var_loss = loss_fn.variance_hinge(H_collapsed)
+        self.assertAlmostEqual(var_loss.item(), 1.0, places=2)
+
+        # 2. High variance representations (std >= 1.0) -> hinge loss must equal 0.0
+        H_high_var = 5.0 * torch.randn(B, N, D)
+        var_loss_high = loss_fn.variance_hinge(H_high_var)
+        self.assertAlmostEqual(var_loss_high.item(), 0.0, places=2)
+
+        # 3. Covariance penalty on perfectly correlated features
+        # All 64 channels identical -> off-diagonal covariance is large
+        z_base = torch.randn(B * N, 1)
+        H_corr = z_base.expand(B * N, D).reshape(B, N, D)
+        cov_loss_corr = loss_fn.covariance_penalty(H_corr)
+        self.assertGreater(cov_loss_corr.item(), 1.0)
+
+        # 4. Forward with VICReg active
+        H_pred = torch.randn(B, 10, D, requires_grad=True)
+        H_tgt = torch.randn(B, 10, D)
+        H_ctx = torch.randn(B, N, D, requires_grad=True)
+        out = loss_fn(H_pred=H_pred, H_target=H_tgt, H_ctx=H_ctx)
+
+        self.assertIn("loss_var", out)
+        self.assertIn("loss_cov", out)
+        self.assertGreater(out["loss_var"].item(), 0.0)
+        self.assertGreater(out["loss_cov"].item(), 0.0)
+
+        out["loss"].backward()
+        self.assertIsNotNone(H_ctx.grad)
+        self.assertGreater(H_ctx.grad.abs().sum().item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

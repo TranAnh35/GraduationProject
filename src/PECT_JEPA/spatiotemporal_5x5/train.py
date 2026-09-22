@@ -95,8 +95,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
     p.add_argument("--loss_type", type=str, default="l1", choices=["l1", "smooth_l1", "l2", "cosine"],
                    help="JEPA latent prediction loss function (default: l1)")
-    p.add_argument("--uniformity_weight", type=float, default=0.05,
-                   help="Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020, default: 0.05)")
+    p.add_argument("--var_weight", type=float, default=1.0,
+                   help="VICReg coordinate-wise variance hinge weight (Bardes et al., ICLR 2022, default: 1.0)")
+    p.add_argument("--cov_weight", type=float, default=1.0,
+                   help="VICReg covariance decorrelation penalty weight (Bardes et al., ICLR 2022, default: 1.0)")
+    p.add_argument("--var_gamma", type=float, default=1.0,
+                   help="VICReg target standard deviation threshold gamma (anchors coordinate scale, default: 1.0)")
+    p.add_argument("--uniformity_weight", type=float, default=0.0,
+                   help="Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020, default: 0.0)")
     p.add_argument("--uniformity_t", type=float, default=2.0,
                    help="Gaussian potential parameter t for hypersphere uniformity (default: 2.0)")
     p.add_argument("--uniformity_subsample", type=int, default=1024,
@@ -172,6 +178,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Metric to monitor for early stopping and best checkpoint saving (default: val_loss_pred)")
     p.add_argument("--early_stopping_patience", type=int, default=10,
                    help="Stop training early if monitored metric fails to improve for N epochs (default: 10; 0 = disabled)")
+    p.add_argument("--early_stopping_warmup", type=int, default=5,
+                   help="Number of initial epochs during which early stopping patience counter is paused (default: 5)")
     p.add_argument("--eval_after_train", type=lambda v: v.lower() == "true", default=False,
                    help="Automatically run downstream evaluation suite immediately after training completes")
     p.add_argument("--resume", type=str, default=None,
@@ -202,11 +210,17 @@ def main():
         loss_type=args.loss_type,
         liftoff_invar_weight=args.liftoff_invar_weight,
         phase_align_weight=args.phase_align_weight,
+        var_weight=args.var_weight,
+        cov_weight=args.cov_weight,
+        var_gamma=args.var_gamma,
         uniformity_weight=args.uniformity_weight,
         uniformity_t=args.uniformity_t,
         uniformity_subsample=args.uniformity_subsample,
         norm_floor_weight=args.norm_floor_weight,
         norm_floor_target=args.norm_floor_target,
+        early_stopping_metric=args.early_stopping_metric,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_warmup=args.early_stopping_warmup,
         ema_momentum=args.ema_momentum,
         ema_momentum_end=args.ema_momentum_end,
         tokenizer_type=args.tokenizer_type,
@@ -234,8 +248,6 @@ def main():
         wandb_entity=args.wandb_entity,
         log_histograms=args.log_histograms,
         diagnostics_interval=args.diagnostics_interval,
-        early_stopping_metric=args.early_stopping_metric,
-        early_stopping_patience=args.early_stopping_patience,
         resume=args.resume,
     )
 
