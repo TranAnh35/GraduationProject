@@ -260,13 +260,14 @@ def plot_foundation_diagnostics_dashboard(
 
     if attn_maps is not None and attn_maps.ndim == 3:
         num_heads = min(4, attn_maps.shape[0])
-        sub_grid = fig.add_subfigure(axes[1, 1].get_subplotspec())
-        sub_axes = sub_grid.subplots(1, num_heads)
-        if num_heads == 1:
-            sub_axes = [sub_axes]
+        # Position sub-axes natively inside ax4 using inset_axes (100% compatible with tight_layout)
+        width = 0.84 / num_heads
+        gap = 0.10 / max(1, num_heads - 1) if num_heads > 1 else 0.0
 
+        im_h = None
         for h in range(num_heads):
-            s_ax = sub_axes[h]
+            left = 0.08 + h * (width + gap)
+            s_ax = ax4.inset_axes([left, 0.28, width, 0.62])
             h_map = attn_maps[h]
             im_h = s_ax.imshow(h_map, cmap="viridis", vmin=0.0, vmax=max(0.15, float(np.max(h_map))))
             s_ax.plot(2, 2, "r*", markersize=7)  # center marker
@@ -274,8 +275,10 @@ def plot_foundation_diagnostics_dashboard(
             s_ax.set_xticks([])
             s_ax.set_yticks([])
 
-        cbar_h = sub_grid.colorbar(im_h, ax=sub_axes, orientation="horizontal", fraction=0.08, pad=0.15)
-        cbar_h.set_label("Attention Weight (Normalized)", fontsize=8)
+        if im_h is not None:
+            cax = ax4.inset_axes([0.15, 0.08, 0.70, 0.07])
+            cbar_h = fig.colorbar(im_h, cax=cax, orientation="horizontal")
+            cbar_h.set_label("Attention Weight (Normalized)", fontsize=8)
     else:
         ax4.text(0.5, 0.5, "Attention Maps Available on Encoder Evaluation", ha="center", va="center")
 
