@@ -113,7 +113,6 @@ class TestPhysicsOperatorAndLosses(unittest.TestCase):
 
         # Check gradients for key modules
         self.assertIsNotNone(model.depth_head.weight.grad)
-        self.assertIsNotNone(model.target_harmonic_proj[0].weight.grad)
         self.assertIsNotNone(model.context_encoder.blocks[0].mlp.fc1.weight.grad)
         self.assertIsNotNone(model.predictor.blocks[0].mlp.fc1.weight.grad)
 

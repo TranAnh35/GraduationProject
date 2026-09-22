@@ -359,12 +359,164 @@ class DualDomainAttentionTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class DualScaleDiffusionTokenizer5x5(nn.Module):
+    """
+    Dual-Scale Spatiotemporal-Diffusion Tokenizer for 5x5 PECT-JEPA.
+
+    Transforms the C-channel waveform at each spatial coordinate (i, j)
+    into TWO distinct physical tokens of dimension D:
+      1. Token Shallow: High-frequency / Surface diffusion regime (skin depth delta small).
+         Captures surface interaction, lift-off distance h, and surface defect reflections.
+      2. Token Deep: Low-frequency / Bulk diffusion regime (skin depth delta large).
+         Captures deep eddy current penetration, wall thickness, and deep defect reflections.
+
+    Key Features:
+      - Uses global nn.Linear(in_channels, embed_dim) for temporal projection (preserving global dynamics).
+      - Uses Adaptive Energy-Weighted Spectral Embedding to completely eliminate empty noise bins.
+      - Total tokens = grid_size * grid_size * 2 = 25 * 2 = 50 tokens.
+      - Positional embedding combines 2D spatial coordinate pos_embed with learnable scale embeddings
+        (scale_shallow and scale_deep).
+
+    Input: [B, 5, 5, C] -> Output: tokens [B, 50, D], pos [B, 50, D]
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_tokens = self.num_spatial * 2    # 50
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+
+        # 1. Global Temporal Projection (nn.Linear without restrictive inductive bias)
+        self.time_proj = nn.Linear(in_channels, embed_dim)
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Spectral Projections for Deep (low freq) and Shallow (high freq)
+        self.split_bin = min(4, max(1, self.num_freq_bins // 2))
+        self.proj_deep = nn.Linear(2, embed_dim)
+        self.proj_shallow = nn.Linear(2, embed_dim)
+        self.ln_deep = nn.LayerNorm(embed_dim)
+        self.ln_shallow = nn.LayerNorm(embed_dim)
+
+        # 3. Learnable Scale / Diffusion Regime Embeddings
+        self.scale_shallow = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.scale_deep = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.scale_shallow, std=0.02)
+        nn.init.trunc_normal_(self.scale_deep, std=0.02)
+
+        # 4. Spatial Positional Embedding (2D)
+        if pos_embed_type == "learnable_2d":
+            self.spatial_pos_embed = nn.Parameter(torch.zeros(1, self.num_spatial, embed_dim))
+            nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("spatial_pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    @staticmethod
+    def compute_energy_weighted_phase(x: torch.Tensor, num_bins: int = 14) -> torch.Tensor:
+        """
+        Computes the global Energy-Weighted Spectral Phase (Phi_EWP) for each pixel.
+        Phi_EWP = sum_k w_k * phi_k where w_k = |X_k|^2 / sum(|X_m|^2)
+        Returns: [B, 25] in [-1, 1]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        x_flat = x.reshape(B * H * W, C).float()
+        X_fft = torch.fft.rfft(x_flat, dim=-1)[:, 1:num_bins + 1]
+        mags = torch.abs(X_fft)
+        phases = torch.angle(X_fft) / torch.pi
+        pwr = mags ** 2
+        weights = pwr / (torch.sum(pwr, dim=-1, keepdim=True) + 1e-12)
+        ew_phase = torch.sum(weights * phases, dim=-1)
+        return ew_phase.reshape(B, H * W).to(x.dtype)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_flat = x.reshape(B * self.num_spatial, C)
+
+        # 1. Temporal branch
+        z_time = self.ln_time(self.time_proj(x_flat))  # [B*25, D]
+
+        # 2. Spectral branch via FFT
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)[:, 1:self.num_freq_bins + 1]  # [B*25, K]
+        mags = torch.abs(X_fft)  # [B*25, K]
+        phases = torch.angle(X_fft) / torch.pi  # [B*25, K] in [-1, 1]
+        pwr = mags ** 2  # [B*25, K]
+
+        # Deep bins: 0 .. split_bin
+        pwr_deep = pwr[:, :self.split_bin]
+        w_deep = pwr_deep / (torch.sum(pwr_deep, dim=-1, keepdim=True) + 1e-12)
+        feat_deep = torch.sum(
+            w_deep.unsqueeze(-1) * torch.stack([phases[:, :self.split_bin], torch.log1p(mags[:, :self.split_bin])], dim=-1),
+            dim=1
+        ).to(x_flat.dtype)  # [B*25, 2]
+        z_freq_deep = self.proj_deep(feat_deep)  # [B*25, D]
+
+        # Shallow bins: split_bin .. K
+        pwr_shallow = pwr[:, self.split_bin:]
+        w_shallow = pwr_shallow / (torch.sum(pwr_shallow, dim=-1, keepdim=True) + 1e-12)
+        feat_shallow = torch.sum(
+            w_shallow.unsqueeze(-1) * torch.stack([phases[:, self.split_bin:], torch.log1p(mags[:, self.split_bin:])], dim=-1),
+            dim=1
+        ).to(x_flat.dtype)  # [B*25, 2]
+        z_freq_shallow = self.proj_shallow(feat_shallow)  # [B*25, D]
+
+        # 3. Fuse into Token Shallow and Token Deep
+        t_shallow = self.ln_shallow(z_time + z_freq_shallow)  # [B*25, D]
+        t_deep = self.ln_deep(z_time + z_freq_deep)           # [B*25, D]
+
+        t_shallow = t_shallow.reshape(B, self.num_spatial, self.embed_dim)
+        t_deep = t_deep.reshape(B, self.num_spatial, self.embed_dim)
+
+        # 4. Interleave into 50 tokens: [shallow_0, deep_0, shallow_1, deep_1, ...]
+        tokens = torch.stack([t_shallow, t_deep], dim=2).reshape(B, self.num_tokens, self.embed_dim)
+        tokens = self.drop(tokens)
+
+        # 5. Positional Embeddings: Spatial Pos + Scale Embedding
+        sp_pos = self.spatial_pos_embed.expand(B, -1, -1)  # [B, 25, D]
+        pos_shallow = sp_pos + self.scale_shallow          # [B, 25, D]
+        pos_deep = sp_pos + self.scale_deep                # [B, 25, D]
+        pos = torch.stack([pos_shallow, pos_deep], dim=2).reshape(B, self.num_tokens, self.embed_dim)
+
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "dual_domain_attention")
-    if tokenizer_type == "dual_domain_attention":
+    tokenizer_type = getattr(config, "tokenizer_type", "dual_scale_diffusion")
+    if tokenizer_type in ("dual_scale_diffusion", "dual_scale"):
+        return DualScaleDiffusionTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type == "dual_domain_attention":
         return DualDomainAttentionTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
@@ -399,3 +551,4 @@ def build_tokenizer_5x5(config) -> nn.Module:
         )
     else:
         raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")
+

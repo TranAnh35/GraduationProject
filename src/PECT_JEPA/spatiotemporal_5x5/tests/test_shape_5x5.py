@@ -40,7 +40,7 @@ class TestShape5x5(unittest.TestCase):
         N_tgt = out["target_indices"].shape[1]
         N_ctx = out["context_indices"].shape[1]
 
-        self.assertEqual(N_tgt + N_ctx, 25)
+        self.assertEqual(N_tgt + N_ctx, self.model.tokenizer.num_tokens)
         self.assertEqual(out["H_pred"].shape, (B, N_tgt, 128))
         self.assertEqual(out["H_tgt"].shape, (B, N_tgt, 128))
         self.assertEqual(out["H_ctx"].shape, (B, N_ctx, 128))

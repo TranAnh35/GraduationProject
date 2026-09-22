@@ -10,11 +10,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..configs.config import Spatiotemporal5x5Config, get_default_config_5x5
-from .tokenizer_5x5 import SpatialGridTokenizer5x5, DualDomainGridTokenizer5x5, DualDomainAttentionTokenizer5x5, build_tokenizer_5x5
+from .tokenizer_5x5 import (
+    DualScaleDiffusionTokenizer5x5,
+    SpatialGridTokenizer5x5,
+    DualDomainGridTokenizer5x5,
+    DualDomainAttentionTokenizer5x5,
+    build_tokenizer_5x5,
+)
 from .context_encoder import ContextEncoder5x5
 from .target_encoder import TargetEncoder5x5
 from .predictor import Predictor5x5, OperatorDiffusionPredictor5x5, build_predictor_5x5
-from ..masking.cluster_mask import ContiguousClusterMasker5x5
+from ..masking.cluster_mask import (
+    build_masker_5x5,
+    ContiguousClusterMasker5x5,
+    SpatiotemporalDiffusionMasker5x5,
+)
 from ..losses.jepa_loss import JEPALoss5x5
 
 
@@ -30,15 +40,11 @@ class PECT_JEPA_5x5(nn.Module):
             config = get_default_config_5x5()
         self.config = config
 
-        # 1. Tokenizer (Dual-Domain Spatiotemporal-Spectral or Time-Only)
+        # 1. Tokenizer (Dual-Scale Diffusion, Dual-Domain Attention, or Time-Only)
         self.tokenizer = build_tokenizer_5x5(config)
 
-        # 2. Contiguous Cluster Masker
-        self.masker = ContiguousClusterMasker5x5(
-            min_masked=config.min_masked,
-            max_masked=config.max_masked,
-            grid_size=config.grid_size
-        )
+        # 2. Masker (Spatiotemporal Diffusion 3D or Contiguous Cluster 2D)
+        self.masker = build_masker_5x5(config)
 
         # 3. Context Encoder
         self.context_encoder = ContextEncoder5x5(
@@ -120,14 +126,15 @@ class PECT_JEPA_5x5(nn.Module):
         B = x.shape[0]
         device = x.device
 
-        # 1. Tokenization -> tokens [B, 25, D], pos [B, 25, D]
+        # 1. Tokenization -> tokens [B, N_total, D], pos [B, N_total, D] (N_total is 50 for dual_scale or 25)
         tokens, pos = self.tokenizer(x)
+        N_total = tokens.shape[1]
 
         # 2. Sample or use custom mask
         if custom_context_indices is not None and custom_target_indices is not None:
             context_indices = custom_context_indices.to(device)
             target_indices = custom_target_indices.to(device)
-            mask_bool = torch.zeros(B, self.config.grid_size * self.config.grid_size, dtype=torch.bool, device=device)
+            mask_bool = torch.zeros(B, N_total, dtype=torch.bool, device=device)
             mask_bool.scatter_(1, target_indices, True)
         else:
             context_indices, target_indices, mask_bool = self.masker.sample_mask(B, device=device)
@@ -142,37 +149,16 @@ class PECT_JEPA_5x5(nn.Module):
         # 4. Context Encoder (only sees visible context tokens)
         H_ctx = self.context_encoder(context_tokens, context_pos)
 
-        # 5. Predictor (Physics Operator Diffusion Predictor or Standard)
+        # 5. Predictor (Predicts target representation from context and target queries)
         is_operator_diff = hasattr(self.predictor, "op_embedding") and getattr(self.config, "predictor_type", "") == "operator_diffusion"
         if is_operator_diff:
-            if freq_condition is None:
-                if self.training:
-                    freq_condition = torch.randint(1, getattr(self.config, "num_freq_bins", 14) + 1, (B,), device=device)
-                else:
-                    freq_condition = None
             H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos, freq_condition=freq_condition)
         else:
             H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos)
 
-        # 6. Target Encoder (EMA, detached)
+        # 6. Target Encoder (EMA, detached - Pure Clean Physical Representation)
         with torch.no_grad():
-            H_tgt_base = self.target_encoder(target_tokens, target_pos)
-
-        # 6b. Frequency-Resolved Target for Operator Diffusion JEPA
-        if is_operator_diff and freq_condition is not None:
-            # Extract harmonic feature (phase & log-magnitude) of harmonic k at target locations
-            x_flat = x.reshape(B, self.config.grid_size * self.config.grid_size, self.config.in_channels)
-            x_tgt_raw = x_flat[batch_arange, target_indices]  # [B, N_tgt, C]
-            X_tgt_fft = torch.fft.rfft(x_tgt_raw.float(), dim=-1)  # [B, N_tgt, C//2 + 1]
-            k_expand = freq_condition.view(B, 1, 1).expand(-1, target_indices.shape[1], 1)
-            X_k = torch.gather(X_tgt_fft, dim=-1, index=k_expand).squeeze(-1)  # [B, N_tgt]
-            phase_k = torch.angle(X_k) / torch.pi
-            mag_k = torch.log1p(torch.abs(X_k))
-            harm_feat = torch.stack([phase_k, mag_k], dim=-1)  # [B, N_tgt, 2]
-            harm_emb = self.target_harmonic_proj(harm_feat)  # [B, N_tgt, D]
-            H_tgt = F.layer_norm(H_tgt_base + harm_emb, (self.config.embed_dim,))
-        else:
-            H_tgt = H_tgt_base
+            H_tgt = self.target_encoder(target_tokens, target_pos)
 
         # 7a. Compute Lift-Off Perturbation (if liftoff_invar_weight > 0)
         H_ctx_pert = None
@@ -187,14 +173,16 @@ class PECT_JEPA_5x5(nn.Module):
             context_tokens_pert = tokens_pert[batch_arange, context_indices]
             H_ctx_pert = self.context_encoder(context_tokens_pert, context_pos)
 
-        # 7b. Compute Fundamental Harmonic Phase for Phase-Depth Alignment (if phase_align_weight > 0)
+        # 7b. Compute Energy-Weighted Spectral Phase for Phase-Depth Alignment (if phase_align_weight > 0)
         z_depth = None
         phase_ctx = None
         if getattr(self.config, "phase_align_weight", 0.0) > 0.0:
-            x_flat = x.reshape(B, self.config.grid_size * self.config.grid_size, self.config.in_channels)
-            X_fft = torch.fft.rfft(x_flat.float(), dim=-1)
-            phase_1 = torch.angle(X_fft[:, :, 1]) / torch.pi  # [B, 25] in [-1, 1]
-            phase_ctx = phase_1[batch_arange, context_indices]  # [B, N_ctx]
+            phi_ewp = DualScaleDiffusionTokenizer5x5.compute_energy_weighted_phase(
+                x, num_bins=getattr(self.config, "num_freq_bins", 14)
+            )  # [B, 25] in [-1, 1]
+            # Map context token indices to spatial grid indices (if 50 tokens: idx // 2, else idx)
+            spatial_idx = (context_indices // 2) if N_total == 50 else context_indices
+            phase_ctx = torch.gather(phi_ewp, dim=1, index=spatial_idx)  # [B, N_ctx]
             z_depth = self.depth_head(H_ctx).squeeze(-1)  # [B, N_ctx]
 
         # 7c. Compute Combined JEPA Loss
@@ -226,9 +214,13 @@ class PECT_JEPA_5x5(nn.Module):
             x = x.unsqueeze(0)
         B = x.shape[0]
         tokens, pos = self.tokenizer(x)
-        H = self.context_encoder(tokens, pos)  # [B, 25, D]
-        center_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)  # index 12
-        return H[:, center_idx, :]  # [B, D]
+        H = self.context_encoder(tokens, pos)  # [B, N_total, D]
+        if tokens.shape[1] == 50:
+            # Center spatial pixel is index 12 -> shallow is 24, deep is 25
+            return 0.5 * (H[:, 24, :] + H[:, 25, :])  # [B, D]
+        else:
+            center_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)  # index 12
+            return H[:, center_idx, :]  # [B, D]
 
     @torch.no_grad()
     def extract_all_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -239,13 +231,18 @@ class PECT_JEPA_5x5(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(0)
         tokens, pos = self.tokenizer(x)
-        return self.context_encoder(tokens, pos)
+        H = self.context_encoder(tokens, pos)  # [B, N_total, D]
+        if tokens.shape[1] == 50:
+            # Average shallow and deep tokens for each of the 25 spatial points
+            return 0.5 * (H[:, 0::2, :] + H[:, 1::2, :])  # [B, 25, D]
+        else:
+            return H  # [B, 25, D]
 
     @torch.no_grad()
     def extract_attention_map(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         """
         Extract self-attention weights from the final Context Encoder block.
-        Input: [B, 5, 5, C] -> Output: [B, num_heads, 25, 25]
+        Input: [B, 5, 5, C] -> Output: [B, num_heads, N_total, N_total]
         """
         if x.ndim == 3:
             x = x.unsqueeze(0)

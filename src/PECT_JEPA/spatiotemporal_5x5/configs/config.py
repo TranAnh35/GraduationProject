@@ -34,11 +34,14 @@ class Spatiotemporal5x5Config:
     max_files: Optional[int] = None
 
     # --------------------------------------------------------------- Masking
-    min_masked: int = 10                # 40% of 25 tokens
-    max_masked: int = 15                # 60% of 25 tokens
+    masker_type: str = "spatiotemporal_diffusion" # 'spatiotemporal_diffusion' (3D Space+Diffusion) | 'contiguous_cluster' (2D)
+    min_masked: int = 10                # Backward compatibility alias
+    max_masked: int = 15                # Backward compatibility alias
+    num_spatial_cluster: int = 8        # Number of spatial grid points in cluster (x2 tokens = 16 tokens)
+    num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (8 tokens) -> Total 24 targets, 26 context
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (Pure Multi-Head Attention Fusion) | 'dual_domain' | 'time_only'
+    tokenizer_type: str = "dual_scale_diffusion" # 'dual_scale_diffusion' (Shallow vs Deep 50 tokens) | 'dual_domain_attention' | 'dual_domain' | 'time_only'
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
@@ -48,7 +51,7 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "operator_diffusion" # 'operator_diffusion' (Harmonic Helmholtz Diffusion Predictor) | 'standard'
+    predictor_type: str = "standard"    # 'standard' (Clean Spatiotemporal Predictor) | 'operator_diffusion'
     predictor_depth: int = 2
     predictor_heads: int = 4
     mlp_ratio: float = 4.0

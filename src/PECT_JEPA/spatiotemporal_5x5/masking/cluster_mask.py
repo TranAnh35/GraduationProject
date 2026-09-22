@@ -201,3 +201,136 @@ class ContiguousClusterMasker5x5:
         target_indices = torch.tensor(tgt_all, dtype=torch.long, device=device)
         mask_bool = torch.from_numpy(mask_grid_all).to(device)
         return context_indices, target_indices, mask_bool
+
+
+class SpatiotemporalDiffusionMasker5x5:
+    """
+    3D Spatiotemporal-Diffusion Masker for 5x5 PECT-JEPA (50 tokens: 25 spatial x 2 scales).
+
+    Combines:
+      1. Spatial Cluster Masking:
+         Selects a contiguous cluster of `num_spatial_cluster` points (default 8) on the 5x5 grid
+         using random-walk neighbor expansion.
+         For these spatial points, BOTH Shallow and Deep tokens are masked (8 * 2 = 16 tokens).
+         Forces the Predictor to learn lateral eddy current deflection around defects.
+      2. Cross-Diffusion Masking:
+         From the remaining (25 - num_spatial_cluster) points, selects `num_cross_diffusion` points (default 8).
+         For these points, ONLY the Deep token is masked, keeping the Shallow (surface) token visible!
+         Forces the Predictor to learn the electromagnetic diffusion Green's function from surface to depth.
+         Breaks the spatial copying shortcut on sound metal (since shallow != deep).
+
+    Total tokens: 50.
+    Total targets: num_spatial_cluster * 2 + num_cross_diffusion = 16 + 8 = 24 tokens (48%).
+    Total context: 50 - 24 = 26 tokens (52%).
+    Outputs rectangular, non-ragged tensors: [B, 26] and [B, 24].
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 5,
+        num_spatial_cluster: int = 8,
+        num_cross_diffusion: int = 8,
+    ):
+        self.grid_size = grid_size
+        self.total_spatial = grid_size * grid_size  # 25
+        self.total_tokens = self.total_spatial * 2  # 50
+        self.num_spatial_cluster = min(num_spatial_cluster, self.total_spatial - 2)
+        self.num_cross_diffusion = min(num_cross_diffusion, self.total_spatial - self.num_spatial_cluster)
+        self.num_tgt = self.num_spatial_cluster * 2 + self.num_cross_diffusion
+        self.num_ctx = self.total_tokens - self.num_tgt
+
+    def _get_neighbors(self, x: int, y: int) -> List[Tuple[int, int]]:
+        nbs = []
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
+                nbs.append((nx, ny))
+        return nbs
+
+    def sample_one(self, rng: random.Random) -> Tuple[List[int], List[int]]:
+        all_pts = [(i, j) for i in range(self.grid_size) for j in range(self.grid_size)]
+        sx = rng.randint(0, self.grid_size - 1)
+        sy = rng.randint(0, self.grid_size - 1)
+        cluster: Set[Tuple[int, int]] = {(sx, sy)}
+        frontier: List[Tuple[int, int]] = self._get_neighbors(sx, sy)
+
+        # 1. Random walk cluster expansion
+        while len(cluster) < self.num_spatial_cluster and frontier:
+            idx = rng.randint(0, len(frontier) - 1)
+            cx, cy = frontier.pop(idx)
+            if (cx, cy) not in cluster:
+                cluster.add((cx, cy))
+                for nb in self._get_neighbors(cx, cy):
+                    if nb not in cluster and nb not in frontier:
+                        frontier.append(nb)
+
+        # If frontier exhausted early, fill from remaining
+        remaining = [p for p in all_pts if p not in cluster]
+        while len(cluster) < self.num_spatial_cluster and remaining:
+            p = remaining.pop(rng.randint(0, len(remaining) - 1))
+            cluster.add(p)
+
+        # Target tokens from spatial cluster (both shallow and deep)
+        tgt_tokens: List[int] = []
+        for (x, y) in cluster:
+            sp_idx = x * self.grid_size + y
+            tgt_tokens.append(sp_idx * 2)      # shallow token
+            tgt_tokens.append(sp_idx * 2 + 1)  # deep token
+
+        # 2. Cross-diffusion masking on remaining visible spatial points
+        remaining_pts = [p for p in all_pts if p not in cluster]
+        cross_pts = rng.sample(remaining_pts, min(self.num_cross_diffusion, len(remaining_pts)))
+        for (x, y) in cross_pts:
+            sp_idx = x * self.grid_size + y
+            tgt_tokens.append(sp_idx * 2 + 1)  # mask deep token only
+
+        tgt_set = set(tgt_tokens)
+        ctx_tokens = [i for i in range(self.total_tokens) if i not in tgt_set]
+
+        return sorted(ctx_tokens), sorted(tgt_tokens)
+
+    def sample_mask(
+        self,
+        batch_size: int,
+        device: torch.device = torch.device("cpu"),
+        seed: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ctx_all = []
+        tgt_all = []
+        mask_grid_all = np.zeros((batch_size, self.total_tokens), dtype=bool)
+
+        for b in range(batch_size):
+            sub_rng = random.Random(seed * 10007 + b) if seed is not None else random.Random()
+            ctx, tgt = self.sample_one(sub_rng)
+            ctx_all.append(ctx)
+            tgt_all.append(tgt)
+            mask_grid_all[b, tgt] = True
+
+        context_indices = torch.tensor(ctx_all, dtype=torch.long, device=device)
+        target_indices = torch.tensor(tgt_all, dtype=torch.long, device=device)
+        mask_bool = torch.from_numpy(mask_grid_all).to(device)
+        return context_indices, target_indices, mask_bool
+
+
+def build_masker_5x5(config):
+    """
+    Factory function to construct masker based on config and tokenizer type.
+    If tokenizer produces 50 tokens (dual_scale_diffusion), returns SpatiotemporalDiffusionMasker5x5.
+    If tokenizer produces 25 tokens (dual_domain_attention, time_only, etc.), returns ContiguousClusterMasker5x5.
+    """
+    tokenizer_type = getattr(config, "tokenizer_type", "dual_scale_diffusion")
+    masker_type = getattr(config, "masker_type", "auto")
+
+    if tokenizer_type in ("dual_scale_diffusion", "dual_scale") and masker_type != "contiguous_cluster":
+        return SpatiotemporalDiffusionMasker5x5(
+            grid_size=config.grid_size,
+            num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
+            num_cross_diffusion=getattr(config, "num_cross_diffusion", 8),
+        )
+    else:
+        return ContiguousClusterMasker5x5(
+            min_masked=config.min_masked,
+            max_masked=config.max_masked,
+            grid_size=config.grid_size,
+        )
+

@@ -47,14 +47,18 @@ class TestLeakage5x5(unittest.TestCase):
             out_orig = self.model(x, custom_context_indices=ctx_idx, custom_target_indices=tgt_idx)
             H_ctx_orig = out_orig["H_ctx"]
 
-        # Create perturbed input: add noise ONLY at target locations
+        # Create perturbed input: add noise ONLY at target locations that have no context tokens
         x_perturbed = x.clone()
         x_perturbed_flat = x_perturbed.view(B, 25, 128)
         noise = torch.randn_like(x_perturbed_flat) * 10.0
 
         for b in range(B):
-            t_idx = tgt_idx[b]
-            x_perturbed_flat[b, t_idx] += noise[b, t_idx]
+            if self.model.tokenizer.num_tokens == 50:
+                ctx_sp = set((ctx_idx[b] // 2).tolist())
+            else:
+                ctx_sp = set(ctx_idx[b].tolist())
+            pure_tgt_sp = [sp for sp in range(25) if sp not in ctx_sp]
+            x_perturbed_flat[b, pure_tgt_sp] += noise[b, pure_tgt_sp]
 
         x_perturbed = x_perturbed_flat.view(B, 5, 5, 128)
 
