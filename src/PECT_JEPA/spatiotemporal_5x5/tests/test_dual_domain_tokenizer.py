@@ -108,7 +108,7 @@ class TestDualDomainTokenizer(unittest.TestCase):
             predictor_heads=4,
             min_masked=10,
             max_masked=15,
-            rank_barrier_weight=0.5,
+            uniformity_weight=0.05,
         )
         model = PECT_JEPA_5x5(cfg)
         x = torch.randn(self.B, 5, 5, 128)
@@ -116,9 +116,7 @@ class TestDualDomainTokenizer(unittest.TestCase):
 
         self.assertIn("loss", out)
         self.assertIn("loss_pred", out)
-        self.assertIn("loss_var", out)
-        self.assertIn("loss_cov", out)
-        self.assertIn("loss_rank_barrier", out)
+        self.assertIn("loss_unif", out)
         self.assertTrue(torch.isfinite(out["loss"]))
 
         # Check feature extractions

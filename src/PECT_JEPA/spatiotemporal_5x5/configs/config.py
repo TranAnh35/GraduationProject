@@ -64,12 +64,11 @@ class Spatiotemporal5x5Config:
     loss_type: str = "l1"                # Pure I-JEPA L1 loss (preserves non-vanishing unit gradient)
     liftoff_invar_weight: float = 0.05   # Lift-off invariance loss weight (decouples lift-off from depth)
     phase_align_weight: float = 0.05     # Phase-depth monotonicity loss weight (enforces monotonic depth manifold)
-    var_weight: float = 0.0              # Zeroed: Pure JEPA relies on EMA target encoder to prevent collapse
-    cov_weight: float = 0.0              # Zeroed: Avoids artificial isotropic whitening of physical eddy currents
-    var_gamma: float = 1.0               # Target variance standard deviation (if var_weight > 0)
-    vicreg_target: str = "context"       # 'context' (C-JEPA on H_ctx) | 'both' | 'predictor'
-    rank_barrier_weight: float = 0.0     # Zeroed: Preserves natural physical eigenvalue distribution
-    rank_barrier_eps: float = 1e-4       # Interior point barrier regularizer epsilon
+    var_weight: float = 0.0              # Deprecated (VICReg removed in favor of Hypersphere Uniformity)
+    cov_weight: float = 0.0              # Deprecated (VICReg removed in favor of Hypersphere Uniformity)
+    uniformity_weight: float = 0.05      # Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020)
+    uniformity_t: float = 2.0            # Gaussian potential parameter t for hypersphere uniformity
+    uniformity_subsample: int = 1024     # Subsample size for stable, memory-efficient pairwise similarity
 
     # --------------------------------------------------------------- Training
     batch_size: int = 256

@@ -142,9 +142,7 @@ class Trainer5x5:
         total_pred = 0.0
         total_liftoff = 0.0
         total_phase = 0.0
-        total_var = 0.0
-        total_cov = 0.0
-        total_rank_barrier = 0.0
+        total_unif = 0.0
         n_batches = 0
 
         pbar = tqdm(
@@ -189,17 +187,13 @@ class Trainer5x5:
             pred_val = float(loss_dict["loss_pred"].item())
             liftoff_val = float(loss_dict.get("loss_liftoff", torch.tensor(0.0)).item())
             phase_val = float(loss_dict.get("loss_phase", torch.tensor(0.0)).item())
-            var_val = float(loss_dict["loss_var"].item())
-            cov_val = float(loss_dict["loss_cov"].item())
-            rank_barrier_val = float(loss_dict.get("loss_rank_barrier", torch.tensor(0.0)).item())
+            unif_val = float(loss_dict.get("loss_unif", torch.tensor(0.0)).item())
 
             total_loss += loss_val
             total_pred += pred_val
             total_liftoff += liftoff_val
             total_phase += phase_val
-            total_var += var_val
-            total_cov += cov_val
-            total_rank_barrier += rank_barrier_val
+            total_unif += unif_val
             n_batches += 1
 
             if self.logger:
@@ -210,9 +204,7 @@ class Trainer5x5:
                         "loss_pred": pred_val,
                         "loss_liftoff": liftoff_val,
                         "loss_phase": phase_val,
-                        "loss_var": var_val,
-                        "loss_cov": cov_val,
-                        "loss_rank_barrier": rank_barrier_val,
+                        "loss_unif": unif_val,
                         "lr": lr,
                         "momentum": momentum,
                         "grad_norm": grad_norm,
@@ -225,8 +217,8 @@ class Trainer5x5:
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
                 "pred": f"{pred_val:.4f}",
+                "unif": f"{unif_val:.3f}",
                 "lift": f"{liftoff_val:.3f}",
-                "ph": f"{phase_val:.3f}",
                 "lr": f"{lr:.1e}"
             })
 
@@ -235,9 +227,7 @@ class Trainer5x5:
             "loss_pred": total_pred / max(1, n_batches),
             "loss_liftoff": total_liftoff / max(1, n_batches),
             "loss_phase": total_phase / max(1, n_batches),
-            "loss_var": total_var / max(1, n_batches),
-            "loss_cov": total_cov / max(1, n_batches),
-            "loss_rank_barrier": total_rank_barrier / max(1, n_batches),
+            "loss_unif": total_unif / max(1, n_batches),
         }
         return metrics
 

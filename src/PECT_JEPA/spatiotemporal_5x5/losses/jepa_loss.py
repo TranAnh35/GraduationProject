@@ -1,5 +1,9 @@
 """
-JEPA Loss for 5x5 PECT-JEPA: Smooth L1 Prediction Loss + VICReg Anti-Collapse.
+JEPA Loss for 5x5 PECT-JEPA: Smooth L1 Prediction Loss + Hypersphere Uniformity Anti-Collapse.
+
+Replaces VICReg isotropic covariance/variance penalties with Hypersphere Uniformity
+(Wang & Isola, ICML 2020), providing stable, non-isotropic representation dispersion
+grounded in physical eddy current diffusion.
 """
 
 from typing import Dict, Optional
@@ -10,8 +14,8 @@ import torch.nn.functional as F
 
 class JEPALoss5x5(nn.Module):
     """
-    Smooth L1 latent prediction loss + VICReg variance hinge & covariance penalty.
-    Supports C-JEPA regularizing context encoder representations (H_ctx), predictor (H_pred), or both.
+    JEPA latent prediction loss + Hypersphere Uniformity Dispersion.
+    Also supports Physical Lift-off Invariance and Phase-Depth Monotonicity alignment.
     """
 
     def __init__(
@@ -20,24 +24,19 @@ class JEPALoss5x5(nn.Module):
         eps: float = 1e-8,
         liftoff_invar_weight: float = 0.0,
         phase_align_weight: float = 0.0,
-        var_weight: float = 0.0,
-        cov_weight: float = 0.0,
-        var_gamma: float = 1.0,
-        vicreg_target: str = "context",
-        rank_barrier_weight: float = 0.0,
-        rank_barrier_eps: float = 1e-4,
+        uniformity_weight: float = 0.05,
+        uniformity_t: float = 2.0,
+        uniformity_subsample: int = 1024,
+        **kwargs,
     ):
         super().__init__()
         self.loss_type = loss_type
         self.eps = eps
         self.liftoff_invar_weight = liftoff_invar_weight
         self.phase_align_weight = phase_align_weight
-        self.var_weight = var_weight
-        self.cov_weight = cov_weight
-        self.var_gamma = var_gamma
-        self.vicreg_target = vicreg_target
-        self.rank_barrier_weight = rank_barrier_weight
-        self.rank_barrier_eps = rank_barrier_eps
+        self.uniformity_weight = uniformity_weight
+        self.uniformity_t = uniformity_t
+        self.uniformity_subsample = uniformity_subsample
 
     def latent_prediction_loss(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
         safe_eps = max(self.eps, 1e-5)
@@ -57,61 +56,37 @@ class JEPALoss5x5(nn.Module):
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
-    def variance_hinge(self, H_pred: torch.Tensor) -> torch.Tensor:
-        """Forces batch variance along each dimension to be >= var_gamma (computed in FP32)."""
-        # Force FP32 and sanitize non-finite values
-        z = torch.nan_to_num(H_pred.float(), nan=0.0, posinf=50.0, neginf=-50.0)
-        B, N, D = z.shape
-        z = z.reshape(B * N, D)
-        safe_eps = max(self.eps, 1e-5)
-        # Clamp variance to >= 0.0 to guard against negative variance from FP rounding
-        var = torch.clamp(z.var(dim=0, unbiased=False), min=0.0)
-        std = torch.sqrt(var + safe_eps)  # [D]
-        std = torch.nan_to_num(std, nan=0.0, posinf=self.var_gamma)
-        return torch.mean(F.relu(self.var_gamma - std))
-
-    def covariance_penalty(self, H_pred: torch.Tensor) -> torch.Tensor:
-        """Decorrelates embedding dimensions to maximize information content (computed in FP32)."""
-        # Force FP32: inner product z.T @ z with B*N > 6000 easily overflows FP16 max (65,504) -> inf -> NaN
-        z = torch.nan_to_num(H_pred.float(), nan=0.0, posinf=50.0, neginf=-50.0)
-        B, N, D = z.shape
-        z = z.reshape(B * N, D)
-        z = z - z.mean(dim=0, keepdim=True)
-        cov = (z.T @ z) / max(1, z.shape[0] - 1)  # [D, D]
-        off_diag = cov - torch.diag(torch.diag(cov))
-        cov_penalty = (off_diag ** 2).sum() / D
-        return torch.nan_to_num(cov_penalty, nan=0.0, posinf=1.0)
-
-    def rank_barrier_loss(self, H_rep: torch.Tensor) -> torch.Tensor:
+    def hypersphere_uniformity_loss(self, H_rep: torch.Tensor) -> torch.Tensor:
         """
-        Log-Determinant Spectral Barrier Loss on the normalized representation correlation matrix.
-        Forces all eigenvalues to stay non-zero and isotropic, mathematically preventing
-        Effective Rank collapse without risk of scale explosion (scale-invariant via correlation matrix).
-        L_barrier = - (1 / D) * ln det (C_corr + eps * I)
+        Hypersphere Uniformity Loss (Wang & Isola, ICML 2020).
+        Computes the logarithm of the average pairwise Gaussian potential on the unit sphere:
+            L_unif = log E_{u,v} [ exp(-t * ||u - v||^2) ]
+                   = log E_{u,v} [ exp(2t * (u . v - 1)) ]
+        Maintains representation dispersion without forcing artificial isotropic whitening.
+        Gradients are strictly Lipschitz bounded with zero division-by-zero risk.
         """
+        # Ensure FP32 and sanitize
         z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
         B, N, D = z.shape
         z = z.reshape(B * N, D)
-        z = z - z.mean(dim=0, keepdim=True)
-        cov = (z.T @ z) / max(1, z.shape[0] - 1)  # [D, D]
+        M = z.shape[0]
+        if M < 2:
+            return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
-        # Standard deviations along each dimension
-        std = torch.sqrt(torch.clamp(torch.diag(cov), min=1e-8))
-        # Correlation matrix: cov / (std_i * std_j) (ensures scale-invariance)
-        corr = cov / (std.unsqueeze(0) * std.unsqueeze(1) + 1e-8)
-        corr = torch.nan_to_num(corr, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Subsample tokens for memory and compute efficiency if M > uniformity_subsample
+        if self.uniformity_subsample > 0 and M > self.uniformity_subsample:
+            idx = torch.randperm(M, device=z.device)[:self.uniformity_subsample]
+            z = z[idx]
+            M = z.shape[0]
 
-        # Regularized correlation matrix with interior point barrier eps
-        eps = max(self.rank_barrier_eps, 1e-6)
-        corr_reg = corr + eps * torch.eye(D, device=z.device, dtype=z.dtype)
+        u = F.normalize(z, p=2, dim=-1, eps=max(self.eps, 1e-8))
+        sim = torch.mm(u, u.t())  # [M, M] in [-1, 1]
 
-        # Compute log-determinant via real eigenvalues of symmetric matrix
-        # Guarantees positive eigenvalues and smooth, non-collapsing gradients
-        eigvals = torch.linalg.eigvalsh(corr_reg)
-        eigvals_safe = torch.clamp(eigvals, min=eps)
-        logdet = torch.sum(torch.log(eigvals_safe))
-        barrier = -logdet / D
-        return torch.nan_to_num(barrier, nan=10.0, posinf=10.0, neginf=0.0)
+        # Exclude diagonal (self-similarity)
+        mask = ~torch.eye(M, dtype=torch.bool, device=z.device)
+        pair_exp = torch.exp(2.0 * self.uniformity_t * (sim - 1.0))[mask]
+        unif = torch.log(torch.mean(pair_exp) + 1e-8)
+        return torch.nan_to_num(unif, nan=0.0, posinf=0.0, neginf=-10.0)
 
     def liftoff_invariance_loss(self, H_ctx: torch.Tensor, H_ctx_pert: torch.Tensor) -> torch.Tensor:
         """
@@ -135,9 +110,9 @@ class JEPALoss5x5(nn.Module):
         p_flat = phase_ctx.float().reshape(-1)
         z_c = z_flat - z_flat.mean()
         p_c = p_flat - p_flat.mean()
-        denom = (torch.sqrt(torch.sum(z_c ** 2)) * torch.sqrt(torch.sum(p_c ** 2))) + 1e-6
+        denom = (torch.sqrt(torch.sum(z_c ** 2) + 1e-8) * torch.sqrt(torch.sum(p_c ** 2) + 1e-8)) + 1e-6
         pearson_r = torch.sum(z_c * p_c) / denom
-        return 1.0 - torch.abs(pearson_r)
+        return 1.0 - torch.abs(torch.clamp(pearson_r, min=-1.0, max=1.0))
 
     def forward(
         self,
@@ -161,31 +136,16 @@ class JEPALoss5x5(nn.Module):
         if self.phase_align_weight > 0.0 and z_depth is not None and phase_ctx is not None:
             l_phase = self.phase_depth_alignment_loss(z_depth, phase_ctx)
 
-        # Auxiliary VICReg & Barrier losses (if activated)
-        l_var = zero_loss
-        l_cov = zero_loss
-        l_rank = zero_loss
-        if self.var_weight > 0.0 or self.cov_weight > 0.0 or self.rank_barrier_weight > 0.0:
-            if self.vicreg_target == "context" and H_ctx is not None:
-                l_var = self.variance_hinge(H_ctx)
-                l_cov = self.covariance_penalty(H_ctx)
-                l_rank = self.rank_barrier_loss(H_ctx) if self.rank_barrier_weight > 0.0 else zero_loss
-            elif self.vicreg_target == "both" and H_ctx is not None:
-                l_var = 0.5 * (self.variance_hinge(H_ctx) + self.variance_hinge(H_pred))
-                l_cov = 0.5 * (self.covariance_penalty(H_ctx) + self.covariance_penalty(H_pred))
-                l_rank = 0.5 * (self.rank_barrier_loss(H_ctx) + self.rank_barrier_loss(H_pred)) if self.rank_barrier_weight > 0.0 else zero_loss
-            else:
-                l_var = self.variance_hinge(H_pred)
-                l_cov = self.covariance_penalty(H_pred)
-                l_rank = self.rank_barrier_loss(H_pred) if self.rank_barrier_weight > 0.0 else zero_loss
+        # Hypersphere Uniformity Dispersion Loss
+        l_unif = zero_loss
+        if self.uniformity_weight > 0.0 and H_ctx is not None:
+            l_unif = self.hypersphere_uniformity_loss(H_ctx)
 
         total = (
             l_pred
             + self.liftoff_invar_weight * l_liftoff
             + self.phase_align_weight * l_phase
-            + self.var_weight * l_var
-            + self.cov_weight * l_cov
-            + self.rank_barrier_weight * l_rank
+            + self.uniformity_weight * l_unif
         )
 
         return {
@@ -193,7 +153,5 @@ class JEPALoss5x5(nn.Module):
             "loss_pred": l_pred.detach(),
             "loss_liftoff": l_liftoff.detach(),
             "loss_phase": l_phase.detach(),
-            "loss_var": l_var.detach(),
-            "loss_cov": l_cov.detach(),
-            "loss_rank_barrier": l_rank.detach(),
+            "loss_unif": l_unif.detach(),
         }

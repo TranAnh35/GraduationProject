@@ -32,8 +32,7 @@ class TestShape5x5(unittest.TestCase):
 
         self.assertIn("loss", out)
         self.assertIn("loss_pred", out)
-        self.assertIn("loss_var", out)
-        self.assertIn("loss_cov", out)
+        self.assertIn("loss_unif", out)
 
         self.assertEqual(out["loss"].ndim, 0)
 

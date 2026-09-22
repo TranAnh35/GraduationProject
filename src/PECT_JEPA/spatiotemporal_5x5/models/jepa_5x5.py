@@ -68,18 +68,15 @@ class PECT_JEPA_5x5(nn.Module):
         # 5. Predictor (Physics Operator Diffusion Predictor or Standard)
         self.predictor = build_predictor_5x5(config)
 
-        # 6. Loss Function with Physics-Informed Regularization
+        # 6. Loss Function with Hypersphere Uniformity Dispersion
         self.loss_fn = JEPALoss5x5(
             loss_type=config.loss_type,
             eps=config.eps,
             liftoff_invar_weight=getattr(config, "liftoff_invar_weight", 0.0),
             phase_align_weight=getattr(config, "phase_align_weight", 0.0),
-            var_weight=config.var_weight,
-            cov_weight=config.cov_weight,
-            var_gamma=config.var_gamma,
-            vicreg_target=getattr(config, "vicreg_target", "context"),
-            rank_barrier_weight=getattr(config, "rank_barrier_weight", 0.0),
-            rank_barrier_eps=getattr(config, "rank_barrier_eps", 1e-4),
+            uniformity_weight=getattr(config, "uniformity_weight", 0.05),
+            uniformity_t=getattr(config, "uniformity_t", 2.0),
+            uniformity_subsample=getattr(config, "uniformity_subsample", 1024),
         )
 
         # 7. Physical Alignment Modules (Option B)

@@ -95,14 +95,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
     p.add_argument("--loss_type", type=str, default="smooth_l1", choices=["smooth_l1", "l1", "l2", "cosine"],
                    help="JEPA latent prediction loss function (default: smooth_l1)")
-    p.add_argument("--cov_weight", type=float, default=0.0, help="VICReg covariance penalty weight (default: 0.0 for pure JEPA)")
-    p.add_argument("--var_weight", type=float, default=0.0, help="VICReg variance hinge weight (default: 0.0 for pure JEPA)")
-    p.add_argument("--rank_barrier_weight", type=float, default=0.0,
-                   help="Log-Determinant Spectral Barrier loss weight (default: 0.0 for pure JEPA)")
-    p.add_argument("--rank_barrier_eps", type=float, default=1e-4,
-                   help="Regularization epsilon for Log-Determinant Spectral Barrier (default: 1e-4)")
-    p.add_argument("--vicreg_target", type=str, default="context", choices=["context", "both", "predictor"],
-                   help="Target representation for VICReg anti-collapse loss: 'context' (Online Context Encoder, C-JEPA), 'both', or 'predictor' (default: context)")
+    p.add_argument("--uniformity_weight", type=float, default=0.05,
+                   help="Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020, default: 0.05)")
+    p.add_argument("--uniformity_t", type=float, default=2.0,
+                   help="Gaussian potential parameter t for hypersphere uniformity (default: 2.0)")
+    p.add_argument("--uniformity_subsample", type=int, default=1024,
+                   help="Subsample size of tokens for hypersphere uniformity (default: 1024)")
     p.add_argument("--tokenizer_type", type=str, default="dual_domain_attention", choices=["dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
                    help="Tokenizer architecture: 'dual_domain_attention' (Time + FFT Multi-Head Attention Fusion), 'dual_domain', or 'time_only' (default: dual_domain_attention)")
     p.add_argument("--predictor_type", type=str, default="operator_diffusion", choices=["operator_diffusion", "standard"],
@@ -195,11 +193,9 @@ def main():
         loss_type=args.loss_type,
         liftoff_invar_weight=args.liftoff_invar_weight,
         phase_align_weight=args.phase_align_weight,
-        cov_weight=args.cov_weight,
-        var_weight=args.var_weight,
-        rank_barrier_weight=args.rank_barrier_weight,
-        rank_barrier_eps=args.rank_barrier_eps,
-        vicreg_target=args.vicreg_target,
+        uniformity_weight=args.uniformity_weight,
+        uniformity_t=args.uniformity_t,
+        uniformity_subsample=args.uniformity_subsample,
         ema_momentum=args.ema_momentum,
         ema_momentum_end=args.ema_momentum_end,
         tokenizer_type=args.tokenizer_type,

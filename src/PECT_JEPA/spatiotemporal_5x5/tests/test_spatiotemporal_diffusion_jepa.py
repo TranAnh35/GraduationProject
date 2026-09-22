@@ -31,9 +31,7 @@ class TestSpatiotemporalDiffusionJEPA(unittest.TestCase):
             predictor_heads=4,
             liftoff_invar_weight=0.05,
             phase_align_weight=0.05,
-            var_weight=0.0,
-            cov_weight=0.0,
-            rank_barrier_weight=0.0,
+            uniformity_weight=0.05,
         )
 
     def test_tokenizer_shapes_and_phase(self):

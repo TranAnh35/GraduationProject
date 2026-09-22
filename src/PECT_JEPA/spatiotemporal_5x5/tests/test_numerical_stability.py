@@ -19,29 +19,29 @@ from src.PECT_JEPA.spatiotemporal_5x5.training.trainer import Trainer5x5
 
 class TestNumericalStability(unittest.TestCase):
 
-    def test_vicreg_fp16_stability(self):
-        """Verify that VICReg loss handles FP16 inputs without overflow/NaN."""
-        loss_fn = JEPALoss5x5()
+    def test_uniformity_fp16_stability(self):
+        """Verify that Hypersphere Uniformity loss handles FP16 inputs without overflow/NaN."""
+        loss_fn = JEPALoss5x5(uniformity_weight=1.0)
         B, N, D = 512, 12, 128
-        # Values with magnitude 3.5 in FP16: inner product sum over 6144 exceeds 65504
+        H_ctx_fp16 = (torch.randn(B, N, D, dtype=torch.float16) * 3.5)
         H_pred_fp16 = (torch.randn(B, N, D, dtype=torch.float16) * 3.5)
         H_tgt_fp16 = (torch.randn(B, N, D, dtype=torch.float16) * 3.5)
 
-        loss_dict = loss_fn(H_pred_fp16, H_tgt_fp16)
+        loss_dict = loss_fn(H_pred_fp16, H_tgt_fp16, H_ctx=H_ctx_fp16)
         total_loss = loss_dict["loss"]
 
         self.assertFalse(torch.isnan(total_loss), "Loss should not be NaN for FP16 inputs")
         self.assertFalse(torch.isinf(total_loss), "Loss should not be Inf for FP16 inputs")
         self.assertEqual(total_loss.dtype, torch.float32, "Output loss must be in FP32")
 
-    def test_variance_hinge_zero_variance(self):
-        """Verify variance hinge handles zero-variance inputs without NaN."""
-        loss_fn = JEPALoss5x5()
-        # Constant tensor: variance is exactly 0.0
-        H_pred = torch.ones(64, 12, 128, dtype=torch.float32)
-        l_var = loss_fn.variance_hinge(H_pred)
-        self.assertFalse(torch.isnan(l_var), "Variance hinge should not produce NaN on zero variance")
-        self.assertGreater(float(l_var.item()), 0.0)
+    def test_uniformity_zero_variance(self):
+        """Verify Hypersphere Uniformity handles zero-variance / constant inputs without NaN."""
+        loss_fn = JEPALoss5x5(uniformity_weight=1.0)
+        # Constant tensor: all tokens identical
+        H_const = torch.ones(64, 12, 128, dtype=torch.float32)
+        l_unif = loss_fn.hypersphere_uniformity_loss(H_const)
+        self.assertFalse(torch.isnan(l_unif), "Uniformity should not produce NaN on zero variance / constant input")
+        self.assertTrue(torch.isfinite(l_unif))
 
     def test_validate_nan_resilience(self):
         """Verify validate() skips NaN batches and averages over valid batches only."""
