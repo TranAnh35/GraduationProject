@@ -93,18 +93,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Number of outer boundary pixels to crop on each edge (default: 15 to remove air/edge effect)")
     p.add_argument("--normalization", type=str, default="global_peak", choices=["global_peak", "zscore", "peak_early", "min_max"])
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
-    p.add_argument("--loss_type", type=str, default="smooth_l1", choices=["smooth_l1", "l1", "l2", "cosine"],
-                   help="JEPA latent prediction loss function (default: smooth_l1)")
+    p.add_argument("--loss_type", type=str, default="l1", choices=["l1", "smooth_l1", "l2", "cosine"],
+                   help="JEPA latent prediction loss function (default: l1)")
     p.add_argument("--uniformity_weight", type=float, default=0.05,
                    help="Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020, default: 0.05)")
     p.add_argument("--uniformity_t", type=float, default=2.0,
                    help="Gaussian potential parameter t for hypersphere uniformity (default: 2.0)")
     p.add_argument("--uniformity_subsample", type=int, default=1024,
                    help="Subsample size of tokens for hypersphere uniformity (default: 1024)")
-    p.add_argument("--tokenizer_type", type=str, default="dual_domain_attention", choices=["dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'dual_domain_attention' (Time + FFT Multi-Head Attention Fusion), 'dual_domain', or 'time_only' (default: dual_domain_attention)")
-    p.add_argument("--predictor_type", type=str, default="operator_diffusion", choices=["operator_diffusion", "standard"],
-                   help="Predictor architecture: 'operator_diffusion' (Harmonic Helmholtz Diffusion Predictor) or 'standard' (default: operator_diffusion)")
+    p.add_argument("--norm_floor_weight", type=float, default=0.1,
+                   help="Norm-floor barrier weight to prevent zero-vector collapse (default: 0.1)")
+    p.add_argument("--norm_floor_target", type=float, default=1.0,
+                   help="Minimum target L2 norm of representations (default: 1.0)")
+    p.add_argument("--tokenizer_type", type=str, default="dual_scale_diffusion",
+                   choices=["dual_scale_diffusion", "dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'dual_scale_diffusion' (50 tokens: Shallow vs Deep), 'dual_domain_attention', 'dual_domain', or 'time_only' (default: dual_scale_diffusion)")
+    p.add_argument("--predictor_type", type=str, default="standard", choices=["standard", "operator_diffusion"],
+                   help="Predictor architecture: 'standard' (Clean Spatiotemporal Transformer Predictor) or 'operator_diffusion' (default: standard)")
     p.add_argument("--liftoff_invar_weight", type=float, default=0.05,
                    help="Physical lift-off invariance loss weight (default: 0.05)")
     p.add_argument("--phase_align_weight", type=float, default=0.05,
@@ -123,7 +128,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Lowpass filter cutoff frequency in Hz (default: 2500.0)")
     p.add_argument("--lowpass_order", type=int, default=4,
                    help="Lowpass filter order (default: 4)")
-    p.add_argument("--ema_momentum", type=float, default=0.996, help="Target encoder base EMA momentum (default: 0.996)")
+    p.add_argument("--ema_momentum", type=float, default=0.990, help="Target encoder base EMA momentum (default: 0.990)")
     p.add_argument("--ema_momentum_end", type=float, default=0.999,
                    help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
     p.add_argument("--embed_dim", type=int, default=64, help="Latent embedding dimension D (default: 64)")
@@ -196,6 +201,8 @@ def main():
         uniformity_weight=args.uniformity_weight,
         uniformity_t=args.uniformity_t,
         uniformity_subsample=args.uniformity_subsample,
+        norm_floor_weight=args.norm_floor_weight,
+        norm_floor_target=args.norm_floor_target,
         ema_momentum=args.ema_momentum,
         ema_momentum_end=args.ema_momentum_end,
         tokenizer_type=args.tokenizer_type,

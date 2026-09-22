@@ -69,6 +69,8 @@ class Spatiotemporal5x5Config:
     uniformity_weight: float = 0.05      # Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020)
     uniformity_t: float = 2.0            # Gaussian potential parameter t for hypersphere uniformity
     uniformity_subsample: int = 1024     # Subsample size for stable, memory-efficient pairwise similarity
+    norm_floor_weight: float = 0.1       # Norm Floor Barrier weight to prevent zero-vector collapse (||z|| >= target)
+    norm_floor_target: float = 1.0       # Minimum expected representation L2 norm target
 
     # --------------------------------------------------------------- Training
     batch_size: int = 256

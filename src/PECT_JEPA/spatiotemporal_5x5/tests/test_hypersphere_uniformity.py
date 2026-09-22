@@ -52,6 +52,8 @@ class TestHypersphereUniformityLoss(unittest.TestCase):
         self.assertIn("loss_liftoff", loss_dict)
         self.assertIn("loss_phase", loss_dict)
         self.assertIn("loss_unif", loss_dict)
+        self.assertIn("loss_norm", loss_dict)
+        self.assertIn("mean_norm", loss_dict)
 
         total_loss = loss_dict["loss"]
         self.assertTrue(torch.isfinite(total_loss))
@@ -148,6 +150,43 @@ class TestHypersphereUniformityLoss(unittest.TestCase):
 
         self.assertGreater(final_mean_dist, init_mean_dist * 2.0,
                            "Optimizing uniformity must disperse clustered points across the sphere")
+
+    def test_zero_vector_collapse_loophole_is_blocked(self):
+        """
+        Verify that a zero-vector collapse (z = 0) is blocked and penalized heavily
+        with max bound 2t = 4.0, rather than escaping with 0.0.
+        """
+        loss_fn = JEPALoss5x5(uniformity_weight=1.0, uniformity_t=2.0, norm_floor_weight=0.1, norm_floor_target=1.0)
+
+        # Zero vector representation
+        H_zero = torch.zeros(16, 25, self.D)
+        loss_zero = loss_fn.hypersphere_uniformity_loss(H_zero)
+
+        # Must receive maximum collapse penalty 2t = 4.0
+        self.assertAlmostEqual(loss_zero.item(), 4.0, places=4,
+                               msg="Zero vector collapse must receive maximum penalty 4.0, NOT 0.0")
+
+        # Norm floor barrier must also heavily penalize zero vector
+        l_norm, mean_norm = loss_fn.norm_floor_loss(H_zero)
+        self.assertAlmostEqual(mean_norm.item(), 0.0, places=4)
+        self.assertAlmostEqual(l_norm.item(), 1.0, places=4,
+                               msg="Norm floor barrier on zero vectors must be (1.0 - 0.0)^2 = 1.0")
+
+    def test_norm_floor_barrier_behavior(self):
+        """Verify that norm floor loss is zero when representation norm >= target, positive otherwise."""
+        loss_fn = JEPALoss5x5(norm_floor_target=1.0)
+
+        # Norm > target
+        H_large = 2.0 * F.normalize(torch.randn(8, 20, self.D), p=2, dim=-1)
+        l_norm_large, mean_norm_large = loss_fn.norm_floor_loss(H_large)
+        self.assertEqual(l_norm_large.item(), 0.0)
+        self.assertAlmostEqual(mean_norm_large.item(), 2.0, places=4)
+
+        # Norm < target
+        H_small = 0.5 * F.normalize(torch.randn(8, 20, self.D), p=2, dim=-1)
+        l_norm_small, mean_norm_small = loss_fn.norm_floor_loss(H_small)
+        self.assertAlmostEqual(l_norm_small.item(), (1.0 - 0.5) ** 2, places=4)
+        self.assertAlmostEqual(mean_norm_small.item(), 0.5, places=4)
 
 
 if __name__ == "__main__":

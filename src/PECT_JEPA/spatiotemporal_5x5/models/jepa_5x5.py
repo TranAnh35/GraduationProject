@@ -77,6 +77,8 @@ class PECT_JEPA_5x5(nn.Module):
             uniformity_weight=getattr(config, "uniformity_weight", 0.05),
             uniformity_t=getattr(config, "uniformity_t", 2.0),
             uniformity_subsample=getattr(config, "uniformity_subsample", 1024),
+            norm_floor_weight=getattr(config, "norm_floor_weight", 0.1),
+            norm_floor_target=getattr(config, "norm_floor_target", 1.0),
         )
 
         # 7. Physical Alignment Modules (Option B)

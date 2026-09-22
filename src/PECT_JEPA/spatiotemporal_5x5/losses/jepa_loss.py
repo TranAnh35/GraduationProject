@@ -6,7 +6,7 @@ Replaces VICReg isotropic covariance/variance penalties with Hypersphere Uniform
 grounded in physical eddy current diffusion.
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +27,8 @@ class JEPALoss5x5(nn.Module):
         uniformity_weight: float = 0.05,
         uniformity_t: float = 2.0,
         uniformity_subsample: int = 1024,
+        norm_floor_weight: float = 0.1,
+        norm_floor_target: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -37,6 +39,8 @@ class JEPALoss5x5(nn.Module):
         self.uniformity_weight = uniformity_weight
         self.uniformity_t = uniformity_t
         self.uniformity_subsample = uniformity_subsample
+        self.norm_floor_weight = norm_floor_weight
+        self.norm_floor_target = norm_floor_target
 
     def latent_prediction_loss(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
         safe_eps = max(self.eps, 1e-5)
@@ -56,6 +60,19 @@ class JEPALoss5x5(nn.Module):
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
+    def norm_floor_loss(self, H_rep: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Norm-Floor Barrier Loss:
+        L_norm = max(0, norm_floor_target - mean(||z_i||_2))^2
+        Enforces representation magnitude to stay >= norm_floor_target (default 1.0),
+        preventing zero-vector collapse.
+        """
+        z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        norms = torch.norm(z, p=2, dim=-1)  # [B, N]
+        mean_norm = torch.mean(norms)
+        l_norm = torch.relu(self.norm_floor_target - mean_norm) ** 2
+        return l_norm, mean_norm
+
     def hypersphere_uniformity_loss(self, H_rep: torch.Tensor) -> torch.Tensor:
         """
         Calibrated Non-Negative Hypersphere Uniformity Loss (Wang & Isola, ICML 2020 + Jensen Shift).
@@ -64,6 +81,7 @@ class JEPALoss5x5(nn.Module):
         Properties:
         - Strictly non-negative: L_unif^+ >= 0 (by Jensen's inequality E[exp(2t u^T v)] >= exp(0) = 1).
         - At complete collapse (u = v): L_unif^+ = 2t = +4.0 (strong positive penalty).
+        - At zero-vector collapse (||z|| < 0.1): L_unif^+ = 2t = +4.0 (eliminates zero-collapse loophole).
         - At uniform dispersion (u^T v ~ N(0, 1/D)): L_unif^+ -> 2t^2 / D ~ 0.06 - 0.12.
         - Gradients are 100% mathematically identical to Wang & Isola potential:
           grad(L_unif^+) == grad(L_unif^raw) since 2t is constant.
@@ -75,6 +93,11 @@ class JEPALoss5x5(nn.Module):
         M = z.shape[0]
         if M < 2:
             return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+
+        # Anti zero-collapse check: if representations vanish toward zero, penalize with max bound
+        norms = torch.norm(z, p=2, dim=-1)
+        if torch.mean(norms) < 0.1:
+            return torch.tensor(2.0 * self.uniformity_t, device=z.device, dtype=z.dtype)
 
         # Subsample tokens for memory and compute efficiency if M > uniformity_subsample
         if self.uniformity_subsample > 0 and M > self.uniformity_subsample:
@@ -145,11 +168,18 @@ class JEPALoss5x5(nn.Module):
         if self.uniformity_weight > 0.0 and H_ctx is not None:
             l_unif = self.hypersphere_uniformity_loss(H_ctx)
 
+        # Norm-Floor Barrier Loss (Anti Zero-Collapse)
+        l_norm = zero_loss
+        mean_norm = torch.tensor(1.0, device=H_pred.device, dtype=torch.float32)
+        if self.norm_floor_weight > 0.0 and H_ctx is not None:
+            l_norm, mean_norm = self.norm_floor_loss(H_ctx)
+
         total = (
             l_pred
             + self.liftoff_invar_weight * l_liftoff
             + self.phase_align_weight * l_phase
             + self.uniformity_weight * l_unif
+            + self.norm_floor_weight * l_norm
         )
 
         return {
@@ -158,4 +188,6 @@ class JEPALoss5x5(nn.Module):
             "loss_liftoff": l_liftoff.detach(),
             "loss_phase": l_phase.detach(),
             "loss_unif": l_unif.detach(),
+            "loss_norm": l_norm.detach(),
+            "mean_norm": mean_norm.detach(),
         }

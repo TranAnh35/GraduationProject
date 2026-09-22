@@ -361,3 +361,145 @@ class DownstreamBenchmarkSuite:
                 "delta_mae_mm": round(float(m_mae - l_mae), 4),
             },
         }
+
+    # =========================================================================
+    # Task 1b: True Cross-File Out-of-Distribution (OOD) Transfer Benchmark
+    # =========================================================================
+    def benchmark_cross_file_ood(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+    ) -> Dict[str, Any]:
+        """
+        True Out-of-Distribution (OOD) Transfer Benchmark.
+        Trains Linear Probe and MLP on frozen features from training files,
+        and evaluates strictly zero-shot on held-out test files with zero spatial leakage.
+        """
+        X_tr = X_train.reshape(-1, X_train.shape[-1]).astype(np.float32)
+        y_tr = y_train.reshape(-1).astype(np.int64)
+        X_te = X_test.reshape(-1, X_test.shape[-1]).astype(np.float32)
+        y_te = y_test.reshape(-1).astype(np.int64)
+
+        v_tr = np.where(y_tr >= 0)[0]
+        v_te = np.where(y_te >= 0)[0]
+        X_tr, y_tr = X_tr[v_tr], y_tr[v_tr]
+        X_te, y_te = X_te[v_te], y_te[v_te]
+
+        if len(np.unique(y_tr)) < 2:
+            return {"error": "Training set needs at least 2 distinct classes"}
+        if len(np.unique(y_te)) < 2:
+            return {"error": "Test set needs at least 2 distinct classes for AUC"}
+
+        pos_tr = np.where(y_tr == 1)[0]
+        neg_tr = np.where(y_tr == 0)[0]
+        if len(neg_tr) > 10000:
+            rng = np.random.RandomState(self.random_state)
+            sub_neg = rng.choice(neg_tr, size=min(len(neg_tr), max(len(pos_tr) * 10, 10000)), replace=False)
+            keep_idx = np.sort(np.concatenate([pos_tr, sub_neg]))
+            X_tr, y_tr = X_tr[keep_idx], y_tr[keep_idx]
+
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_te_s = scaler.transform(X_te)
+
+        # 1. Linear Probe
+        lr = LogisticRegression(
+            C=1.0,
+            max_iter=max(500, self.max_iter),
+            tol=1e-3,
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+            solver="lbfgs",
+        )
+        lr.fit(X_tr_s, y_tr)
+        p_lr = lr.predict_proba(X_te_s)[:, 1]
+        y_pred_lr = (p_lr >= 0.5).astype(int)
+
+        l_auc = float(roc_auc_score(y_te, p_lr))
+        l_ap = float(average_precision_score(y_te, p_lr))
+        l_f1 = float(f1_score(y_te, y_pred_lr, zero_division=0))
+        l_acc = float(accuracy_score(y_te, y_pred_lr))
+
+        # 2. MLP 2-Layer Probe
+        mlp = MLPClassifier(
+            hidden_layer_sizes=(self.mlp_hidden_dim,),
+            activation="relu",
+            max_iter=self.max_iter,
+            early_stopping=True,
+            n_iter_no_change=10,
+            random_state=self.random_state,
+        )
+        sample_weights = compute_sample_weight("balanced", y_tr) if self.class_weight == "balanced" else None
+        mlp.fit(X_tr_s, y_tr, sample_weight=sample_weights)
+        p_mlp = mlp.predict_proba(X_te_s)[:, 1]
+        y_pred_mlp = (p_mlp >= 0.5).astype(int)
+
+        m_auc = float(roc_auc_score(y_te, p_mlp))
+        m_ap = float(average_precision_score(y_te, p_mlp))
+        m_f1 = float(f1_score(y_te, y_pred_mlp, zero_division=0))
+        m_acc = float(accuracy_score(y_te, y_pred_mlp))
+
+        return {
+            "linear_probe": {
+                "auc_roc": round(l_auc, 4),
+                "average_precision": round(l_ap, 4),
+                "f1_score": round(l_f1, 4),
+                "accuracy": round(l_acc, 4),
+            },
+            "mlp_2layer": {
+                "auc_roc": round(m_auc, 4),
+                "average_precision": round(m_ap, 4),
+                "f1_score": round(m_f1, 4),
+                "accuracy": round(m_acc, 4),
+            },
+            "representation_gap": {
+                "delta_auc_roc": round(m_auc - l_auc, 4),
+                "delta_average_precision": round(m_ap - l_ap, 4),
+                "delta_f1": round(m_f1 - l_f1, 4),
+            },
+        }
+
+    # =========================================================================
+    # Task 1c: Single C-Scan Spatial-Block Cross-Validation (Zero Patch Overlap)
+    # =========================================================================
+    def benchmark_binary_detection_spatial_block(
+        self,
+        features_2d: np.ndarray,  # [H, W, D]
+        labels_2d: np.ndarray,    # [H, W]
+        buffer_margin: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Spatial-Block Evaluation for a single C-scan.
+        Divides the scan spatially (top half train, bottom half test)
+        with an excluded buffer margin >= 5 pixels between them.
+        Eliminates the 5x5 patch overlap spatial leakage inherent in random pixel splitting.
+        """
+        H, W, D = features_2d.shape
+        mid_y = H // 2
+
+        train_y_max = max(0, mid_y - buffer_margin)
+        test_y_min = min(H, mid_y + buffer_margin)
+
+        X_tr = features_2d[:train_y_max, :, :].reshape(-1, D)
+        y_tr = labels_2d[:train_y_max, :].reshape(-1)
+
+        X_te = features_2d[test_y_min:, :, :].reshape(-1, D)
+        y_te = labels_2d[test_y_min:, :].reshape(-1)
+
+        pos_tr = np.sum(y_tr == 1)
+        pos_te = np.sum(y_te == 1)
+
+        if pos_tr < 5 or pos_te < 5:
+            mid_x = W // 2
+            train_x_max = max(0, mid_x - buffer_margin)
+            test_x_min = min(W, mid_x + buffer_margin)
+
+            X_tr = features_2d[:, :train_x_max, :].reshape(-1, D)
+            y_tr = labels_2d[:, :train_x_max].reshape(-1)
+
+            X_te = features_2d[:, test_x_min:, :].reshape(-1, D)
+            y_te = labels_2d[:, test_x_min:].reshape(-1)
+
+        return self.benchmark_cross_file_ood(X_tr, y_tr, X_te, y_te)

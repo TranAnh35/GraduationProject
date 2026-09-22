@@ -144,6 +144,8 @@ class Trainer5x5:
         total_liftoff = 0.0
         total_phase = 0.0
         total_unif = 0.0
+        total_norm = 0.0
+        total_mean_norm = 0.0
         total_inter_cos = 0.0
         n_batches = 0
 
@@ -185,6 +187,8 @@ class Trainer5x5:
             liftoff_val = float(loss_dict.get("loss_liftoff", torch.tensor(0.0)).item())
             phase_val = float(loss_dict.get("loss_phase", torch.tensor(0.0)).item())
             unif_val = float(loss_dict.get("loss_unif", torch.tensor(0.0)).item())
+            norm_val = float(loss_dict.get("loss_norm", torch.tensor(0.0)).item())
+            mean_norm_val = float(loss_dict.get("mean_norm", torch.tensor(1.0)).item())
 
             # Inter-sample diversity monitoring (anti-collapse health metric)
             with torch.no_grad():
@@ -202,6 +206,8 @@ class Trainer5x5:
             total_liftoff += liftoff_val
             total_phase += phase_val
             total_unif += unif_val
+            total_norm += norm_val
+            total_mean_norm += mean_norm_val
             total_inter_cos += inter_cos_val
             n_batches += 1
 
@@ -214,6 +220,8 @@ class Trainer5x5:
                         "loss_liftoff": liftoff_val,
                         "loss_phase": phase_val,
                         "loss_unif": unif_val,
+                        "loss_norm": norm_val,
+                        "mean_norm": mean_norm_val,
                         "inter_cos": inter_cos_val,
                         "lr": lr,
                         "momentum": momentum,
@@ -227,7 +235,7 @@ class Trainer5x5:
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
                 "pred": f"{pred_val:.4f}",
-                "unif": f"{unif_val:.3f}",
+                "norm": f"{mean_norm_val:.2f}",
                 "cos": f"{inter_cos_val:.3f}",
                 "lr": f"{lr:.1e}"
             })
@@ -238,6 +246,8 @@ class Trainer5x5:
             "loss_liftoff": total_liftoff / max(1, n_batches),
             "loss_phase": total_phase / max(1, n_batches),
             "loss_unif": total_unif / max(1, n_batches),
+            "loss_norm": total_norm / max(1, n_batches),
+            "mean_norm": total_mean_norm / max(1, n_batches),
             "inter_cos": total_inter_cos / max(1, n_batches),
         }
         return metrics
