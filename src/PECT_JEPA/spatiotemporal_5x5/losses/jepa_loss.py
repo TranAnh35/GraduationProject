@@ -94,10 +94,16 @@ class JEPALoss5x5(nn.Module):
         if M < 2:
             return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
-        # Anti zero-collapse check: if representations vanish toward zero, penalize with max bound
+        # Anti zero-collapse scale barrier:
+        # For any non-zero state 0 < ||z|| < 1.0, this smooth sigmoid penalty exerts an active,
+        # non-vanishing restoring gradient pushing the representation norm outward toward >= 1.0.
+        # Note: At the exact mathematical origin z = 0, any isotropic potential g(||z||) has
+        # gradient 0 by symmetry; the primary architectural anchor maintaining ||z|| ~ sqrt(D) ~ 8.0
+        # is the Transformer's LayerNorm.
         norms = torch.norm(z, p=2, dim=-1)
-        if torch.mean(norms) < 0.1:
-            return torch.tensor(2.0 * self.uniformity_t, device=z.device, dtype=z.dtype)
+        mean_norm = torch.mean(norms)
+        max_bound = 2.0 * self.uniformity_t
+        scale_penalty = max_bound * torch.sigmoid(4.0 * (1.0 - mean_norm))
 
         # Subsample tokens for memory and compute efficiency if M > uniformity_subsample
         if self.uniformity_subsample > 0 and M > self.uniformity_subsample:
@@ -112,8 +118,11 @@ class JEPALoss5x5(nn.Module):
         mask = ~torch.eye(M, dtype=torch.bool, device=z.device)
         pair_exp = torch.exp(2.0 * self.uniformity_t * sim)[mask]
         unif = torch.log(torch.mean(pair_exp) + 1e-8)
-        max_bound = 2.0 * self.uniformity_t
-        return torch.clamp(torch.nan_to_num(unif, nan=0.0, posinf=max_bound, neginf=0.0), min=0.0, max=max_bound)
+        raw_unif = torch.clamp(torch.nan_to_num(unif, nan=0.0, posinf=max_bound, neginf=0.0), min=0.0, max=max_bound)
+
+        # When mean_norm >= 1.0 (normal LayerNorm operation ~8.0), scale_penalty -> 0.0
+        # When mean_norm < 1.0, scale_penalty adds active restoring gradient
+        return raw_unif + scale_penalty
 
     def liftoff_invariance_loss(self, H_ctx: torch.Tensor, H_ctx_pert: torch.Tensor) -> torch.Tensor:
         """

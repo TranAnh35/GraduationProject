@@ -432,6 +432,13 @@ def evaluate_single_file(
                 "knn_5_accuracy": lp_res.get("knn_5_accuracy"),
             }
 
+            # In-Scan Spatial-Block Evaluation with Buffer Margin (Zero Patch Overlap)
+            try:
+                bench_sb = DownstreamBenchmarkSuite(random_state=42)
+                task1_res["spatial_block_cv"] = bench_sb.benchmark_binary_detection_spatial_block(sub_feat, sub_gt, buffer_margin=5)
+            except Exception as e:
+                task1_res["spatial_block_cv"] = {"error": str(e)}
+
             # 1. Defect Probability Heatmap
             prob_heatmap_path = os.path.join(task1_dir, f"{fname_base}_prob_heatmap.png")
             plot_probability_heatmap(
@@ -668,6 +675,157 @@ def evaluate_single_file(
     return result
 
 
+def run_cross_file_ood_benchmark(
+    model: PECT_JEPA_5x5,
+    train_files: List[str],
+    test_files: List[str],
+    output_dir: str,
+    data_dir: str = "data",
+    batch_size: int = 512,
+    device: str = "cuda",
+    crop_border: int = 15,
+    pts_per_train_file: int = 1000,
+) -> Dict[str, Any]:
+    """
+    Authoritative Zero-Shot Cross-File OOD Evaluation Protocol:
+    1. Extracts frozen latent representations across the base training files (train_files).
+    2. Trains a single Linear Probe and 2-Layer MLP on (X_train_pool, y_train_pool).
+    3. Evaluates the FROZEN probe zero-shot on each held-out test file (test_files).
+    4. Computes true cross-file OOD metrics (AUC-ROC, AP, F1, Accuracy) with ZERO spatial leakage.
+    """
+    suite = DownstreamBenchmarkSuite(random_state=42)
+
+    print("\n" + "=" * 70)
+    print("  RUNNING ZERO-SHOT CROSS-FILE OOD BENCHMARK")
+    print(f"  Training Probe on {len(train_files)} base train files...")
+    print(f"  Evaluating Zero-Shot on {len(test_files)} held-out OOD test files...")
+    print("=" * 70)
+
+    # Step 1: Collect training representations across base train files
+    train_feats_list = []
+    train_labels_list = []
+
+    for fp in train_files:
+        mask = find_ground_truth_mask(fp, data_dir=data_dir)
+        if mask is None:
+            continue
+        try:
+            grid = load_cscan_from_tdms(
+                fp,
+                time_samples=model.config.time_samples,
+                temporal_samples=model.config.temporal_samples,
+                resample_mode=model.config.resample_mode,
+                normalization=model.config.normalization,
+                raster_correction=model.config.raster_correction,
+                crop_border=crop_border,
+            )
+            fmap = extract_full_cscan_map(model, grid, batch_size=batch_size, device=device, show_pbar=False)
+            min_Y = min(fmap.shape[0], mask.shape[0])
+            min_X = min(fmap.shape[1], mask.shape[1])
+            sub_f = fmap[:min_Y, :min_X].reshape(-1, fmap.shape[-1])
+            sub_y = mask[:min_Y, :min_X].reshape(-1)
+
+            # Valid points (exclude buffer -1)
+            v = np.where(sub_y >= 0)[0]
+            sub_f, sub_y = sub_f[v], sub_y[v]
+
+            pos = np.where(sub_y == 1)[0]
+            neg = np.where(sub_y == 0)[0]
+            if len(pos) > 0 and len(neg) > 0:
+                n_neg = min(len(neg), max(len(pos) * 5, pts_per_train_file))
+                rng = np.random.RandomState(42)
+                sub_neg = rng.choice(neg, size=n_neg, replace=False)
+                keep = np.concatenate([pos, sub_neg])
+                train_feats_list.append(sub_f[keep])
+                train_labels_list.append(sub_y[keep])
+        except Exception as e:
+            print(f"  [Warning] Skipping train file {os.path.basename(fp)}: {e}")
+
+    if not train_feats_list:
+        print("  [Error] No labeled training features collected for cross-file probe.")
+        return {"error": "No training features collected"}
+
+    X_train_pool = np.concatenate(train_feats_list, axis=0)
+    y_train_pool = np.concatenate(train_labels_list, axis=0)
+    print(f"  Train Probe Pool: {len(y_train_pool)} samples ({np.sum(y_train_pool == 1)} defects, {np.sum(y_train_pool == 0)} sound)")
+
+    # Step 2: Evaluate frozen probe zero-shot on each held-out test file
+    ood_file_results = []
+    for fp in test_files:
+        mask = find_ground_truth_mask(fp, data_dir=data_dir)
+        if mask is None:
+            continue
+        try:
+            grid = load_cscan_from_tdms(
+                fp,
+                time_samples=model.config.time_samples,
+                temporal_samples=model.config.temporal_samples,
+                resample_mode=model.config.resample_mode,
+                normalization=model.config.normalization,
+                raster_correction=model.config.raster_correction,
+                crop_border=crop_border,
+            )
+            fmap = extract_full_cscan_map(model, grid, batch_size=batch_size, device=device, show_pbar=False)
+            min_Y = min(fmap.shape[0], mask.shape[0])
+            min_X = min(fmap.shape[1], mask.shape[1])
+            sub_f = fmap[:min_Y, :min_X].reshape(-1, fmap.shape[-1])
+            sub_y = mask[:min_Y, :min_X].reshape(-1)
+
+            ood_metrics = suite.benchmark_cross_file_ood(X_train_pool, y_train_pool, sub_f, sub_y)
+            if "error" not in ood_metrics:
+                meta = extract_file_metadata(fp)
+                ood_file_results.append({
+                    "file_name": os.path.basename(fp),
+                    "specimen": meta.get("specimen"),
+                    "sensor": meta.get("sensor"),
+                    "waveform": meta.get("waveform"),
+                    "liftoff": meta.get("liftoff"),
+                    "linear_probe": ood_metrics["linear_probe"],
+                    "mlp_2layer": ood_metrics["mlp_2layer"],
+                    "representation_gap": ood_metrics["representation_gap"],
+                })
+        except Exception as e:
+            print(f"  [Warning] Cross-file OOD evaluation failed on {os.path.basename(fp)}: {e}")
+
+    # Step 3: Compute aggregate Zero-Shot OOD metrics
+    l_aucs = [r["linear_probe"]["auc_roc"] for r in ood_file_results if r["linear_probe"].get("auc_roc") is not None]
+    l_aps = [r["linear_probe"]["average_precision"] for r in ood_file_results if r["linear_probe"].get("average_precision") is not None]
+    l_f1s = [r["linear_probe"]["f1_score"] for r in ood_file_results if r["linear_probe"].get("f1_score") is not None]
+    m_aucs = [r["mlp_2layer"]["auc_roc"] for r in ood_file_results if r["mlp_2layer"].get("auc_roc") is not None]
+
+    ood_summary = {
+        "benchmark_type": "Zero-Shot Cross-File OOD Transfer (Zero Spatial Leakage)",
+        "num_train_files": len(train_files),
+        "num_test_files": len(test_files),
+        "evaluated_test_files": len(ood_file_results),
+        "linear_probe": {
+            "mean_auc_roc": round(float(np.mean(l_aucs)), 4) if l_aucs else None,
+            "std_auc_roc": round(float(np.std(l_aucs)), 4) if l_aucs else None,
+            "mean_average_precision": round(float(np.mean(l_aps)), 4) if l_aps else None,
+            "mean_f1": round(float(np.mean(l_f1s)), 4) if l_f1s else None,
+        },
+        "mlp_2layer": {
+            "mean_auc_roc": round(float(np.mean(m_aucs)), 4) if m_aucs else None,
+        },
+        "file_results": ood_file_results,
+    }
+
+    ood_summary_path = os.path.join(output_dir, "cross_file_zero_shot_ood_summary.json")
+    with open(ood_summary_path, "w", encoding="utf-8") as f:
+        json.dump(ood_summary, f, indent=2)
+
+    print("\n--- ZERO-SHOT CROSS-FILE OOD RESULTS ---")
+    if l_aucs:
+        print(f"  Linear Probe Mean AUC-ROC : {np.mean(l_aucs):.4f} +/- {np.std(l_aucs):.4f}")
+        print(f"  Linear Probe Mean AP      : {np.mean(l_aps):.4f}")
+        print(f"  Linear Probe Mean F1      : {np.mean(l_f1s):.4f}")
+        if m_aucs:
+            print(f"  MLP 2-Layer Mean AUC-ROC  : {np.mean(m_aucs):.4f}")
+    print(f"  Saved full OOD benchmark report to: {ood_summary_path}\n")
+
+    return ood_summary
+
+
 def evaluate_liftoff_invariance(
     file_paths: List[str],
     model: PECT_JEPA_5x5,
@@ -817,8 +975,9 @@ def main():
 
     # 1. Determine evaluation test file set
     test_files: List[str] = []
+    train_files: List[str] = []
     test_slices: Dict[str, List[str]] = {}
-    protocol_name: str = "custom"
+    protocol_name: str = "unknown"
     holdout_target: str = "none"
 
     resolved_split_summary = resolve_split_summary_path(args.split_summary, checkpoint_path=checkpoint_path)
@@ -833,6 +992,7 @@ def main():
         print(f"Loading evaluation test partition from split summary: {resolved_split_summary}")
         with open(resolved_split_summary, "r", encoding="utf-8") as f:
             summary = json.load(f)
+        train_files = summary.get("train_files", [])
         test_files = summary.get("test_files", [])
         test_slices = summary.get("test_slices", {})
         protocol_name = summary.get("protocol", "unknown")
@@ -845,7 +1005,7 @@ def main():
             print(f"[Error] No TDMS files found in {args.data_dir}")
             sys.exit(1)
 
-        _, _, test_files, summary = get_dataset_split(
+        train_files, _, test_files, summary = get_dataset_split(
             file_paths=all_files,
             protocol=args.split_protocol,
             holdout_target=args.holdout_target,
@@ -887,7 +1047,24 @@ def main():
         )
         file_results.append(res)
 
-    # 3. Task 4: Lift-off Invariance Analysis (run by default if multiple lift-offs exist)
+    # 3. Task 1b: True Zero-Shot Cross-File OOD Benchmark
+    cross_file_ood_summary = {}
+    if train_files and len(train_files) > 0 and len(test_files) > 0 and protocol_name != "single_file":
+        try:
+            cross_file_ood_summary = run_cross_file_ood_benchmark(
+                model=model,
+                train_files=train_files,
+                test_files=test_files,
+                output_dir=args.output_dir,
+                data_dir=args.data_dir,
+                batch_size=args.batch_size,
+                device=args.device,
+                crop_border=crop_border,
+            )
+        except Exception as e:
+            print(f"  [OOD Benchmark Warning] Cross-file OOD evaluation failed: {e}")
+
+    # 4. Task 4: Lift-off Invariance Analysis (run by default if multiple lift-offs exist)
     liftoff_summary = {}
     if args.eval_liftoff:
         all_pool = find_all_tdms_files(args.data_dir)

@@ -98,6 +98,11 @@ class TestOODLeakageAndConfigSync(unittest.TestCase):
         self.assertIn("auc_roc", res["linear_probe"])
         self.assertTrue(0.0 <= res["linear_probe"]["auc_roc"] <= 1.0)
 
+    def test_run_cross_file_ood_benchmark_is_wired(self):
+        """Verify run_cross_file_ood_benchmark is importable and integrated in evaluate.py."""
+        from src.PECT_JEPA.spatiotemporal_5x5.evaluate import run_cross_file_ood_benchmark
+        self.assertTrue(callable(run_cross_file_ood_benchmark))
+
 
 if __name__ == "__main__":
     unittest.main()

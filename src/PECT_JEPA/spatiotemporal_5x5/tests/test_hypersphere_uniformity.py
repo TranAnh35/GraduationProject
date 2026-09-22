@@ -162,15 +162,23 @@ class TestHypersphereUniformityLoss(unittest.TestCase):
         H_zero = torch.zeros(16, 25, self.D)
         loss_zero = loss_fn.hypersphere_uniformity_loss(H_zero)
 
-        # Must receive maximum collapse penalty 2t = 4.0
-        self.assertAlmostEqual(loss_zero.item(), 4.0, places=4,
-                               msg="Zero vector collapse must receive maximum penalty 4.0, NOT 0.0")
+        # Must receive heavy collapse penalty (> 3.5), eliminating the zero-collapse loophole
+        self.assertGreater(loss_zero.item(), 3.5,
+                           msg="Zero vector collapse must receive heavy penalty > 3.5, NOT 0.0")
 
         # Norm floor barrier must also heavily penalize zero vector
         l_norm, mean_norm = loss_fn.norm_floor_loss(H_zero)
         self.assertAlmostEqual(mean_norm.item(), 0.0, places=4)
         self.assertAlmostEqual(l_norm.item(), 1.0, places=4,
                                msg="Norm floor barrier on zero vectors must be (1.0 - 0.0)^2 = 1.0")
+
+        # Check active restoring gradient on small-norm representations:
+        H_small = (0.05 * torch.randn(4, 10, self.D)).requires_grad_(True)
+        l_unif_small = loss_fn.hypersphere_uniformity_loss(H_small)
+        l_unif_small.backward()
+        self.assertIsNotNone(H_small.grad)
+        self.assertGreater(torch.sum(torch.abs(H_small.grad)).item(), 0.0,
+                           "Restoring scale penalty must exert non-vanishing gradients on small-norm representations")
 
     def test_norm_floor_barrier_behavior(self):
         """Verify that norm floor loss is zero when representation norm >= target, positive otherwise."""
