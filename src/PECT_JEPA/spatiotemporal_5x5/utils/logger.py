@@ -137,7 +137,7 @@ class PECTExperimentLogger5x5:
             step_csv_path = os.path.join(self.run_dir, "metrics_step.csv")
             step_exists = os.path.exists(step_csv_path) and os.path.getsize(step_csv_path) > 0
             self.step_csv_file = open(step_csv_path, "a" if step_exists else "w", newline="", encoding="utf-8")
-            self.step_csv_cols = ["step", "epoch", "loss", "loss_pred", "loss_unif", "loss_liftoff", "loss_phase", "lr", "momentum", "grad_norm"]
+            self.step_csv_cols = ["step", "epoch", "loss", "loss_pred", "loss_unif", "loss_liftoff", "loss_phase", "inter_cos", "lr", "momentum", "grad_norm"]
             self.step_csv_writer = csv.DictWriter(self.step_csv_file, fieldnames=self.step_csv_cols)
             if not step_exists:
                 self.step_csv_writer.writeheader()
@@ -147,7 +147,7 @@ class PECTExperimentLogger5x5:
             epoch_csv_path = os.path.join(self.run_dir, "metrics_epoch.csv")
             epoch_exists = os.path.exists(epoch_csv_path) and os.path.getsize(epoch_csv_path) > 0
             self.epoch_csv_file = open(epoch_csv_path, "a" if epoch_exists else "w", newline="", encoding="utf-8")
-            self.epoch_csv_cols = ["epoch", "train_loss", "val_loss", "val_loss_pred", "uniformity", "twonn_dim", "probe_cnr", "probe_gt_auc", "probe_gt_ap", "lr", "time_sec"]
+            self.epoch_csv_cols = ["epoch", "train_loss", "val_loss", "val_loss_pred", "uniformity", "inter_cos", "twonn_dim", "probe_cnr", "probe_gt_auc", "probe_gt_ap", "lr", "time_sec"]
             self.epoch_csv_writer = csv.DictWriter(self.epoch_csv_file, fieldnames=self.epoch_csv_cols)
             if not epoch_exists:
                 self.epoch_csv_writer.writeheader()

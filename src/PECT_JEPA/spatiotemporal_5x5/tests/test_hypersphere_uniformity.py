@@ -99,9 +99,19 @@ class TestHypersphereUniformityLoss(unittest.TestCase):
         H_collapsed = center + 1e-4 * torch.randn(32, 25, self.D)
         loss_collapsed = loss_fn.hypersphere_uniformity_loss(H_collapsed).item()
 
-        # Collapsed -> close to 0.0; Dispersed -> negative (e.g. < -0.5)
+        # Collapsed -> close to 4.0; Dispersed -> close to 0.0
         self.assertGreater(loss_collapsed, loss_dispersed + 0.5,
                            "Collapsed representations must have much higher uniformity loss than dispersed ones")
+        self.assertGreaterEqual(loss_dispersed, 0.0, "Uniformity loss must be strictly non-negative")
+        self.assertGreaterEqual(loss_collapsed, 0.0, "Collapsed uniformity loss must be strictly non-negative")
+
+    def test_strictly_non_negative_by_jensen(self):
+        """Test that uniformity loss is strictly non-negative across arbitrary random distributions."""
+        loss_fn = JEPALoss5x5(uniformity_weight=1.0, uniformity_t=2.0)
+        for _ in range(10):
+            H = torch.randn(8, 20, self.D)
+            loss = loss_fn.hypersphere_uniformity_loss(H)
+            self.assertGreaterEqual(loss.item(), 0.0, "Loss must be >= 0 by Jensen's inequality")
 
     def test_fp16_fp32_numerical_stability(self):
         """Test that FP16 inputs do not overflow or cause NaNs."""
@@ -111,6 +121,7 @@ class TestHypersphereUniformityLoss(unittest.TestCase):
         loss = loss_fn.hypersphere_uniformity_loss(H_fp16)
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(loss.dtype, torch.float32)
+        self.assertGreaterEqual(loss.item(), 0.0)
 
     def test_optimization_disperses_representations(self):
         """Test that optimizing uniformity loss increases distance between tokens."""

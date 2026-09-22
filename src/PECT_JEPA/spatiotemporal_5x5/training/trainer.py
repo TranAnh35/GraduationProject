@@ -8,6 +8,7 @@ import time
 import glob
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from typing import Optional, Dict, Any
 
@@ -143,6 +144,7 @@ class Trainer5x5:
         total_liftoff = 0.0
         total_phase = 0.0
         total_unif = 0.0
+        total_inter_cos = 0.0
         n_batches = 0
 
         pbar = tqdm(
@@ -166,17 +168,12 @@ class Trainer5x5:
 
             if torch.isnan(loss) or torch.isinf(loss):
                 if self.logger:
-                    self.logger.warning(f"NaN/Inf loss at step {self.global_step}. Skipping batch.")
-                self.optimizer.zero_grad()
+                    self.logger.warning(f"NaN/Inf loss at global step {self.global_step}. Skipping batch.")
                 continue
 
             self.scaler.scale(loss).backward()
-
-            grad_norm = 0.0
-            if self.config.grad_clip > 0.0:
-                self.scaler.unscale_(self.optimizer)
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip).item())
-
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip))
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -189,11 +186,23 @@ class Trainer5x5:
             phase_val = float(loss_dict.get("loss_phase", torch.tensor(0.0)).item())
             unif_val = float(loss_dict.get("loss_unif", torch.tensor(0.0)).item())
 
+            # Inter-sample diversity monitoring (anti-collapse health metric)
+            with torch.no_grad():
+                H_tgt_step = loss_dict.get("H_tgt")
+                if H_tgt_step is not None and H_tgt_step.shape[0] > 1:
+                    H_tgt_p = F.normalize(H_tgt_step.detach().mean(dim=1).float(), p=2, dim=-1)
+                    sim_b = torch.mm(H_tgt_p, H_tgt_p.t())
+                    mask_b = ~torch.eye(sim_b.shape[0], dtype=torch.bool, device=sim_b.device)
+                    inter_cos_val = float(sim_b[mask_b].mean().item())
+                else:
+                    inter_cos_val = 1.0
+
             total_loss += loss_val
             total_pred += pred_val
             total_liftoff += liftoff_val
             total_phase += phase_val
             total_unif += unif_val
+            total_inter_cos += inter_cos_val
             n_batches += 1
 
             if self.logger:
@@ -205,6 +214,7 @@ class Trainer5x5:
                         "loss_liftoff": liftoff_val,
                         "loss_phase": phase_val,
                         "loss_unif": unif_val,
+                        "inter_cos": inter_cos_val,
                         "lr": lr,
                         "momentum": momentum,
                         "grad_norm": grad_norm,
@@ -218,7 +228,7 @@ class Trainer5x5:
                 "loss": f"{loss_val:.4f}",
                 "pred": f"{pred_val:.4f}",
                 "unif": f"{unif_val:.3f}",
-                "lift": f"{liftoff_val:.3f}",
+                "cos": f"{inter_cos_val:.3f}",
                 "lr": f"{lr:.1e}"
             })
 
@@ -228,6 +238,7 @@ class Trainer5x5:
             "loss_liftoff": total_liftoff / max(1, n_batches),
             "loss_phase": total_phase / max(1, n_batches),
             "loss_unif": total_unif / max(1, n_batches),
+            "inter_cos": total_inter_cos / max(1, n_batches),
         }
         return metrics
 
