@@ -3,6 +3,7 @@ Attention building blocks for 5x5 Spatiotemporal PECT-JEPA Transformer.
 """
 
 import math
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,7 +68,12 @@ class MultiheadCrossAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, N_q, D = query.shape
         _, N_kv, _ = key_value.shape
 
@@ -75,16 +81,22 @@ class MultiheadCrossAttention(nn.Module):
         k = self.k_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         v = self.v_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
+        if attn_bias is not None and attn_bias.dtype != q.dtype:
+            attn_bias = attn_bias.to(dtype=q.dtype)
+
         if hasattr(F, "scaled_dot_product_attention"):
             # FlashAttention / Memory-Efficient attention with internal FP32 accumulation
             out = F.scaled_dot_product_attention(
                 q, k, v,
+                attn_mask=attn_bias,
                 dropout_p=self.dropout if self.training else 0.0,
                 scale=self.scale
             )
         else:
             # Fallback: clamp attention logits and compute softmax in FP32 to prevent FP16 overflow
             attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+            if attn_bias is not None:
+                attn_scores = attn_scores + attn_bias
             attn_scores = torch.clamp(attn_scores, min=-65000.0, max=65000.0)
             attn = torch.softmax(attn_scores.float(), dim=-1).to(q.dtype)
             attn = self.drop(attn)

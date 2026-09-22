@@ -91,6 +91,29 @@ class PECT_JEPA_5x5(nn.Module):
             nn.Linear(config.embed_dim, config.embed_dim),
         )
 
+    @staticmethod
+    def compute_characteristic_frequency(x: torch.Tensor, num_bins: int = 14) -> torch.Tensor:
+        """
+        Computes the normalized Energy-Weighted Characteristic Frequency (omega_bar)
+        for each sample in the batch:
+            omega_bar = sum_{k=1}^K omega_k * |X_k|^2 / sum_{k=1}^K |X_k|^2
+        Returns:
+            freq_bar: [B] in range (0, 1]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        x_flat = x.reshape(B, H * W, C).float()
+        # Compute FFT along temporal dimension
+        X_fft = torch.fft.rfft(x_flat, dim=-1)[:, :, 1:num_bins + 1]  # [B, 25, K], exclude DC
+        pwr = torch.sum(torch.abs(X_fft) ** 2, dim=1)  # [B, K], spatial average power per freq bin
+        # Frequency bins: 1, 2, ..., K normalized to (0, 1]
+        k_indices = torch.linspace(1.0 / float(num_bins), 1.0, num_bins, device=x.device, dtype=torch.float32)  # [K]
+        total_pwr = torch.sum(pwr, dim=-1, keepdim=True) + 1e-12
+        weights = pwr / total_pwr  # [B, K]
+        freq_bar = torch.sum(weights * k_indices.unsqueeze(0), dim=-1)  # [B]
+        return freq_bar.clamp(min=1.0 / float(num_bins), max=1.0)
+
     def _init_target_encoder(self):
         """Copy initial weights from Context Encoder to Target Encoder."""
         for p_tgt, p_ctx in zip(self.target_encoder.encoder.parameters(), self.context_encoder.parameters()):
@@ -151,7 +174,17 @@ class PECT_JEPA_5x5(nn.Module):
         # 5. Predictor (Predicts target representation from context and target queries)
         is_operator_diff = hasattr(self.predictor, "op_embedding") and getattr(self.config, "predictor_type", "") == "operator_diffusion"
         if is_operator_diff:
-            H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos, freq_condition=freq_condition)
+            if freq_condition is None:
+                freq_condition = self.compute_characteristic_frequency(
+                    x, num_bins=getattr(self.config, "num_freq_bins", 14)
+                )
+            H_pred = self.predictor(
+                H_context=H_ctx,
+                target_pos=target_pos,
+                context_indices=context_indices,
+                target_indices=target_indices,
+                freq_condition=freq_condition,
+            )
         else:
             H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos)
 

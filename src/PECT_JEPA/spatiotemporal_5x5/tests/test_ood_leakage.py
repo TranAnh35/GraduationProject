@@ -36,8 +36,8 @@ class TestOODLeakageAndConfigSync(unittest.TestCase):
         self.assertEqual(args.loss_type, "l1")
         self.assertEqual(cfg.loss_type, "l1")
 
-        self.assertEqual(args.predictor_type, "standard")
-        self.assertEqual(cfg.predictor_type, "standard")
+        self.assertEqual(args.predictor_type, "operator_diffusion")
+        self.assertEqual(cfg.predictor_type, "operator_diffusion")
 
         self.assertAlmostEqual(args.ema_momentum, 0.990)
         self.assertAlmostEqual(cfg.ema_momentum, 0.990)

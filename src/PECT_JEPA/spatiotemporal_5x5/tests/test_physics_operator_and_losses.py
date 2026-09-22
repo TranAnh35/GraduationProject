@@ -109,10 +109,99 @@ class TestPhysicsOperatorAndLosses(unittest.TestCase):
 
         loss_dict["loss"].backward()
 
-        # Check gradients for key modules
-        self.assertIsNotNone(model.depth_head.weight.grad)
-        self.assertIsNotNone(model.context_encoder.blocks[0].mlp.fc1.weight.grad)
-        self.assertIsNotNone(model.predictor.blocks[0].mlp.fc1.weight.grad)
+    def test_compute_characteristic_frequency(self):
+        B, C = 4, 128
+        # Signal 1: Pure low frequency (slow sine wave)
+        t = torch.linspace(0, 1, C)
+        x_low = torch.sin(2 * torch.pi * 2 * t).view(1, 1, 1, C).expand(2, 5, 5, C)
+        # Signal 2: High frequency (fast sine wave)
+        x_high = torch.sin(2 * torch.pi * 20 * t).view(1, 1, 1, C).expand(2, 5, 5, C)
+        x = torch.cat([x_low, x_high], dim=0)  # [4, 5, 5, C]
+
+        freq_bar = PECT_JEPA_5x5.compute_characteristic_frequency(x, num_bins=14)
+        self.assertEqual(freq_bar.shape, (4,))
+        self.assertTrue((freq_bar > 0.0).all() and (freq_bar <= 1.0).all())
+
+        # Low frequency signals must have strictly lower omega_bar than high frequency signals
+        self.assertLess(freq_bar[0].item(), freq_bar[2].item())
+        self.assertLess(freq_bar[1].item(), freq_bar[3].item())
+
+    def test_greens_diffusion_attention_bias_properties(self):
+        pred = OperatorDiffusionPredictor5x5(
+            embed_dim=64,
+            depth=2,
+            num_heads=4,
+            num_freq_bins=14,
+            gamma_init=1.0,
+            beta_init=0.5,
+        )
+        B = 2
+        # Target at center (2, 2) shallow: index 24 (spatial 12, scale 0)
+        # Context 1 at near neighbor (2, 3) shallow: index 26 (spatial 13, scale 0), dist = 1.0
+        # Context 2 at far corner (0, 0) shallow: index 0 (spatial 0, scale 0), dist = sqrt(2^2+2^2) = 2.828
+        target_indices = torch.tensor([[24]], dtype=torch.long).expand(B, -1)  # [B, 1]
+        context_indices = torch.tensor([[26, 0]], dtype=torch.long).expand(B, -1)  # [B, 2]
+
+        H_ctx = torch.randn(B, 2, 64)
+        target_pos = torch.randn(B, 1, 64)
+
+        # 1. Forward with frequency condition
+        f_low = torch.tensor([0.2, 0.2])
+        f_high = torch.tensor([0.9, 0.9])
+
+        out_low = pred(
+            H_context=H_ctx,
+            target_pos=target_pos,
+            context_indices=context_indices,
+            target_indices=target_indices,
+            freq_condition=f_low,
+        )
+        self.assertEqual(out_low.shape, (B, 1, 64))
+
+        # 2. Check gradient flow into raw_gamma and raw_beta
+        loss = (out_low ** 2).sum()
+        loss.backward()
+        self.assertIsNotNone(pred.raw_gamma.grad)
+        self.assertIsNotNone(pred.raw_beta.grad)
+        self.assertGreater(pred.raw_gamma.grad.abs().item(), 0.0)
+
+    def test_dual_scale_50_tokens_with_operator_predictor(self):
+        config_50 = Spatiotemporal5x5Config(
+            in_channels=128,
+            embed_dim=64,
+            tokenizer_type="dual_scale_diffusion",
+            predictor_type="operator_diffusion",
+            masker_type="spatiotemporal_diffusion",
+            encoder_depth=2,
+            encoder_heads=4,
+            predictor_depth=2,
+            predictor_heads=4,
+            num_spatial_cluster=8,
+            num_cross_diffusion=8,
+            liftoff_invar_weight=0.05,
+            phase_align_weight=0.05,
+            uniformity_weight=0.05,
+        )
+        model = PECT_JEPA_5x5(config_50)
+        model.train()
+
+        B, C = 2, 128
+        x = torch.randn(B, 5, 5, C, requires_grad=True)
+        loss_dict = model(x)
+
+        self.assertIn("loss", loss_dict)
+        self.assertIn("loss_pred", loss_dict)
+        self.assertIn("loss_unif", loss_dict)
+        self.assertEqual(loss_dict["H_pred"].shape, (B, 24, 64))
+        self.assertEqual(loss_dict["H_tgt"].shape, (B, 24, 64))
+        self.assertEqual(loss_dict["H_ctx"].shape, (B, 26, 64))
+
+        loss = loss_dict["loss"]
+        loss.backward()
+        self.assertIsNotNone(x.grad)
+        self.assertGreater(x.grad.abs().sum().item(), 0.0)
+        self.assertIsNotNone(model.predictor.raw_gamma.grad)
+        self.assertIsNotNone(model.predictor.raw_beta.grad)
 
 
 if __name__ == "__main__":

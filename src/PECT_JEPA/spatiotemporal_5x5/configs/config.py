@@ -51,9 +51,11 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "standard"    # 'standard' (Clean Spatiotemporal Predictor) | 'operator_diffusion'
+    predictor_type: str = "operator_diffusion" # 'operator_diffusion' (Physics Neural Operator with Green's Attention Bias) | 'standard'
     predictor_depth: int = 2
     predictor_heads: int = 4
+    diffusion_gamma_init: float = 1.0   # Spatial diffusion attenuation rate gamma for Green's attention bias
+    diffusion_beta_init: float = 0.5    # Cross-scale depth barrier beta for Green's attention bias
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     ema_momentum: float = 0.990         # Start at 0.990 for fast early target evolution

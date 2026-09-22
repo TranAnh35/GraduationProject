@@ -108,8 +108,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--tokenizer_type", type=str, default="dual_scale_diffusion",
                    choices=["dual_scale_diffusion", "dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
                    help="Tokenizer architecture: 'dual_scale_diffusion' (50 tokens: Shallow vs Deep), 'dual_domain_attention', 'dual_domain', or 'time_only' (default: dual_scale_diffusion)")
-    p.add_argument("--predictor_type", type=str, default="standard", choices=["standard", "operator_diffusion"],
-                   help="Predictor architecture: 'standard' (Clean Spatiotemporal Transformer Predictor) or 'operator_diffusion' (default: standard)")
+    p.add_argument("--predictor_type", type=str, default="operator_diffusion", choices=["operator_diffusion", "standard"],
+                   help="Predictor architecture: 'operator_diffusion' (Physics Neural Operator with Green's attention bias) or 'standard' (default: operator_diffusion)")
+    p.add_argument("--diffusion_gamma_init", type=float, default=1.0,
+                   help="Initial spatial diffusion attenuation coefficient gamma for Green's attention bias (default: 1.0)")
+    p.add_argument("--diffusion_beta_init", type=float, default=0.5,
+                   help="Initial cross-scale vertical diffusion barrier beta for Green's attention bias (default: 0.5)")
     p.add_argument("--liftoff_invar_weight", type=float, default=0.05,
                    help="Physical lift-off invariance loss weight (default: 0.05)")
     p.add_argument("--phase_align_weight", type=float, default=0.05,
