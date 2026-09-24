@@ -312,16 +312,128 @@ class SpatiotemporalDiffusionMasker5x5:
         return context_indices, target_indices, mask_bool
 
 
+class ComplementarySpatiotemporalMasker5x5:
+    """
+    Complementary Spatiotemporal Masker (CST-Masker) for 5x5 PECT-JEPA.
+    Operates on 100 spatiotemporal tokens (25 spatial probe points * 4 temporal diffusion stages).
+
+    Principle (Resolving the Spatial Copying Shortcut on Sound Metal):
+      1. Spatial Cluster Partition:
+         Selects a contiguous cluster of `num_spatial_cluster` points (default 8) on the 5x5 grid
+         using random-walk neighbor expansion with hole-filling.
+         Target spatial points: S_tgt (8 points)
+         Context spatial points: S_ctx (17 points)
+      2. Asymmetric / Complementary Temporal Masking:
+         At Context points S_ctx: LATE temporal diffusion tokens (tau in {2, 3}) are ALSO MASKED!
+         Context Encoder only observes EARLY excitation tokens (tau in {0, 1}) -> 17 * 2 = 34 tokens.
+         Target Encoder represents LATE diffusion tokens (tau in {2, 3}) at S_tgt -> 8 * 2 = 16 tokens.
+
+      Guarantees:
+        - Late diffusion tokens tau in {2, 3} are completely absent from all context locations S_ctx.
+        - Predictor cannot copy horizontally from adjacent sound metal because NO neighbor has late tokens.
+        - Predictor cannot do 1D temporal extrapolation at the same spatial point because S_tgt not in S_ctx.
+        - Forces predictor to learn the 3D Green's function propagator G(Delta s, Delta tau).
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 5,
+        num_temporal_stages: int = 4,
+        num_spatial_cluster: int = 8,
+        mode: str = "causal",
+    ):
+        self.grid_size = grid_size
+        self.total_spatial = grid_size * grid_size  # 25
+        self.num_temporal_stages = num_temporal_stages  # 4
+        self.total_tokens = self.total_spatial * num_temporal_stages  # 100
+        self.num_spatial_cluster = min(num_spatial_cluster, self.total_spatial - 2)
+        self.mode = mode
+
+        # Base spatial cluster generator
+        self.spatial_masker = ContiguousClusterMasker5x5(
+            min_masked=self.num_spatial_cluster,
+            max_masked=self.num_spatial_cluster,
+            grid_size=grid_size,
+        )
+
+        # Token counts
+        self.num_sp_tgt = self.num_spatial_cluster  # 8
+        self.num_sp_ctx = self.total_spatial - self.num_sp_tgt  # 17
+        self.num_temporal_ctx = num_temporal_stages // 2  # 2
+        self.num_temporal_tgt = num_temporal_stages // 2  # 2
+
+        self.num_ctx = self.num_sp_ctx * self.num_temporal_ctx  # 17 * 2 = 34
+        self.num_tgt = self.num_sp_tgt * self.num_temporal_tgt  # 8 * 2 = 16
+
+    def sample_one(self, rng: random.Random) -> Tuple[List[int], List[int]]:
+        # 1. Sample contiguous spatial cluster for target
+        sp_ctx_list, sp_tgt_list = self.spatial_masker.sample_one(rng, self.num_spatial_cluster)
+
+        # 2. Determine temporal partitioning
+        if self.mode == "random":
+            # Random complementary 2 vs 2 stages
+            all_stages = list(range(self.num_temporal_stages))
+            rng.shuffle(all_stages)
+            t_ctx = sorted(all_stages[:self.num_temporal_ctx])
+            t_tgt = sorted(all_stages[self.num_temporal_ctx:])
+        else:
+            # Causal: early excitation (0, 1) -> late diffusion (2, 3)
+            t_ctx = list(range(self.num_temporal_ctx))  # [0, 1]
+            t_tgt = list(range(self.num_temporal_ctx, self.num_temporal_stages))  # [2, 3]
+
+        # 3. Context tokens: at each context spatial point, only t_ctx stages
+        ctx_tokens = []
+        for s in sp_ctx_list:
+            for tau in t_ctx:
+                ctx_tokens.append(s * self.num_temporal_stages + tau)
+
+        # 4. Target tokens: at each target spatial point, only t_tgt stages
+        tgt_tokens = []
+        for s in sp_tgt_list:
+            for tau in t_tgt:
+                tgt_tokens.append(s * self.num_temporal_stages + tau)
+
+        return sorted(ctx_tokens), sorted(tgt_tokens)
+
+    def sample_mask(
+        self,
+        batch_size: int,
+        device: torch.device = torch.device("cpu"),
+        seed: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ctx_all = []
+        tgt_all = []
+        mask_grid_all = np.zeros((batch_size, self.total_tokens), dtype=bool)
+
+        for b in range(batch_size):
+            sub_rng = random.Random(seed * 10007 + b) if seed is not None else random.Random()
+            ctx, tgt = self.sample_one(sub_rng)
+            ctx_all.append(ctx)
+            tgt_all.append(tgt)
+            mask_grid_all[b, tgt] = True
+
+        context_indices = torch.tensor(ctx_all, dtype=torch.long, device=device)
+        target_indices = torch.tensor(tgt_all, dtype=torch.long, device=device)
+        mask_bool = torch.from_numpy(mask_grid_all).to(device)
+        return context_indices, target_indices, mask_bool
+
+
 def build_masker_5x5(config):
     """
     Factory function to construct masker based on config and tokenizer type.
-    If tokenizer produces 50 tokens (dual_scale_diffusion), returns SpatiotemporalDiffusionMasker5x5.
-    If tokenizer produces 25 tokens (dual_domain_attention, time_only, etc.), returns ContiguousClusterMasker5x5.
+    Defaults to ComplementarySpatiotemporalMasker5x5 (CST-Masking: 100 tokens).
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "dual_scale_diffusion")
-    masker_type = getattr(config, "masker_type", "auto")
+    tokenizer_type = getattr(config, "tokenizer_type", "spatiotemporal_patch")
+    masker_type = getattr(config, "masker_type", "complementary_st")
 
-    if tokenizer_type in ("dual_scale_diffusion", "dual_scale") and masker_type != "contiguous_cluster":
+    if masker_type in ("complementary_st", "complementary_spatiotemporal", "cst", "auto", "default") or tokenizer_type in ("spatiotemporal_patch", "st_patch", "cst_patch"):
+        return ComplementarySpatiotemporalMasker5x5(
+            grid_size=config.grid_size,
+            num_temporal_stages=getattr(config, "num_temporal_stages", 4),
+            num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
+            mode=getattr(config, "cst_mask_mode", "causal"),
+        )
+    elif tokenizer_type in ("dual_scale_diffusion", "dual_scale") and masker_type != "contiguous_cluster":
         return SpatiotemporalDiffusionMasker5x5(
             grid_size=config.grid_size,
             num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
@@ -333,4 +445,5 @@ def build_masker_5x5(config):
             max_masked=config.max_masked,
             grid_size=config.grid_size,
         )
+
 

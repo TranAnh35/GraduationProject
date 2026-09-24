@@ -233,6 +233,24 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
         self.register_buffer("dist_table_25", dist_25, persistent=False)
         self.register_buffer("scale_diff_table_25", scale_diff_25, persistent=False)
 
+        # 100 tokens: 25 spatial points * 4 temporal diffusion stages
+        coords_100 = []
+        scales_100 = []
+        for k in range(100):
+            sp = k // 4
+            coords_100.append((float(sp % 5), float(sp // 5)))
+            scales_100.append(float(k % 4))
+
+        coords_100_t = torch.tensor(coords_100, dtype=torch.float32)  # [100, 2]
+        scales_100_t = torch.tensor(scales_100, dtype=torch.float32)  # [100]
+
+        diff_100 = coords_100_t.unsqueeze(1) - coords_100_t.unsqueeze(0)  # [100, 100, 2]
+        dist_100 = torch.norm(diff_100, p=2, dim=-1)  # [100, 100]
+        scale_diff_100 = torch.abs(scales_100_t.unsqueeze(1) - scales_100_t.unsqueeze(0))  # [100, 100]
+
+        self.register_buffer("dist_table_100", dist_100, persistent=False)
+        self.register_buffer("scale_diff_table_100", scale_diff_100, persistent=False)
+
     def forward(
         self,
         H_context: torch.Tensor,
@@ -246,7 +264,7 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
         Args:
             H_context: [B, N_ctx, D]
             target_pos: [B, N_tgt, D]
-            context_indices: optional [B, N_ctx] token indices into the 50-token or 25-token grid
+            context_indices: optional [B, N_ctx] token indices into the 100-token, 50-token, or 25-token grid
             target_indices: optional [B, N_tgt] token indices into the grid
             freq_condition: [B] normalized characteristic frequency in (0, 1]
             diffusion_operator: optional explicit [B, 1, D] condition
@@ -271,7 +289,10 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
         attn_bias = None
         if context_indices is not None and target_indices is not None:
             max_idx = max(int(target_indices.max().item()), int(context_indices.max().item()))
-            if max_idx >= 25:
+            if max_idx >= 50:
+                dist_table = self.dist_table_100
+                scale_table = self.scale_diff_table_100
+            elif max_idx >= 25:
                 dist_table = self.dist_table_50
                 scale_table = self.scale_diff_table_50
             else:

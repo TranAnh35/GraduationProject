@@ -215,8 +215,8 @@ class PECT_JEPA_5x5(nn.Module):
             phi_ewp = DualScaleDiffusionTokenizer5x5.compute_energy_weighted_phase(
                 x, num_bins=getattr(self.config, "num_freq_bins", 14)
             )  # [B, 25] in [-1, 1]
-            # Map context token indices to spatial grid indices (if 50 tokens: idx // 2, else idx)
-            spatial_idx = (context_indices // 2) if N_total == 50 else context_indices
+            # Map context token indices to spatial grid indices (if 100 tokens: idx // 4, if 50 tokens: idx // 2, else idx)
+            spatial_idx = (context_indices // 4) if N_total == 100 else ((context_indices // 2) if N_total == 50 else context_indices)
             phase_ctx = torch.gather(phi_ewp, dim=1, index=spatial_idx)  # [B, N_ctx]
             z_depth = self.depth_head(H_ctx).squeeze(-1)  # [B, N_ctx]
 
@@ -250,7 +250,10 @@ class PECT_JEPA_5x5(nn.Module):
         B = x.shape[0]
         tokens, pos = self.tokenizer(x)
         H = self.context_encoder(tokens, pos)  # [B, N_total, D]
-        if tokens.shape[1] == 50:
+        if tokens.shape[1] == 100:
+            # Center spatial pixel is index 12 -> 4 temporal stages: indices 48, 49, 50, 51
+            return H[:, 48:52, :].mean(dim=1)  # [B, D]
+        elif tokens.shape[1] == 50:
             # Center spatial pixel is index 12 -> shallow is 24, deep is 25
             return 0.5 * (H[:, 24, :] + H[:, 25, :])  # [B, D]
         else:
@@ -267,7 +270,10 @@ class PECT_JEPA_5x5(nn.Module):
             x = x.unsqueeze(0)
         tokens, pos = self.tokenizer(x)
         H = self.context_encoder(tokens, pos)  # [B, N_total, D]
-        if tokens.shape[1] == 50:
+        if tokens.shape[1] == 100:
+            # Average 4 temporal stages for each of the 25 spatial points
+            return H.view(-1, 25, 4, H.shape[-1]).mean(dim=2)  # [B, 25, D]
+        elif tokens.shape[1] == 50:
             # Average shallow and deep tokens for each of the 25 spatial points
             return 0.5 * (H[:, 0::2, :] + H[:, 1::2, :])  # [B, 25, D]
         else:

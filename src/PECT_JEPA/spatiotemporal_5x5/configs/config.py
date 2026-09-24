@@ -34,14 +34,16 @@ class Spatiotemporal5x5Config:
     max_files: Optional[int] = None
 
     # --------------------------------------------------------------- Masking
-    masker_type: str = "spatiotemporal_diffusion" # 'spatiotemporal_diffusion' (3D Space+Diffusion) | 'contiguous_cluster' (2D)
+    masker_type: str = "complementary_st" # 'complementary_st' (CST default) | 'spatiotemporal_diffusion' (3D) | 'contiguous_cluster' (2D)
     min_masked: int = 10                # Backward compatibility alias
     max_masked: int = 15                # Backward compatibility alias
-    num_spatial_cluster: int = 8        # Number of spatial grid points in cluster (x2 tokens = 16 tokens)
-    num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (8 tokens) -> Total 24 targets, 26 context
+    num_spatial_cluster: int = 8        # Number of spatial grid points in cluster
+    num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (for dual_scale)
+    num_temporal_stages: int = 4        # Number of chronological temporal diffusion stages (for CST)
+    cst_mask_mode: str = "causal"       # 'causal' (early ctx -> late tgt) | 'random' (random complementary)
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "dual_scale_diffusion" # 'dual_scale_diffusion' (Shallow vs Deep 50 tokens) | 'dual_domain_attention' | 'dual_domain' | 'time_only'
+    tokenizer_type: str = "spatiotemporal_patch" # 'spatiotemporal_patch' (100 tok default) | 'continuous_stf' | 'dual_scale_diffusion' (50 tok) | 'dual_domain_attention' | 'dual_domain' | 'time_only'
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'

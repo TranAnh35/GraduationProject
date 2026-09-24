@@ -243,6 +243,19 @@ class Trainer5x5:
 
             self.global_step += 1
 
+            # Periodic intra-epoch checkpoint saving for failure recovery
+            if self.global_step > 0 and self.global_step % 500 == 0:
+                latest_path = os.path.join(self.config.save_dir, "latest_model_5x5.pt")
+                try:
+                    self.save_checkpoint(
+                        latest_path,
+                        val_loss=self.best_val_loss if not np.isinf(self.best_val_loss) else None,
+                        val_loss_pred=self.best_val_loss_pred if not np.isinf(self.best_val_loss_pred) else None,
+                    )
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(f"[Trainer] Periodic checkpoint save failed: {e}")
+
             postfix = {
                 "loss": f"{loss_val:.4f}",
                 "pred": f"{pred_val:.4f}",

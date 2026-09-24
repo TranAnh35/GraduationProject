@@ -502,12 +502,199 @@ class DualScaleDiffusionTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class ContinuousSTFTokenizer5x5(nn.Module):
+    """
+    Continuous Spatiotemporal Filterbank Tokenizer for Multi-Waveform PECT-JEPA.
+    
+    Transforms the C-channel temporal A-scan at each spatial coordinate (i, j)
+    into a rich spatiotemporal-spectral token of dimension D:
+      1. Multi-Scale 1D Temporal Convolutions: 3 parallel causal kernels (k=5, 15, 31, stride=2)
+         extracting sharp Square rising edges, Gaussian wave packets, and slow diffusive exponential tails.
+      2. Full-Spectrum Harmonic Dispersion: Preserves all K frequency bins (normalized phase and log-magnitude)
+         without destructive scalar averaging.
+      3. Data-Driven Gated Dual-Domain Fusion: Learnable gating balances temporal transients and spectral phase
+         dynamically with zero external metadata.
+      4. 2D Spatial Positional Embedding: Added across 25 spatial grid coordinates.
+    
+    Input: [B, 5, 5, C] -> Output: tokens [B, 25, D], pos [B, 25, D]
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_tokens = grid_size * grid_size  # 25 spatial tokens
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+
+        # 1. Multi-scale 1D Temporal Conv Filterbank
+        d_sub = embed_dim // 3
+        self.conv_short = nn.Conv1d(1, d_sub, kernel_size=5, stride=2, padding=2)
+        self.conv_med = nn.Conv1d(1, d_sub, kernel_size=15, stride=2, padding=7)
+        self.conv_long = nn.Conv1d(1, embed_dim - 2 * d_sub, kernel_size=31, stride=2, padding=15)
+        self.act_time = nn.GELU()
+        self.time_pool = nn.AdaptiveAvgPool1d(1)
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Full-Spectrum Harmonic Dispersion
+        # 14 bins * 2 (phase and log-magnitude) = 28 features
+        self.spectral_dim = self.num_freq_bins * 2
+        self.freq_proj = nn.Linear(self.spectral_dim, embed_dim)
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Data-Driven Gated Dual-Domain Fusion
+        self.gate = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Sigmoid(),
+        )
+        self.fuse_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+        # 4. 2D Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        else:
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_flat = x.reshape(B * self.num_tokens, C)
+
+        # 1. Temporal Branch via Multi-Scale 1D Convolutions
+        x_1d = x_flat.unsqueeze(1)  # [B*25, 1, C]
+        h_s = self.conv_short(x_1d)
+        h_m = self.conv_med(x_1d)
+        h_l = self.conv_long(x_1d)
+        h_cat = self.act_time(torch.cat([h_s, h_m, h_l], dim=1))  # [B*25, D, C//2]
+        z_time = self.ln_time(self.time_pool(h_cat).squeeze(-1))   # [B*25, D]
+
+        # 2. Spectral Branch via Full Harmonic Dispersion
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)[:, 1:self.num_freq_bins + 1]  # Exclude DC
+        phase = torch.angle(X_fft) / torch.pi  # Normalized to [-1, 1]
+        mag = torch.log1p(torch.abs(X_fft))
+        spectral_feat = torch.cat([phase, mag], dim=-1).to(x_flat.dtype)  # [B*25, 2K]
+        z_freq = self.ln_freq(self.freq_proj(spectral_feat))             # [B*25, D]
+
+        # 3. Data-Driven Gated Fusion (Zero Metadata)
+        g = self.gate(torch.cat([z_time, z_freq], dim=-1))               # [B*25, D] in [0, 1]
+        z_fused = g * z_time + (1.0 - g) * z_freq
+        tokens = self.drop(self.norm_out(self.fuse_proj(z_fused))).reshape(B, self.num_tokens, self.embed_dim)
+
+        # 4. Positional Embedding
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
+class SpatiotemporalPatchTokenizer5x5(nn.Module):
+    """
+    Spatiotemporal Patch Tokenizer for PECT-JEPA.
+
+    Transforms the C-channel temporal A-scan at each spatial coordinate (i, j)
+    into T_s chronological diffusion stage tokens of dimension D:
+      - 25 spatial grid probes * T_s temporal stages (default T_s = 4 -> 100 tokens).
+      - Each token z_{(s, tau)} captures the local electromagnetic field state
+        at probe location s in diffusion time window tau.
+      - Disentangled 2D spatial + 1D temporal positional embeddings.
+      - Waveform-agnostic: operates natively across Square, Gaussian, and Chirp
+        without arbitrary static frequency cuts or metadata injection.
+
+    Input:  [B, 5, 5, C] -> Output: tokens [B, 100, D], pos [B, 100, D]
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_temporal_stages: int = 4,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_temporal_stages = num_temporal_stages  # 4
+        self.num_tokens = self.num_spatial * num_temporal_stages  # 100
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.chunk_size = in_channels // num_temporal_stages  # 32
+
+        # Linear projection per temporal chunk
+        self.chunk_proj = nn.Linear(self.chunk_size, embed_dim)
+        self.ln_chunk = nn.LayerNorm(embed_dim)
+
+        # 2D Spatial Positional Embedding
+        self.spatial_pos_embed = nn.Parameter(torch.zeros(1, self.num_spatial, 1, embed_dim))
+        nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
+
+        # 1D Temporal Positional Embedding (diffusion stage)
+        self.temporal_pos_embed = nn.Parameter(torch.zeros(1, 1, num_temporal_stages, embed_dim))
+        nn.init.trunc_normal_(self.temporal_pos_embed, std=0.02)
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        # Reshape to [B, 25, num_temporal_stages, chunk_size]
+        x_chunks = x.reshape(B, self.num_spatial, self.num_temporal_stages, self.chunk_size)
+
+        # Project each chunk to embed_dim
+        h = self.ln_chunk(self.chunk_proj(x_chunks))  # [B, 25, 4, D]
+
+        # Combine spatial and temporal positional embeddings
+        pos = (self.spatial_pos_embed + self.temporal_pos_embed).reshape(1, self.num_tokens, self.embed_dim).expand(B, -1, -1)
+
+        # Flatten tokens to [B, 100, D]
+        tokens = self.drop(h.reshape(B, self.num_tokens, self.embed_dim))
+
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
+    Defaults to SpatiotemporalPatchTokenizer5x5 (100 tokens: 25 probes x 4 diffusion stages).
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "dual_scale_diffusion")
-    if tokenizer_type in ("dual_scale_diffusion", "dual_scale"):
+    tokenizer_type = getattr(config, "tokenizer_type", "spatiotemporal_patch")
+    if tokenizer_type in ("spatiotemporal_patch", "st_patch", "cst_patch", "auto", "default"):
+        return SpatiotemporalPatchTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_temporal_stages=getattr(config, "num_temporal_stages", 4),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type in ("continuous_stf", "continuous_filterbank"):
+        return ContinuousSTFTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type in ("dual_scale_diffusion", "dual_scale"):
         return DualScaleDiffusionTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
@@ -551,4 +738,5 @@ def build_tokenizer_5x5(config) -> nn.Module:
         )
     else:
         raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")
+
 

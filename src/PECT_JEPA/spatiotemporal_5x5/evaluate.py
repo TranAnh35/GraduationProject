@@ -290,7 +290,11 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
 
     # If tokenizer_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "tokenizer_type" in cfg_dict):
-        if "tokenizer.cross_domain_attn.in_proj_weight" in state_dict or "tokenizer.fuse_proj.weight" in state_dict:
+        if "tokenizer.chunk_proj.weight" in state_dict:
+            config.tokenizer_type = "spatiotemporal_patch"
+        elif "tokenizer.conv_short.weight" in state_dict:
+            config.tokenizer_type = "continuous_stf"
+        elif "tokenizer.cross_domain_attn.in_proj_weight" in state_dict or "tokenizer.fuse_proj.weight" in state_dict:
             config.tokenizer_type = "dual_domain_attention"
         elif "tokenizer.time_proj.weight" in state_dict:
             config.tokenizer_type = "dual_domain"

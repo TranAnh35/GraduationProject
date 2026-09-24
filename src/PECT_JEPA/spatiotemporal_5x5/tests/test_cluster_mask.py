@@ -67,5 +67,62 @@ class TestContiguousClusterMasker5x5(unittest.TestCase):
                     )
 
 
+class TestComplementarySpatiotemporalMasker5x5(unittest.TestCase):
+
+    def setUp(self):
+        from ..masking.cluster_mask import ComplementarySpatiotemporalMasker5x5, build_masker_5x5
+        from ..configs.config import Spatiotemporal5x5Config
+        self.masker = ComplementarySpatiotemporalMasker5x5(
+            grid_size=5,
+            num_temporal_stages=4,
+            num_spatial_cluster=8,
+            mode="causal",
+        )
+        self.config = Spatiotemporal5x5Config()
+        self.build_masker = build_masker_5x5
+
+    def test_default_factory(self):
+        """Test that build_masker_5x5 defaults to ComplementarySpatiotemporalMasker5x5."""
+        from ..masking.cluster_mask import ComplementarySpatiotemporalMasker5x5
+        masker = self.build_masker(self.config)
+        self.assertIsInstance(masker, ComplementarySpatiotemporalMasker5x5)
+
+    def test_cst_mask_shapes_and_disjointness(self):
+        """Test tensor dimensions, total token counts, and complete disjointness."""
+        for seed in range(20):
+            ctx, tgt, mask_bool = self.masker.sample_mask(batch_size=8, seed=seed)
+            self.assertEqual(ctx.shape, (8, 34))
+            self.assertEqual(tgt.shape, (8, 16))
+            self.assertEqual(mask_bool.shape, (8, 100))
+
+            for b in range(8):
+                ctx_set = set(ctx[b].tolist())
+                tgt_set = set(tgt[b].tolist())
+                self.assertEqual(len(ctx_set & tgt_set), 0, "Context and target tokens must be strictly disjoint!")
+
+    def test_causal_diffusion_stages(self):
+        """Test that context tokens contain ONLY early stages (0, 1) and target tokens contain ONLY late stages (2, 3)."""
+        for seed in range(20):
+            ctx, tgt, _ = self.masker.sample_mask(batch_size=4, seed=seed)
+            for b in range(4):
+                for tok in ctx[b].tolist():
+                    stage = tok % 4
+                    self.assertIn(stage, (0, 1), f"Context token {tok} has invalid late stage {stage}!")
+                for tok in tgt[b].tolist():
+                    stage = tok % 4
+                    self.assertIn(stage, (2, 3), f"Target token {tok} has invalid early stage {stage}!")
+
+    def test_spatial_probes_partition(self):
+        """Test that target probes form 8 unique spatial locations and context probes form 17 unique spatial locations."""
+        for seed in range(20):
+            ctx, tgt, _ = self.masker.sample_mask(batch_size=4, seed=seed)
+            for b in range(4):
+                tgt_probes = set(tok // 4 for tok in tgt[b].tolist())
+                ctx_probes = set(tok // 4 for tok in ctx[b].tolist())
+                self.assertEqual(len(tgt_probes), 8, f"Expected 8 spatial target probes, got {len(tgt_probes)}")
+                self.assertEqual(len(ctx_probes), 17, f"Expected 17 spatial context probes, got {len(ctx_probes)}")
+                self.assertEqual(len(tgt_probes & ctx_probes), 0, "Target and context spatial probes must be disjoint!")
+
+
 if __name__ == "__main__":
     unittest.main()

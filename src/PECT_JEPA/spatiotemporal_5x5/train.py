@@ -111,9 +111,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Norm-floor barrier weight to prevent zero-vector collapse (default: 0.1)")
     p.add_argument("--norm_floor_target", type=float, default=1.0,
                    help="Minimum target L2 norm of representations (default: 1.0)")
-    p.add_argument("--tokenizer_type", type=str, default="dual_scale_diffusion",
-                   choices=["dual_scale_diffusion", "dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'dual_scale_diffusion' (50 tokens: Shallow vs Deep), 'dual_domain_attention', 'dual_domain', or 'time_only' (default: dual_scale_diffusion)")
+    p.add_argument("--tokenizer_type", type=str, default="spatiotemporal_patch",
+                   choices=["spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_scale_diffusion", "dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'spatiotemporal_patch' (100 tokens: Space x Time diffusion stages, default), 'continuous_stf', 'dual_scale_diffusion' (50 tokens), or others")
+    p.add_argument("--masker_type", type=str, default="complementary_st",
+                   choices=["auto", "complementary_st", "spatiotemporal_diffusion", "contiguous_cluster"],
+                   help="Masker strategy: 'complementary_st' (CST dual-domain default), 'spatiotemporal_diffusion', or 'contiguous_cluster'")
+    p.add_argument("--num_temporal_stages", type=int, default=4,
+                   help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
+    p.add_argument("--cst_mask_mode", type=str, default="causal", choices=["causal", "random"],
+                   help="CST masking temporal partition mode: 'causal' (early ctx -> late tgt) or 'random' (default: causal)")
     p.add_argument("--predictor_type", type=str, default="operator_diffusion", choices=["operator_diffusion", "standard"],
                    help="Predictor architecture: 'operator_diffusion' (Physics Neural Operator with Green's attention bias) or 'standard' (default: operator_diffusion)")
     p.add_argument("--diffusion_gamma_init", type=float, default=1.0,
@@ -224,6 +231,9 @@ def main():
         ema_momentum=args.ema_momentum,
         ema_momentum_end=args.ema_momentum_end,
         tokenizer_type=args.tokenizer_type,
+        masker_type=args.masker_type,
+        num_temporal_stages=args.num_temporal_stages,
+        cst_mask_mode=args.cst_mask_mode,
         num_freq_bins=args.num_freq_bins,
         spectral_features=args.spectral_features,
         phase_snr_tapering=args.phase_snr_tapering,
