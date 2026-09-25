@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union, Tuple
 from .attention import MultiheadSelfAttention, MultiheadCrossAttention, MLP
+from ..data.topologies import get_spatial_topology_offsets
 
 
 class PredictorBlock(nn.Module):
@@ -349,6 +350,8 @@ class ParabolicDiffusionPredictor5x5(Predictor5x5):
         num_freq_bins: int = 14,
         gamma_init: float = 1.0,
         alpha_init: float = 0.5,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
     ):
         super().__init__(
             embed_dim=embed_dim,
@@ -358,6 +361,8 @@ class ParabolicDiffusionPredictor5x5(Predictor5x5):
             dropout=dropout,
         )
         self.num_freq_bins = num_freq_bins
+        self.spatial_topology = spatial_topology
+        self.star_radii = star_radii
         self.op_embedding = DiffusionOperatorEmbedding(embed_dim=embed_dim)
 
         # Context-conditioned query baseline projection
@@ -373,30 +378,32 @@ class ParabolicDiffusionPredictor5x5(Predictor5x5):
         self._register_parabolic_tables()
 
     def _register_parabolic_tables(self):
+        offsets = get_spatial_topology_offsets(
+            topology=self.spatial_topology,
+            star_radii=self.star_radii
+        )  # [25, 2] in physical mm
+
         coords_100 = []
         stages_100 = []
         for k in range(100):
             sp = k // 4
-            coords_100.append((float(sp % 5), float(sp // 5)))
+            coords_100.append((float(offsets[sp, 0]), float(offsets[sp, 1])))
             stages_100.append(float(k % 4))
 
-        coords_100_t = torch.tensor(coords_100, dtype=torch.float32)  # [100, 2]
+        coords_100_t = torch.tensor(coords_100, dtype=torch.float32)  # [100, 2] in mm
         stages_100_t = torch.tensor(stages_100, dtype=torch.float32)  # [100]
 
         diff_100 = coords_100_t.unsqueeze(1) - coords_100_t.unsqueeze(0)  # [100, 100, 2]
-        dist_sq_100 = torch.sum(diff_100 ** 2, dim=-1)  # [100, 100] squared Euclidean distance
+        dist_sq_100 = torch.sum(diff_100 ** 2, dim=-1)  # [100, 100] physical squared distance in mm^2
         delta_tau_100 = stages_100_t.unsqueeze(1) - stages_100_t.unsqueeze(0)  # [100, 100]
 
         self.register_buffer("dist_sq_table_100", dist_sq_100, persistent=False)
         self.register_buffer("delta_tau_table_100", delta_tau_100, persistent=False)
 
-        # 25 spatial tokens table (5x5 grid)
-        coords_25 = []
-        for p in range(25):
-            coords_25.append((float(p % 5), float(p // 5)))
-        coords_25_t = torch.tensor(coords_25, dtype=torch.float32)  # [25, 2]
+        # 25 spatial tokens table in physical mm
+        coords_25_t = torch.from_numpy(offsets).float()  # [25, 2] in mm
         diff_25 = coords_25_t.unsqueeze(1) - coords_25_t.unsqueeze(0)  # [25, 25, 2]
-        dist_sq_25 = torch.sum(diff_25 ** 2, dim=-1)  # [25, 25]
+        dist_sq_25 = torch.sum(diff_25 ** 2, dim=-1)  # [25, 25] in mm^2
         self.register_buffer("dist_sq_table_25", dist_sq_25, persistent=False)
 
     def forward(
@@ -516,6 +523,8 @@ class ResidualDiffusionPredictor5x5(ParabolicDiffusionPredictor5x5):
         num_freq_bins: int = 14,
         gamma_init: float = 1.0,
         alpha_init: float = 0.5,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
     ):
         super().__init__(
             embed_dim=embed_dim,
@@ -526,6 +535,8 @@ class ResidualDiffusionPredictor5x5(ParabolicDiffusionPredictor5x5):
             num_freq_bins=num_freq_bins,
             gamma_init=gamma_init,
             alpha_init=alpha_init,
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
         )
         # Dedicated residual projection head
         self.residual_head = nn.Sequential(
@@ -642,6 +653,9 @@ def build_predictor_5x5(config) -> nn.Module:
     Defaults to ResidualDiffusionPredictor5x5 (Residual Diffusion Predictor).
     """
     predictor_type = getattr(config, "predictor_type", "residual_diffusion")
+    spatial_topology = getattr(config, "spatial_topology", "concentric_star")
+    star_radii = getattr(config, "star_radii", (1, 3, 7))
+
     if predictor_type in ("residual_diffusion", "residual", "auto", "default"):
         return ResidualDiffusionPredictor5x5(
             embed_dim=config.embed_dim,
@@ -652,6 +666,8 @@ def build_predictor_5x5(config) -> nn.Module:
             num_freq_bins=getattr(config, "num_freq_bins", 14),
             gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
             alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
         )
     elif predictor_type in ("parabolic_diffusion", "parabolic_greens", "parabolic"):
         return ParabolicDiffusionPredictor5x5(
@@ -663,6 +679,8 @@ def build_predictor_5x5(config) -> nn.Module:
             num_freq_bins=getattr(config, "num_freq_bins", 14),
             gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
             alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
         )
     elif predictor_type == "operator_diffusion":
         return OperatorDiffusionPredictor5x5(

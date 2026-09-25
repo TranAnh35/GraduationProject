@@ -805,13 +805,18 @@ class SpatioSpectralTokenizer5x5(nn.Module):
         # Compute full complex FFT: [B, 25, 65]
         X_fft = torch.fft.rfft(x_fp32, dim=-1)
 
+        # Vectorized analytic temporal subbands across all scales in 1 single CUDA kernel:
+        # [4, 1, 1, 65] * [1, B, 25, 65] -> [4, B, 25, 65] -> irfft -> [4, B, 25, in_channels]
+        windows_4d = self.windows.view(self.num_scales, 1, 1, -1).to(x_fp32.device)
+        X_subbands_fft = X_fft.unsqueeze(0) * windows_4d
+        x_subbands = torch.fft.irfft(X_subbands_fft, n=self.in_channels, dim=-1).to(x.dtype)
+
         scale_tokens_list = []
         for k in range(self.num_scales):
             s_idx, e_idx = self.band_slices[k]
 
-            # 1. Analytic temporal subband via inverse FFT: [B, 25, 128]
-            X_k = X_fft * self.windows[k].view(1, 1, -1)
-            x_k = torch.fft.irfft(X_k, n=self.in_channels, dim=-1).to(x.dtype)
+            # 1. Analytic temporal subband
+            x_k = x_subbands[k]
 
             # Temporal feature extraction
             z_time = self.ln_time[k](self.time_proj[k](x_k)) + self.domain_time  # [B, 25, D//2]

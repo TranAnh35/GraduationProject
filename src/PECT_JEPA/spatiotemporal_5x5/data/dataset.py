@@ -21,13 +21,14 @@ from .preprocessing import (
     normalize_waveforms_linear,
     apply_lowpass_filter,
 )
+from .topologies import get_spatial_topology_offsets
 
 
 class PECT5x5Dataset(Dataset):
     """
     Spatiotemporal 5x5 PECT C-scan Dataset.
-    Each item is a [5, 5, C] tensor (local 5x5 grid around point (row, col)),
-    where C = num_channels * log_time_samples (default 2 * 128 = 256).
+    Supports standard dense 5x5 grid or multi-scale Concentric Star topology.
+    Output item is always [5, 5, C] tensor (25 points).
     """
 
     def __init__(
@@ -35,6 +36,8 @@ class PECT5x5Dataset(Dataset):
         file_paths: Optional[List[str]] = None,
         arrays: Optional[np.ndarray] = None,  # [N_samples, 5, 5, C] for tests/synth
         metadata_list: Optional[List[Dict[str, Any]]] = None,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
         grid_size: int = 5,
         sX: int = 300,
         sY: int = 300,
@@ -54,13 +57,21 @@ class PECT5x5Dataset(Dataset):
         use_memmap: bool = True,
         cache_dir: Optional[str] = ".cache/pect_5x5_mmap",
         eps: float = 1e-8,
-        preload_ram: bool = False,
+        preload_ram: bool = True,
         return_meta: bool = True,
     ):
         super().__init__()
+        self.spatial_topology = spatial_topology
+        self.star_radii = star_radii
+        self.offsets = get_spatial_topology_offsets(
+            topology=spatial_topology,
+            star_radii=star_radii,
+            grid_size=grid_size,
+        )  # [25, 2]
+        self.max_offset = int(np.max(np.abs(self.offsets)))
+        self.pad = max(grid_size // 2, self.max_offset)
         self.return_meta = return_meta
         self.grid_size = grid_size
-        self.pad = grid_size // 2  # 2 for 5x5
         self.sX = sX
         self.sY = sY
         self.crop_border = max(0, int(crop_border))
@@ -224,8 +235,14 @@ class PECT5x5Dataset(Dataset):
         else:
             padded = self._in_memory_files[file_idx]
 
-        # Extract 5x5 window (from row : row + 5, col : col + 5 in padded array)
-        patch = np.array(padded[row:row + self.grid_size, col:col + self.grid_size, :], copy=True)
+        # Extract 25 points via vectorized topology offsets around center (row + pad, col + pad)
+        center_r = row + self.pad
+        center_c = col + self.pad
+        sample_rows = center_r + self.offsets[:, 0]
+        sample_cols = center_c + self.offsets[:, 1]
+        patch = np.array(padded[sample_rows, sample_cols, :], copy=True).reshape(
+            self.grid_size, self.grid_size, self.in_channels
+        )
 
         if not self.return_meta:
             return torch.from_numpy(patch).float()

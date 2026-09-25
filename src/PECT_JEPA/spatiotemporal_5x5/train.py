@@ -83,8 +83,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=256, help="Batch size (recommended: 128 - 512 for 5x5)")
     p.add_argument("--k_per_file", type=int, default=8, help="Points per file in file-balanced sampler")
     p.add_argument("--num_workers", type=str, default="auto", help="Number of CPU workers (integer or 'auto')")
-    p.add_argument("--preload_ram", type=lambda v: v.lower() == "true", default=False,
-                   help="Preload cached data into RAM (default: False to conserve system memory)")
+    p.add_argument("--preload_ram", type=lambda v: v.lower() == "true", default=True,
+                   help="Preload cached data into RAM (default: True to eliminate disk I/O seek latency)")
+    p.add_argument("--spatial_topology", type=str, default="concentric_star",
+                   choices=["concentric_star", "dense_5x5"],
+                   help="Spatial sampling topology: 'concentric_star' (EXP-13: 25 probes over 14x14mm, default) or 'dense_5x5'")
+    p.add_argument("--star_radii", type=int, nargs=3, default=[1, 3, 7],
+                   help="Radii in mm for concentric star rings (default: 1 3 7)")
     p.add_argument("--max_files", type=int, default=None, help="Limit number of TDMS files for debug")
     p.add_argument("--resample_mode", type=str, default="linear", choices=["linear", "dual_channel"],
                    help="Resampling mode: 'linear' (128 samples) or 'dual_channel' (256 samples)")
@@ -245,6 +250,8 @@ def main():
         ema_momentum_end=args.ema_momentum_end,
         tokenizer_type=args.tokenizer_type,
         num_scales=args.num_scales,
+        spatial_topology=args.spatial_topology,
+        star_radii=tuple(args.star_radii),
         masker_type=args.masker_type,
         num_temporal_stages=args.num_temporal_stages,
         cst_mask_mode=args.cst_mask_mode,
@@ -354,6 +361,8 @@ def main():
         early_window_frac=config.early_window_frac,
         raster_correction=config.raster_correction,
         crop_border=config.crop_border,
+        spatial_topology=config.spatial_topology,
+        star_radii=config.star_radii,
         apply_lowpass=config.apply_lowpass,
         lowpass_cutoff=config.lowpass_cutoff,
         lowpass_order=config.lowpass_order,
@@ -404,6 +413,8 @@ def main():
             early_window_frac=config.early_window_frac,
             raster_correction=config.raster_correction,
             crop_border=config.crop_border,
+            spatial_topology=config.spatial_topology,
+            star_radii=config.star_radii,
             apply_lowpass=config.apply_lowpass,
             lowpass_cutoff=config.lowpass_cutoff,
             lowpass_order=config.lowpass_order,

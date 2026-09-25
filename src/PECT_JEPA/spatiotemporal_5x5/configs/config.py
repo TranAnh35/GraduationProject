@@ -3,7 +3,7 @@ Configuration definitions for Unified 5x5 Spatiotemporal PECT-JEPA.
 """
 
 from dataclasses import dataclass, asdict, field, fields
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import json
 import os
 
@@ -32,6 +32,9 @@ class Spatiotemporal5x5Config:
     cache_dir: str = ".cache/pect_5x5_mmap"
     eps: float = 1e-8
     max_files: Optional[int] = None
+    spatial_topology: str = "concentric_star" # 'concentric_star' (EXP-13: 25 probes over 14x14mm) | 'dense_5x5' (legacy 4x4mm)
+    star_radii: Tuple[int, int, int] = (1, 3, 7) # Physical radii in mm for Ring 1, 2, 3
+    preload_ram: bool = True            # Preload cached files into RAM (920MB total) to eliminate disk seek bottleneck
 
     # --------------------------------------------------------------- Masking
     masker_type: str = "auto"           # 'auto' (ContiguousCluster for 25 tok, CST for 100 tok) | 'complementary_st' | 'contiguous_cluster'
