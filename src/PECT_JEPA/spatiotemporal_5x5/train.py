@@ -111,16 +111,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Norm-floor barrier weight to prevent zero-vector collapse (default: 0.1)")
     p.add_argument("--norm_floor_target", type=float, default=1.0,
                    help="Minimum target L2 norm of representations (default: 1.0)")
-    p.add_argument("--tokenizer_type", type=str, default="dual_domain_attention",
-                   choices=["dual_domain_attention", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_scale_diffusion", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'dual_domain_attention' (Waveform-agnostic 25 tokens, default), 'spatiotemporal_patch', 'continuous_stf', etc.")
+    p.add_argument("--tokenizer_type", type=str, default="spatio_spectral",
+                   choices=["spatio_spectral", "skin_depth", "dual_domain_attention", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_scale_diffusion", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'spatio_spectral' (EXP-12: 100 skin-depth tokens, default), 'dual_domain_attention', etc.")
+    p.add_argument("--num_scales", type=int, default=4,
+                   help="Number of physical skin-depth scales for spatio_spectral tokenizer (default: 4)")
     p.add_argument("--masker_type", type=str, default="auto",
                    choices=["auto", "complementary_st", "spatiotemporal_diffusion", "contiguous_cluster"],
                    help="Masker strategy: 'auto' (ContiguousCluster for 25 tok, CST for 100 tok, default), 'complementary_st', or 'contiguous_cluster'")
     p.add_argument("--num_temporal_stages", type=int, default=4,
                    help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
-    p.add_argument("--cst_mask_mode", type=str, default="causal", choices=["causal", "random"],
-                   help="CST masking temporal partition mode: 'causal' (early ctx -> late tgt) or 'random' (default: causal)")
+    p.add_argument("--cst_mask_mode", type=str, default="surface_to_depth", choices=["surface_to_depth", "causal", "random"],
+                   help="CST masking temporal partition mode: 'surface_to_depth' (default), 'causal', or 'random'")
     p.add_argument("--predictor_type", type=str, default="residual_diffusion",
                    choices=["residual_diffusion", "residual", "parabolic_diffusion", "operator_diffusion", "standard"],
                    help="Predictor architecture: 'residual_diffusion' (Residual Diffusion Predictor, default), 'parabolic_diffusion', 'operator_diffusion', or 'standard'")

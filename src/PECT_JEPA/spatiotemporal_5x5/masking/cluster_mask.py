@@ -376,6 +376,10 @@ class ComplementarySpatiotemporalMasker5x5:
             rng.shuffle(all_stages)
             t_ctx = sorted(all_stages[:self.num_temporal_ctx])
             t_tgt = sorted(all_stages[self.num_temporal_ctx:])
+        elif self.mode in ("surface_to_depth", "spectral_diffusion", "spectral"):
+            # Surface to deep: observe surface & shallow (2, 3) -> predict deep subsurface (0, 1)
+            t_ctx = [2, 3]
+            t_tgt = [0, 1]
         else:
             # Causal: early excitation (0, 1) -> late diffusion (2, 3)
             t_ctx = list(range(self.num_temporal_ctx))  # [0, 1]
@@ -439,6 +443,13 @@ def build_masker_5x5(config):
             grid_size=config.grid_size,
             num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
             num_cross_diffusion=getattr(config, "num_cross_diffusion", 8),
+        )
+    elif tokenizer_type in ("spatio_spectral", "skin_depth"):
+        return ComplementarySpatiotemporalMasker5x5(
+            grid_size=config.grid_size,
+            num_temporal_stages=getattr(config, "num_scales", 4),
+            num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
+            mode=getattr(config, "cst_mask_mode", "surface_to_depth"),
         )
     else:
         return ComplementarySpatiotemporalMasker5x5(

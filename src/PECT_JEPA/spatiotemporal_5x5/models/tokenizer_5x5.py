@@ -670,13 +670,203 @@ class SpatiotemporalPatchTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class SpatioSpectralTokenizer5x5(nn.Module):
+    """
+    Physics-Grounded Dual-Domain Spatio-Spectral Skin-Depth Tokenizer for 5x5 PECT-JEPA (EXP-12).
+
+    Transforms the C-channel waveform at each spatial coordinate (i, j) into 4 physical
+    skin-depth scale tokens via analytic subband filtering and physics-gated dual-domain fusion:
+      - 25 spatial probes x 4 skin-depth scales = 100 physical tokens.
+
+    Skin-Depth Scale Decomposition (Maxwell-Fourier diffusion delta ~ 1/sqrt(f)):
+      - Scale 0 (Deepest Subsurface / Back-Wall): Bins 0-2  (DC to ~156 Hz)
+      - Scale 1 (Mid-Deep Diffusion):             Bins 3-6  (~234 to ~468 Hz)
+      - Scale 2 (Mid-Shallow Diffusion):          Bins 7-14 (~546 to ~1093 Hz)
+      - Scale 3 (Near-Surface / Lift-Off):         Bins 15-64 (~1171 to 5000 Hz)
+
+    At each scale k:
+      1. Time Domain Branch:
+         - Waveform x_k(t) = irfft(X(f) * W_k(f), n=in_channels)
+         - 1D Temporal Linear projection: in_channels (128) -> D // 2
+         - Independent LayerNorm: ensures unit variance
+      2. Spectral Domain Branch:
+         - Fourier Phase theta_k = angle(X_k)/pi (Dodd-Deeds lift-off invariant)
+         - Log-magnitude ln(1 + |X_k|)
+         - Linear projection -> D // 2
+         - Independent LayerNorm
+      3. Physics-Gated Dual-Domain Fusion:
+         - Phase-based gating: Gate_k = sigmoid(Linear(z_freq_k))
+         - Gated temporal features: z_time_gated = z_time_k * Gate_k
+         - Fused projection with Residual Highway:
+           token(i, j, k) = LayerNorm(Linear([z_time_gated, z_freq_k]) + z_time_k)
+      4. 3D Positional Embedding:
+         - E_pos(i, j, k) = E_spatial(i, j) + E_scale(k)
+
+    Output: tokens [B, 100, D], pos [B, 100, D]
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_scales: int = 4,
+        phase_snr_tapering: bool = True,
+        phase_noise_floor: float = 0.05,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_scales = num_scales  # 4
+        self.num_tokens = self.num_spatial * num_scales  # 100
+        self.phase_snr_tapering = phase_snr_tapering
+        self.phase_noise_floor = max(1e-6, float(phase_noise_floor))
+
+        num_fft_bins = in_channels // 2 + 1  # 65 for in_channels=128
+
+        # Define 4 non-overlapping frequency bands covering all 65 bins
+        # Scale 0: 0..2 (3 bins) -> Deepest penetration (lowest freq)
+        # Scale 1: 3..6 (4 bins) -> Mid-deep
+        # Scale 2: 7..14 (8 bins) -> Mid-shallow
+        # Scale 3: 15..64 (50 bins) -> Near-surface / lift-off (highest freq)
+        self.band_slices = [
+            (0, 3),
+            (3, 7),
+            (7, 15),
+            (15, num_fft_bins),
+        ]
+        self.band_sizes = [end - start for start, end in self.band_slices]
+
+        # Register partition windows W_k(f) on buffer [4, 65]
+        windows = torch.zeros(num_scales, num_fft_bins)
+        for k, (s, e) in enumerate(self.band_slices):
+            windows[k, s:e] = 1.0
+        self.register_buffer("windows", windows, persistent=False)
+
+        half_dim = embed_dim // 2
+
+        # 1. Temporal branches per scale
+        self.time_proj = nn.ModuleList([
+            nn.Linear(in_channels, half_dim) for _ in range(num_scales)
+        ])
+        self.ln_time = nn.ModuleList([
+            nn.LayerNorm(half_dim) for _ in range(num_scales)
+        ])
+
+        # 2. Spectral branches per scale (phase + log-mag: 2 * M_k)
+        self.freq_proj = nn.ModuleList([
+            nn.Linear(2 * size, half_dim) for size in self.band_sizes
+        ])
+        self.ln_freq = nn.ModuleList([
+            nn.LayerNorm(half_dim) for _ in range(num_scales)
+        ])
+
+        # 3. Physics-Gated Dual-Domain Fusion per scale
+        self.gate_proj = nn.ModuleList([
+            nn.Linear(half_dim, half_dim) for _ in range(num_scales)
+        ])
+        self.fuse_proj = nn.ModuleList([
+            nn.Linear(embed_dim, embed_dim) for _ in range(num_scales)
+        ])
+        self.time_res = nn.ModuleList([
+            nn.Linear(half_dim, embed_dim) for _ in range(num_scales)
+        ])
+        self.norm_out = nn.ModuleList([
+            nn.LayerNorm(embed_dim) for _ in range(num_scales)
+        ])
+
+        # Domain embeddings
+        self.domain_time = nn.Parameter(torch.zeros(1, 1, half_dim))
+        self.domain_freq = nn.Parameter(torch.zeros(1, 1, half_dim))
+        nn.init.trunc_normal_(self.domain_time, std=0.02)
+        nn.init.trunc_normal_(self.domain_freq, std=0.02)
+
+        # 4. Separable 3D Positional Embedding: E_spatial(25) + E_scale(4)
+        self.pos_spatial = nn.Parameter(torch.zeros(1, self.num_spatial, 1, embed_dim))
+        self.pos_scale = nn.Parameter(torch.zeros(1, 1, self.num_scales, embed_dim))
+        nn.init.trunc_normal_(self.pos_spatial, std=0.02)
+        nn.init.trunc_normal_(self.pos_scale, std=0.02)
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_sp = x.reshape(B, self.num_spatial, C)
+        x_fp32 = x_sp.float()
+
+        # Compute full complex FFT: [B, 25, 65]
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)
+
+        scale_tokens_list = []
+        for k in range(self.num_scales):
+            s_idx, e_idx = self.band_slices[k]
+
+            # 1. Analytic temporal subband via inverse FFT: [B, 25, 128]
+            X_k = X_fft * self.windows[k].view(1, 1, -1)
+            x_k = torch.fft.irfft(X_k, n=self.in_channels, dim=-1).to(x.dtype)
+
+            # Temporal feature extraction
+            z_time = self.ln_time[k](self.time_proj[k](x_k)) + self.domain_time  # [B, 25, D//2]
+
+            # 2. Spectral feature extraction (Fourier phase + log-magnitude for band k)
+            X_band = X_fft[:, :, s_idx:e_idx]  # [B, 25, M_k]
+            phase_k = torch.angle(X_band) / torch.pi
+            mag_linear_k = torch.abs(X_band)
+            mag_k = torch.log1p(mag_linear_k)
+
+            if self.phase_snr_tapering:
+                snr_weight = torch.tanh(mag_linear_k / self.phase_noise_floor)
+                phase_k = phase_k * snr_weight
+
+            spectral_feat_k = torch.cat([phase_k, mag_k], dim=-1).to(x.dtype)  # [B, 25, 2*M_k]
+            z_freq = self.ln_freq[k](self.freq_proj[k](spectral_feat_k)) + self.domain_freq  # [B, 25, D//2]
+
+            # 3. Physics-Gated Dual-Domain Fusion
+            gate = torch.sigmoid(self.gate_proj[k](z_freq))  # [B, 25, D//2]
+            z_time_gated = z_time * gate
+
+            z_cat = torch.cat([z_time_gated, z_freq], dim=-1)  # [B, 25, D]
+            z_fused = self.fuse_proj[k](z_cat) + self.time_res[k](z_time)  # [B, 25, D]
+            token_k = self.norm_out[k](z_fused)  # [B, 25, D]
+
+            scale_tokens_list.append(token_k)
+
+        # Stack into [B, 25, 4, D] -> reshape to [B, 100, D]
+        # Order: token for probe s, scale k is at index s*4 + k
+        tokens_grid = torch.stack(scale_tokens_list, dim=2)  # [B, 25, 4, D]
+        tokens = self.drop(tokens_grid.reshape(B, self.num_tokens, self.embed_dim))
+
+        # 4. Positional Embedding: [B, 25, 4, D] -> [B, 100, D]
+        pos = (self.pos_spatial + self.pos_scale).reshape(1, self.num_tokens, self.embed_dim).expand(B, -1, -1)
+
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
-    Defaults to SpatiotemporalPatchTokenizer5x5 (100 tokens: 25 probes x 4 diffusion stages).
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "spatiotemporal_patch")
-    if tokenizer_type in ("spatiotemporal_patch", "st_patch", "cst_patch", "auto", "default"):
+    tokenizer_type = getattr(config, "tokenizer_type", "spatio_spectral")
+    if tokenizer_type in ("spatio_spectral", "skin_depth"):
+        return SpatioSpectralTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_scales=getattr(config, "num_scales", 4),
+            phase_snr_tapering=getattr(config, "phase_snr_tapering", True),
+            phase_noise_floor=getattr(config, "phase_noise_floor", 0.05),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type in ("spatiotemporal_patch", "st_patch", "cst_patch", "auto", "default"):
         return SpatiotemporalPatchTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,

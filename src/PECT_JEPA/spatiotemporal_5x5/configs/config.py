@@ -39,11 +39,11 @@ class Spatiotemporal5x5Config:
     max_masked: int = 15                # Backward compatibility alias
     num_spatial_cluster: int = 8        # Number of spatial grid points in cluster
     num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (for dual_scale)
-    num_temporal_stages: int = 4        # Number of chronological temporal diffusion stages (for CST)
-    cst_mask_mode: str = "causal"       # 'causal' (early ctx -> late tgt) | 'random' (random complementary)
+    cst_mask_mode: str = "surface_to_depth" # 'surface_to_depth' (surface ctx -> deep subsurface tgt) | 'causal' | 'random'
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (Waveform-agnostic 25 tok default) | 'spatiotemporal_patch' | 'continuous_stf'
+    tokenizer_type: str = "spatio_spectral" # 'spatio_spectral' (EXP-12: 100 skin-depth dual-domain tokens) | 'dual_domain_attention' | 'spatiotemporal_patch'
+    num_scales: int = 4                 # Number of physical skin-depth scales (for spatio_spectral)
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
