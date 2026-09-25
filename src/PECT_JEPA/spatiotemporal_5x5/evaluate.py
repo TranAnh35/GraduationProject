@@ -45,6 +45,8 @@ import sys
 import types
 from typing import List, Dict, Any, Optional, Tuple
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # Defensive safeguard for HPC clusters where torch._dynamo has broken imports or NumPy 2.x conflicts
 try:
     import torch._dynamo
@@ -704,7 +706,7 @@ def run_cross_file_ood_benchmark(
     test_files: List[str],
     output_dir: str,
     data_dir: str = "data",
-    batch_size: int = 512,
+    batch_size: int = 2048,
     device: str = "cuda",
     crop_border: int = 15,
     pts_per_train_file: int = 1000,
@@ -772,6 +774,13 @@ def run_cross_file_ood_benchmark(
     y_train_pool = np.concatenate(train_labels_list, axis=0)
     print(f"  Train Probe Pool: {len(y_train_pool)} samples ({np.sum(y_train_pool == 1)} defects, {np.sum(y_train_pool == 0)} sound)")
 
+    # Fit probe once on training pool for ultra-fast, consistent cross-file zero-shot inference
+    try:
+        scaler, lr_probe, mlp_probe = suite.fit_binary_detector(X_train_pool, y_train_pool)
+    except Exception as e:
+        print(f"  [Error] Failed to fit base training probe: {e}")
+        return {"error": str(e)}
+
     # Step 2: Evaluate frozen probe zero-shot on each held-out test file
     ood_file_results = []
     for fp in test_files:
@@ -794,7 +803,7 @@ def run_cross_file_ood_benchmark(
             sub_f = fmap[:min_Y, :min_X].reshape(-1, fmap.shape[-1])
             sub_y = mask[:min_Y, :min_X].reshape(-1)
 
-            ood_metrics = suite.benchmark_cross_file_ood(X_train_pool, y_train_pool, sub_f, sub_y)
+            ood_metrics = suite.eval_binary_detector(scaler, lr_probe, mlp_probe, sub_f, sub_y)
             if "error" not in ood_metrics:
                 meta = extract_file_metadata(fp)
                 ood_file_results.append({

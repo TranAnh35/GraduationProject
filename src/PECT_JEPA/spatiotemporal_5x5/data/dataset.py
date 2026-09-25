@@ -68,6 +68,8 @@ class PECT5x5Dataset(Dataset):
             star_radii=star_radii,
             grid_size=grid_size,
         )  # [25, 2]
+        self.offsets_r = self.offsets[:, 0]
+        self.offsets_c = self.offsets[:, 1]
         self.max_offset = int(np.max(np.abs(self.offsets)))
         self.pad = max(grid_size // 2, self.max_offset)
         self.return_meta = return_meta
@@ -96,6 +98,7 @@ class PECT5x5Dataset(Dataset):
 
         self.metadata_list: List[Dict[str, Any]] = []
         self._cache_paths: Dict[int, Tuple[str, tuple]] = {}
+        self._file_eff_dims: Dict[int, Tuple[int, int]] = {}
         self.sample_index: List[Tuple[int, int]] = []  # (file_idx, point_idx)
         self.file_point_counts: List[int] = []
         self._data: Optional[np.ndarray] = None
@@ -132,8 +135,9 @@ class PECT5x5Dataset(Dataset):
             pbar.set_postfix({"file": fname[:22]})
 
             if self.use_memmap:
+                radii_str = "_".join(str(r) for r in self.star_radii)
                 h = hashlib.md5(
-                    f"{fp}_5x5_{self.resample_mode}_{self.in_channels}_{self.normalization}_crop{self.crop_border}_lp{self.apply_lowpass}_{self.lowpass_cutoff}_{self.lowpass_order}".encode("utf-8")
+                    f"{fp}_topo_{self.spatial_topology}_radii{radii_str}_pad{self.pad}_{self.resample_mode}_{self.in_channels}_{self.normalization}_crop{self.crop_border}_lp{self.apply_lowpass}_{self.lowpass_cutoff}_{self.lowpass_order}".encode("utf-8")
                 ).hexdigest()
                 cache_path = os.path.join(self.cache_dir, f"{h}_padded.dat")
                 meta_path = os.path.join(self.cache_dir, f"{h}_padded.meta")
@@ -142,10 +146,12 @@ class PECT5x5Dataset(Dataset):
                     with open(meta_path, "r") as f:
                         shape = tuple(int(v) for v in f.read().strip().split(","))
                     self._cache_paths[f_idx] = (cache_path, shape)
-                    # Number of points is sY * sX (interior points before padding)
-                    n_points = (shape[0] - 2 * self.pad) * (shape[1] - 2 * self.pad)
+                    eff_sY = shape[0] - 2 * self.pad
+                    eff_sX = shape[1] - 2 * self.pad
+                    self._file_eff_dims[f_idx] = (eff_sY, eff_sX)
+                    n_points = eff_sY * eff_sX
                 else:
-                    padded_grid = self._load_and_pad_file(fp)  # [sY + 4, sX + 4, C]
+                    padded_grid = self._load_and_pad_file(fp)
                     with open(meta_path, "w") as f:
                         f.write(",".join(str(v) for v in padded_grid.shape))
                     mm = np.memmap(cache_path, dtype="float32", mode="w+", shape=padded_grid.shape)
@@ -153,11 +159,17 @@ class PECT5x5Dataset(Dataset):
                     mm.flush()
                     del mm
                     self._cache_paths[f_idx] = (cache_path, tuple(padded_grid.shape))
-                    n_points = (padded_grid.shape[0] - 2 * self.pad) * (padded_grid.shape[1] - 2 * self.pad)
+                    eff_sY = padded_grid.shape[0] - 2 * self.pad
+                    eff_sX = padded_grid.shape[1] - 2 * self.pad
+                    self._file_eff_dims[f_idx] = (eff_sY, eff_sX)
+                    n_points = eff_sY * eff_sX
             else:
                 padded_grid = self._load_and_pad_file(fp)
                 self._in_memory_files[f_idx] = padded_grid
-                n_points = (padded_grid.shape[0] - 2 * self.pad) * (padded_grid.shape[1] - 2 * self.pad)
+                eff_sY = padded_grid.shape[0] - 2 * self.pad
+                eff_sX = padded_grid.shape[1] - 2 * self.pad
+                self._file_eff_dims[f_idx] = (eff_sY, eff_sX)
+                n_points = eff_sY * eff_sX
 
             self.file_point_counts.append(n_points)
             for p in range(n_points):
@@ -221,7 +233,7 @@ class PECT5x5Dataset(Dataset):
             return torch.from_numpy(patch).float(), meta
 
         # Map 1D point_idx back to 2D (row, col) in cropped interior grid
-        eff_sX = self.eff_sX
+        eff_sX = self._file_eff_dims[file_idx][1] if file_idx in self._file_eff_dims else self.eff_sX
         row = point_idx // eff_sX
         col = point_idx % eff_sX
 
@@ -238,9 +250,9 @@ class PECT5x5Dataset(Dataset):
         # Extract 25 points via vectorized topology offsets around center (row + pad, col + pad)
         center_r = row + self.pad
         center_c = col + self.pad
-        sample_rows = center_r + self.offsets[:, 0]
-        sample_cols = center_c + self.offsets[:, 1]
-        patch = np.array(padded[sample_rows, sample_cols, :], copy=True).reshape(
+        sample_rows = center_r + self.offsets_r
+        sample_cols = center_c + self.offsets_c
+        patch = padded[sample_rows, sample_cols, :].reshape(
             self.grid_size, self.grid_size, self.in_channels
         )
 

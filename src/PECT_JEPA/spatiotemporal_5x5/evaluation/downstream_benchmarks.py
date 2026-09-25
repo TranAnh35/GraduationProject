@@ -377,20 +377,15 @@ class DownstreamBenchmarkSuite:
         Trains Linear Probe and MLP on frozen features from training files,
         and evaluates strictly zero-shot on held-out test files with zero spatial leakage.
         """
+    def fit_binary_detector(self, X_train: np.ndarray, y_train: np.ndarray) -> Tuple[Any, Any, Any]:
+        """Fits StandardScaler, Linear Probe, and MLP 2-Layer on training pool."""
         X_tr = X_train.reshape(-1, X_train.shape[-1]).astype(np.float32)
         y_tr = y_train.reshape(-1).astype(np.int64)
-        X_te = X_test.reshape(-1, X_test.shape[-1]).astype(np.float32)
-        y_te = y_test.reshape(-1).astype(np.int64)
-
         v_tr = np.where(y_tr >= 0)[0]
-        v_te = np.where(y_te >= 0)[0]
         X_tr, y_tr = X_tr[v_tr], y_tr[v_tr]
-        X_te, y_te = X_te[v_te], y_te[v_te]
 
         if len(np.unique(y_tr)) < 2:
-            return {"error": "Training set needs at least 2 distinct classes"}
-        if len(np.unique(y_te)) < 2:
-            return {"error": "Test set needs at least 2 distinct classes for AUC"}
+            raise ValueError("Training set needs at least 2 distinct classes")
 
         pos_tr = np.where(y_tr == 1)[0]
         neg_tr = np.where(y_tr == 0)[0]
@@ -402,9 +397,7 @@ class DownstreamBenchmarkSuite:
 
         scaler = StandardScaler()
         X_tr_s = scaler.fit_transform(X_tr)
-        X_te_s = scaler.transform(X_te)
 
-        # 1. Linear Probe
         lr = LogisticRegression(
             C=1.0,
             max_iter=max(500, self.max_iter),
@@ -414,15 +407,7 @@ class DownstreamBenchmarkSuite:
             solver="lbfgs",
         )
         lr.fit(X_tr_s, y_tr)
-        p_lr = lr.predict_proba(X_te_s)[:, 1]
-        y_pred_lr = (p_lr >= 0.5).astype(int)
 
-        l_auc = float(roc_auc_score(y_te, p_lr))
-        l_ap = float(average_precision_score(y_te, p_lr))
-        l_f1 = float(f1_score(y_te, y_pred_lr, zero_division=0))
-        l_acc = float(accuracy_score(y_te, y_pred_lr))
-
-        # 2. MLP 2-Layer Probe
         mlp = MLPClassifier(
             hidden_layer_sizes=(self.mlp_hidden_dim,),
             activation="relu",
@@ -433,6 +418,34 @@ class DownstreamBenchmarkSuite:
         )
         sample_weights = compute_sample_weight("balanced", y_tr) if self.class_weight == "balanced" else None
         mlp.fit(X_tr_s, y_tr, sample_weight=sample_weights)
+        return scaler, lr, mlp
+
+    def eval_binary_detector(
+        self,
+        scaler: Any,
+        lr: Any,
+        mlp: Any,
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Evaluates pre-fitted probes zero-shot on test data."""
+        X_te = X_test.reshape(-1, X_test.shape[-1]).astype(np.float32)
+        y_te = y_test.reshape(-1).astype(np.int64)
+        v_te = np.where(y_te >= 0)[0]
+        X_te, y_te = X_te[v_te], y_te[v_te]
+
+        if len(np.unique(y_te)) < 2:
+            return {"error": "Test set needs at least 2 distinct classes for AUC"}
+
+        X_te_s = scaler.transform(X_te)
+        p_lr = lr.predict_proba(X_te_s)[:, 1]
+        y_pred_lr = (p_lr >= 0.5).astype(int)
+
+        l_auc = float(roc_auc_score(y_te, p_lr))
+        l_ap = float(average_precision_score(y_te, p_lr))
+        l_f1 = float(f1_score(y_te, y_pred_lr, zero_division=0))
+        l_acc = float(accuracy_score(y_te, y_pred_lr))
+
         p_mlp = mlp.predict_proba(X_te_s)[:, 1]
         y_pred_mlp = (p_mlp >= 0.5).astype(int)
 
@@ -460,6 +473,22 @@ class DownstreamBenchmarkSuite:
                 "delta_f1": round(m_f1 - l_f1, 4),
             },
         }
+
+    def benchmark_cross_file_ood(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+    ) -> Dict[str, Any]:
+        """
+        Fits probe on training file(s) and evaluates zero-shot on an unseen test file.
+        """
+        try:
+            scaler, lr, mlp = self.fit_binary_detector(X_train, y_train)
+        except ValueError as e:
+            return {"error": str(e)}
+        return self.eval_binary_detector(scaler, lr, mlp, X_test, y_test)
 
     # =========================================================================
     # Task 1c: Single C-Scan Spatial-Block Cross-Validation (Zero Patch Overlap)

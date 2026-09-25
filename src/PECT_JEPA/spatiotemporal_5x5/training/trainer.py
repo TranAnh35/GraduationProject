@@ -159,7 +159,7 @@ class Trainer5x5:
         )
 
         for batch in pbar:
-            x = batch["data"].to(self.device)
+            x = batch["data"].to(self.device, non_blocking=True)
             lr = self.lr_scheduler.step(self.global_step)
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
@@ -301,12 +301,14 @@ class Trainer5x5:
         )
 
         val_features = []
-        # Sample representations across the full validation dataset using a stride
-        # to capture true representation geometry across defects, sound metal, and lift-offs
-        val_stride = max(1, len(self.val_loader) // 16)
+        max_val_batches = getattr(self.config, "max_val_batches", 150)
+        eff_val_len = min(len(self.val_loader), max_val_batches) if max_val_batches else len(self.val_loader)
+        val_stride = max(1, eff_val_len // 16)
 
         for batch_idx, batch in enumerate(pbar):
-            x = batch["data"].to(self.device)
+            if max_val_batches is not None and batch_idx >= max_val_batches:
+                break
+            x = batch["data"].to(self.device, non_blocking=True)
             with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
                 loss_dict = self.model(x)
 

@@ -24,6 +24,8 @@ import sys
 import types
 from typing import Any, Optional
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # Defensive safeguard for HPC clusters where torch._dynamo has broken imports or NumPy 2.x conflicts
 try:
     import torch._dynamo
@@ -291,6 +293,9 @@ def main():
 
     # Initialize unified logger
     logger = PECTExperimentLogger5x5(config)
+
+    if torch.cuda.is_available() and config.device == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     # Unify checkpoint save_dir inside experiment directory if not explicitly custom
     if config.save_dir is None or config.save_dir in ("checkpoints/pect_jepa_5x5", "auto"):
