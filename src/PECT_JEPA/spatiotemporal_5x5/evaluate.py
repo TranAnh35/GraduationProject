@@ -300,7 +300,9 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
 
     # If tokenizer_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "tokenizer_type" in cfg_dict):
-        if "tokenizer.chunk_proj.weight" in state_dict:
+        if "tokenizer.pos_scale" in state_dict or "tokenizer.gate_proj.0.weight" in state_dict:
+            config.tokenizer_type = "spatio_spectral"
+        elif "tokenizer.chunk_proj.weight" in state_dict:
             config.tokenizer_type = "spatiotemporal_patch"
         elif "tokenizer.conv_short.weight" in state_dict:
             config.tokenizer_type = "continuous_stf"
@@ -313,7 +315,9 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
 
     # If predictor_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "predictor_type" in cfg_dict):
-        if "predictor.op_embedding.default_op" in state_dict:
+        if "predictor.gamma_raw" in state_dict:
+            config.predictor_type = "residual_diffusion"
+        elif "predictor.op_embedding.default_op" in state_dict:
             config.predictor_type = "operator_diffusion"
         else:
             config.predictor_type = "standard"
