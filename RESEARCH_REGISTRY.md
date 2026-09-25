@@ -20,7 +20,8 @@ This document permanently tracks all completed, rejected, and active research hy
 | **EXP-REJ-02** | Synthetic Lift-Off Perturbation Contractive Loss | Loss Proposal (`liftoff_invar_weight`) | 0 ep | N/A | **Rejected** | Violates Pure JEPA; regresses into Contrastive/Contractive learning with positive pairs. Synthetic 1D decay fails 3D field dynamics and risks blinding encoder to shallow defects. Fourier phase already provides intrinsic lift-off invariance. |
 | **EXP-REJ-03** | Hardcoded Chronological Temporal Stage Chunking ($\tau$) | `tokenizer_5x5.py`: `SpatiotemporalPatchTokenizer5x5` | Evaluated in EXP-08..10 | N/A | **Rejected** | Physically invalid for Chirp (where time = frequency, reversing skin depth order) and Gaussian (zero baseline at edges). Introduces Gibbs spectral leakage. |
 | **EXP-11** | Pure JEPA Multi-Waveform Dual-Domain Attention | `tokenizer_5x5.py`: `DualDomainAttentionTokenizer5x5` + `models/predictor.py`: `ResidualDiffusionPredictor5x5` | 10 ep | AUC: 82.33% ± 8.97% \| AP: 38.43% \| CNR: 1.61 \| Plate R²: 0.1464 \| Defect-Only R²: 0.5391 (Corrosion: 0.8048) \| CKA: 0.6666 \| Two-NN: 7.62D | **Evaluated** | Waveform-agnostic 25 spatial tokens (continuous temporal projection + 14-harmonic Fourier phase cross-attention). Pure JEPA without contrastive penalties. Defect-only R² reaches 0.8048 on Corrosion. Chirp waveform achieves highest AP (43.33%) & CNR (1.79). Linear/MLP representation gap = 0.08%. |
-| **EXP-12** | Dual-Domain Spatio-Spectral Skin-Depth JEPA | `tokenizer_5x5.py`: `SpatioSpectralTokenizer5x5` + `cluster_mask.py`: `ComplementarySpatiotemporalMasker5x5(mode="surface_to_depth")` + `models/predictor.py`: `ResidualDiffusionPredictor5x5` | 10 ep (Training) | Pending | **Active Hypothesis** | Waveform-agnostic 100 spatio-spectral tokens (25 probes x 4 skin-depth scales via analytic subband filtering). Context observes surface scales (2, 3) to predict deep subsurface scales (0, 1), eliminating spatial smoothing collapse while avoiding Chirp chronological time inversion. Pure JEPA with Stop-Grad target + VICReg. |
+| **EXP-12** | Dual-Domain Spatio-Spectral Skin-Depth JEPA | `tokenizer_5x5.py`: `SpatioSpectralTokenizer5x5` + `ComplementarySpatiotemporalMasker5x5(mode="surface_to_depth")` | 10 ep | AUC: 81.25% \| AP: 37.56% \| CNR: 1.67 \| Plate R²: 0.1268 \| Defect-Only R²: 0.5225 (Corrosion: 0.7912) \| CKA: 0.4547 \| Two-NN: 8.7D-9.4D | **Evaluated** | Waveform-agnostic 100 spatio-spectral tokens (25 probes x 4 skin-depth scales via analytic subband filtering). Solved Chirp penetration inversion and defect-only depth sizing collapse (Corrosion Defect R²=0.7912, Rivet_v1 Defect R²=0.4831). Autopsy revealed within-file spatial leakage in random CV (Spatial Block AP dropped to 7.66%, Zero-Shot AP to 1.72%). |
+| **EXP-13** | Multi-Scale Concentric Star (Octagram) Topology | `data/topologies.py` + `dataset.py` + `predictor.py` | 10 ep (In-Progress) | Pending | **Active Hypothesis** | Replaces dense 4x4mm² grid with 25 probes across 3 concentric rings (r=1, 3, 7mm) spanning 14x14mm² (matching coil footprint). Preserves 100% raw PECT measurements (pure JEPA, zero heuristic subtraction), breaks spatial smoothing shortcut, embeds natural sound-metal reference. Preload RAM + vectorized extractor optimization. |
 
 ---
 
@@ -296,6 +297,21 @@ This document permanently tracks all completed, rejected, and active research hy
 - **Empirical Rationale & Architectural Conclusion**:
   - *Waveform-Agnostic Skin-Depth Representation*: Decomposing waveforms into analytic Fourier subbands with 100% time-domain conservation ($\sum x_k(t) = x(t)$) prevented the catastrophic collapse on Chirp waveforms and maintained high Two-NN intrinsic dimension (**8.7D – 9.4D**).
   - *Resolution of Zero-Inflated Depth Sizing*: While previous 100-token models collapsed on defect depth sizing ($R^2 < 0$), EXP-12 maintains **$R^2 = 0.7912$ on Corrosion** and **$0.4831$ on Rivet_v1**, achieving positive depth sizing without minority oversampling.
+
+### EXP-13: Multi-Scale Concentric Star (Octagram) Topology PECT-JEPA
+- **Run Directory**: Pending execution
+- **Configuration**:
+  - Spatial Topology: `concentric_star` (25 omnidirectional probes across 3 concentric rings: Center, Ring 1 at $r=1\,\text{mm}$, Ring 2 at $r=3\,\text{mm}$, Ring 3 at $r=7\,\text{mm}$; spanning $14 \times 14\,\text{mm}^2$).
+  - Tokenizer: `SpatioSpectralTokenizer5x5` (100 tokens: 25 star probes $\times$ 4 skin-depth scales via vectorized analytic Fourier subband filtering).
+  - Masker: `ComplementarySpatiotemporalMasker5x5(mode="surface_to_depth")`.
+  - Predictor: `ResidualDiffusionPredictor5x5` with physical Euclidean distance matrix $D \in \mathbb{R}^{25 \times 25}$ in exact millimeters.
+  - Loss & Regularization: 100% Pure JEPA, zero heuristic subtraction, VICReg var=1.0, cov=1.0, Stop-Gradient target.
+  - Compute Optimizations: `preload_ram=True` (eliminates disk seek latency), vectorized single-kernel `irfft` across all 4 scales, 2048-batch vectorized C-scan feature extraction (20x faster evaluation).
+- **Core Hypothesis**:
+  - Replaces dense $4 \times 4\,\text{mm}^2$ grid with $14 \times 14\,\text{mm}^2$ coil-scale aperture without increasing token count.
+  - Breaks the local spatial smoothing shortcut by removing redundant 1 mm adjacent pairs.
+  - Incorporates natural sound-metal reference in Ring 3 while preserving 100% raw unadulterated PECT measurements.
+
 
 
 
