@@ -12,6 +12,8 @@ from .target_encoder import TargetEncoder5x5
 from .predictor import (
     Predictor5x5,
     OperatorDiffusionPredictor5x5,
+    ParabolicDiffusionPredictor5x5,
+    ResidualDiffusionPredictor5x5,
     build_predictor_5x5,
 )
 from .jepa_5x5 import PECT_JEPA_5x5
@@ -28,6 +30,8 @@ __all__ = [
     "TargetEncoder5x5",
     "Predictor5x5",
     "OperatorDiffusionPredictor5x5",
+    "ParabolicDiffusionPredictor5x5",
+    "ResidualDiffusionPredictor5x5",
     "build_predictor_5x5",
     "PECT_JEPA_5x5",
 ]

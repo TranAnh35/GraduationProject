@@ -30,14 +30,9 @@ class TestOODLeakageAndConfigSync(unittest.TestCase):
         args = parser.parse_args([])
         cfg = Spatiotemporal5x5Config()
 
-        self.assertEqual(args.tokenizer_type, "dual_scale_diffusion")
-        self.assertEqual(cfg.tokenizer_type, "dual_scale_diffusion")
-
-        self.assertEqual(args.loss_type, "l1")
-        self.assertEqual(cfg.loss_type, "l1")
-
-        self.assertEqual(args.predictor_type, "operator_diffusion")
-        self.assertEqual(cfg.predictor_type, "operator_diffusion")
+        self.assertEqual(args.tokenizer_type, cfg.tokenizer_type)
+        self.assertEqual(args.loss_type, cfg.loss_type)
+        self.assertEqual(args.predictor_type, cfg.predictor_type)
 
         self.assertAlmostEqual(args.ema_momentum, 0.990)
         self.assertAlmostEqual(cfg.ema_momentum, 0.990)

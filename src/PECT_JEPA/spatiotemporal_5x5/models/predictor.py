@@ -8,7 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 from .attention import MultiheadSelfAttention, MultiheadCrossAttention, MLP
 
 
@@ -107,7 +107,7 @@ class DiffusionOperatorEmbedding(nn.Module):
         args = freq_val.float() * scales.unsqueeze(0) * torch.pi  # [B, M]
 
         fourier_feats = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # [B, 2*M]
-        q_diff = self.mlp(fourier_feats).unsqueeze(1)  # [B, 1, embed_dim]
+        q_diff = self.mlp(fourier_feats).unsqueeze(1) + self.default_op  # [B, 1, embed_dim]
         return q_diff
 
 
@@ -323,12 +323,348 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
         return super().forward(H_context, target_pos, diffusion_operator=op_cond, attn_bias=attn_bias)
 
 
+class ParabolicDiffusionPredictor5x5(Predictor5x5):
+    """
+    Parabolic Green's Function Diffusion Predictor for CST-Masking (100 tokens: 25 probes x 4 stages).
+
+    1. Context-Conditioned Query Initialization:
+       Grounds target queries in the observed excitation field baseline bar{H}_ctx(tau=0)
+       rather than an uninformative static mask token:
+           q_i = Linear(bar{H}_ctx(tau=0)) + target_pos_i + q_diff(omega_bar)
+
+    2. Parabolic Spatiotemporal Green's Diffusion Attention Bias:
+       Exact heat kernel fundamental solution for nabla^2 B = mu * sigma * d(B)/dt:
+           G(Delta r, Delta tau) ~ (4 * pi * D * Delta tau)^(-3/2) * exp(- ||Delta r||^2 / (4 * D * Delta tau))
+       Attention Log-Bias:
+           M_{ij}^{diff} = - gamma(omega_bar) * ||Delta r_{ij}||^2 / Delta tau_{ij} - alpha * log(Delta tau_{ij})
+       for Delta tau_{ij} = tau_tgt - tau_ctx > 0, and -10000.0 (strictly causal) otherwise.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        depth: int = 2,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        num_freq_bins: int = 14,
+        gamma_init: float = 1.0,
+        alpha_init: float = 0.5,
+    ):
+        super().__init__(
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+        )
+        self.num_freq_bins = num_freq_bins
+        self.op_embedding = DiffusionOperatorEmbedding(embed_dim=embed_dim)
+
+        # Context-conditioned query baseline projection
+        self.ctx_init_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm_ctx_init = nn.LayerNorm(embed_dim)
+
+        # Learnable physical coupling parameters (strictly non-negative via softplus)
+        raw_gamma = math.log(math.exp(gamma_init) - 1.0) if gamma_init > 0 else 0.0
+        raw_alpha = math.log(math.exp(alpha_init) - 1.0) if alpha_init > 0 else 0.0
+        self.raw_gamma = nn.Parameter(torch.tensor(raw_gamma, dtype=torch.float32))
+        self.raw_alpha = nn.Parameter(torch.tensor(raw_alpha, dtype=torch.float32))
+
+        self._register_parabolic_tables()
+
+    def _register_parabolic_tables(self):
+        coords_100 = []
+        stages_100 = []
+        for k in range(100):
+            sp = k // 4
+            coords_100.append((float(sp % 5), float(sp // 5)))
+            stages_100.append(float(k % 4))
+
+        coords_100_t = torch.tensor(coords_100, dtype=torch.float32)  # [100, 2]
+        stages_100_t = torch.tensor(stages_100, dtype=torch.float32)  # [100]
+
+        diff_100 = coords_100_t.unsqueeze(1) - coords_100_t.unsqueeze(0)  # [100, 100, 2]
+        dist_sq_100 = torch.sum(diff_100 ** 2, dim=-1)  # [100, 100] squared Euclidean distance
+        delta_tau_100 = stages_100_t.unsqueeze(1) - stages_100_t.unsqueeze(0)  # [100, 100]
+
+        self.register_buffer("dist_sq_table_100", dist_sq_100, persistent=False)
+        self.register_buffer("delta_tau_table_100", delta_tau_100, persistent=False)
+
+        # 25 spatial tokens table (5x5 grid)
+        coords_25 = []
+        for p in range(25):
+            coords_25.append((float(p % 5), float(p // 5)))
+        coords_25_t = torch.tensor(coords_25, dtype=torch.float32)  # [25, 2]
+        diff_25 = coords_25_t.unsqueeze(1) - coords_25_t.unsqueeze(0)  # [25, 25, 2]
+        dist_sq_25 = torch.sum(diff_25 ** 2, dim=-1)  # [25, 25]
+        self.register_buffer("dist_sq_table_25", dist_sq_25, persistent=False)
+
+    def forward(
+        self,
+        H_context: torch.Tensor,
+        target_pos: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+        freq_condition: Optional[torch.Tensor] = None,
+        diffusion_operator: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, N_tgt, D = target_pos.shape
+        device = target_pos.device
+
+        # 1. Operator Query Condition
+        if diffusion_operator is None:
+            if freq_condition is not None:
+                if freq_condition.dtype in (torch.int32, torch.int64):
+                    freq_norm = freq_condition.float() / float(self.num_freq_bins)
+                else:
+                    freq_norm = freq_condition.float()
+                op_cond = self.op_embedding(freq_norm)
+            else:
+                op_cond = self.op_embedding.default_op
+        else:
+            op_cond = diffusion_operator
+
+        # 2. Context-Conditioned Query Initialization
+        if context_indices is not None and context_indices.max() >= 50:
+            mask_t0 = (context_indices % 4 == 0).to(device)  # [B, N_ctx]
+            denom = mask_t0.sum(dim=-1, keepdim=True).clamp(min=1).unsqueeze(-1)
+            H_ctx_t0 = (H_context * mask_t0.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B, 1, D]
+        else:
+            H_ctx_t0 = H_context.mean(dim=1, keepdim=True)
+
+        q_baseline = self.norm_ctx_init(self.ctx_init_proj(H_ctx_t0))  # [B, 1, D]
+        queries = q_baseline.expand(B, N_tgt, -1) + self.mask_token.expand(B, N_tgt, -1) + target_pos
+        if op_cond is not None:
+            if op_cond.ndim == 2:
+                op_cond = op_cond.unsqueeze(1)
+            queries = queries + op_cond
+
+        # 3. Exact Parabolic Green's Function Attention Bias
+        attn_bias = None
+        if context_indices is not None and target_indices is not None:
+            if target_indices.max() >= 50:
+                t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
+                c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
+
+                d_sq = self.dist_sq_table_100[t_idx, c_idx]      # [B, N_tgt, N_ctx]
+                d_tau = self.delta_tau_table_100[t_idx, c_idx]   # [B, N_tgt, N_ctx] (tau_tgt - tau_ctx)
+
+                if freq_condition is not None:
+                    if freq_condition.dtype in (torch.int32, torch.int64):
+                        f_val = freq_condition.float() / float(self.num_freq_bins)
+                    else:
+                        f_val = freq_condition.float()
+                    sqrt_freq = torch.sqrt(f_val.clamp(min=1e-4)).view(B, 1, 1).to(device)
+                else:
+                    sqrt_freq = torch.ones(B, 1, 1, device=device)
+
+                gamma = F.softplus(self.raw_gamma) * sqrt_freq
+                alpha = F.softplus(self.raw_alpha)
+
+                causal_mask = (d_tau > 0)
+                safe_d_tau = torch.clamp(d_tau, min=1.0)
+
+                # M_{ij}^{diff} = - gamma * (||Delta r||^2 / Delta tau) - alpha * log(Delta tau)
+                M_diff = - gamma * (d_sq / safe_d_tau) - alpha * torch.log(safe_d_tau)
+                M_diff = torch.where(
+                    causal_mask,
+                    M_diff,
+                    torch.tensor(-10000.0, device=device, dtype=M_diff.dtype)
+                )
+                attn_bias = M_diff.unsqueeze(1)  # [B, 1, N_tgt, N_ctx]
+            else:
+                # 25 spatial tokens mode
+                t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
+                c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
+                d_sq = self.dist_sq_table_25[t_idx, c_idx]       # [B, N_tgt, N_ctx]
+                gamma = F.softplus(self.raw_gamma)
+                alpha = F.softplus(self.raw_alpha)
+                safe_r = torch.clamp(d_sq, min=1.0)
+                M_spatial = - gamma * d_sq - alpha * torch.log(safe_r)
+                attn_bias = M_spatial.unsqueeze(1)               # [B, 1, N_tgt, N_ctx]
+
+        q = queries
+        for blk in self.blocks:
+            q = blk(target_queries=q, H_context=H_context, attn_bias=attn_bias)
+
+        return self.norm(q)
+
+
+class ResidualDiffusionPredictor5x5(ParabolicDiffusionPredictor5x5):
+    """
+    Residual Diffusion Predictor for PECT-JEPA.
+
+    Instead of predicting the full macro target token H_tgt (which is 98% dominated
+    by the primary excitation field decay), this predictor models the DYNAMIC DIFFUSION RESIDUAL:
+        Delta H_tgt(tau) = H_tgt(tau) - h_base(tau=0)
+    
+    1. Extracts the early excitation baseline h_base from tau=0 context tokens.
+    2. Conditions target queries on h_base + target position + Green's parabolic diffusion bias.
+    3. Outputs the dynamic residual Delta H_pred in representation space.
+    4. Full predicted representation: H_pred = h_base + Delta H_pred.
+    
+    This mathematically decouples the static excitation field from the defect interaction,
+    enforcing that prediction capacity is dedicated 100% to eddy current diffusion and defect sizing.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        depth: int = 2,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        num_freq_bins: int = 14,
+        gamma_init: float = 1.0,
+        alpha_init: float = 0.5,
+    ):
+        super().__init__(
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            num_freq_bins=num_freq_bins,
+            gamma_init=gamma_init,
+            alpha_init=alpha_init,
+        )
+        # Dedicated residual projection head
+        self.residual_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        self.last_h_base: Optional[torch.Tensor] = None
+        self.last_delta_pred: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        H_context: torch.Tensor,
+        target_pos: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+        freq_condition: Optional[torch.Tensor] = None,
+        diffusion_operator: Optional[torch.Tensor] = None,
+        return_residual: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        B, N_tgt, D = target_pos.shape
+        device = target_pos.device
+
+        # 1. Operator Query Condition
+        if diffusion_operator is None:
+            if freq_condition is not None:
+                if freq_condition.dtype in (torch.int32, torch.int64):
+                    freq_norm = freq_condition.float() / float(self.num_freq_bins)
+                else:
+                    freq_norm = freq_condition.float()
+                op_cond = self.op_embedding(freq_norm)
+            else:
+                op_cond = self.op_embedding.default_op
+        else:
+            op_cond = diffusion_operator
+
+        # 2. Extract Early Context Baseline (tau = 0)
+        if context_indices is not None and context_indices.max() >= 50:
+            mask_t0 = (context_indices % 4 == 0).to(device)  # [B, N_ctx]
+            denom = mask_t0.sum(dim=-1, keepdim=True).clamp(min=1).unsqueeze(-1)
+            H_ctx_t0 = (H_context * mask_t0.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B, 1, D]
+        else:
+            H_ctx_t0 = H_context.mean(dim=1, keepdim=True)
+
+        h_base = self.norm_ctx_init(self.ctx_init_proj(H_ctx_t0))  # [B, 1, D]
+        queries = h_base.expand(B, N_tgt, -1) + self.mask_token.expand(B, N_tgt, -1) + target_pos
+        if op_cond is not None:
+            if op_cond.ndim == 2:
+                op_cond = op_cond.unsqueeze(1)
+            queries = queries + op_cond
+
+        # 3. Exact Parabolic Green's Function Attention Bias
+        attn_bias = None
+        if context_indices is not None and target_indices is not None:
+            if target_indices.max() >= 50:
+                t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
+                c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
+
+                d_sq = self.dist_sq_table_100[t_idx, c_idx]      # [B, N_tgt, N_ctx]
+                d_tau = self.delta_tau_table_100[t_idx, c_idx]   # [B, N_tgt, N_ctx]
+
+                if freq_condition is not None:
+                    if freq_condition.dtype in (torch.int32, torch.int64):
+                        f_val = freq_condition.float() / float(self.num_freq_bins)
+                    else:
+                        f_val = freq_condition.float()
+                    sqrt_freq = torch.sqrt(f_val.clamp(min=1e-4)).view(B, 1, 1).to(device)
+                else:
+                    sqrt_freq = torch.ones(B, 1, 1, device=device)
+
+                gamma = F.softplus(self.raw_gamma) * sqrt_freq
+                alpha = F.softplus(self.raw_alpha)
+
+                causal_mask = (d_tau > 0)
+                safe_d_tau = torch.clamp(d_tau, min=1.0)
+
+                # Green's Attention Bias
+                M_diff = - gamma * (d_sq / safe_d_tau) - alpha * torch.log(safe_d_tau)
+                M_diff = torch.where(
+                    causal_mask,
+                    M_diff,
+                    torch.tensor(-10000.0, device=device, dtype=M_diff.dtype)
+                )
+                attn_bias = M_diff.unsqueeze(1)  # [B, 1, N_tgt, N_ctx]
+            else:
+                # 25 spatial tokens mode
+                t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
+                c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
+                d_sq = self.dist_sq_table_25[t_idx, c_idx]       # [B, N_tgt, N_ctx]
+                gamma = F.softplus(self.raw_gamma)
+                alpha = F.softplus(self.raw_alpha)
+                safe_r = torch.clamp(d_sq, min=1.0)
+                M_spatial = - gamma * d_sq - alpha * torch.log(safe_r)
+                attn_bias = M_spatial.unsqueeze(1)               # [B, 1, N_tgt, N_ctx]
+
+        q = queries
+        for blk in self.blocks:
+            q = blk(target_queries=q, H_context=H_context, attn_bias=attn_bias)
+
+        delta_pred = self.residual_head(self.norm(q))  # [B, N_tgt, D]
+        H_pred = h_base.expand(B, N_tgt, -1) + delta_pred  # [B, N_tgt, D]
+
+        self.last_h_base = h_base
+        self.last_delta_pred = delta_pred
+
+        if return_residual:
+            return H_pred, delta_pred, h_base
+        return H_pred
+
+
 def build_predictor_5x5(config) -> nn.Module:
     """
     Factory function to construct Predictor based on config.
+    Defaults to ResidualDiffusionPredictor5x5 (Residual Diffusion Predictor).
     """
-    predictor_type = getattr(config, "predictor_type", "operator_diffusion")
-    if predictor_type == "operator_diffusion":
+    predictor_type = getattr(config, "predictor_type", "residual_diffusion")
+    if predictor_type in ("residual_diffusion", "residual", "auto", "default"):
+        return ResidualDiffusionPredictor5x5(
+            embed_dim=config.embed_dim,
+            depth=config.predictor_depth,
+            num_heads=config.predictor_heads,
+            mlp_ratio=config.mlp_ratio,
+            dropout=config.dropout,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
+            alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
+        )
+    elif predictor_type in ("parabolic_diffusion", "parabolic_greens", "parabolic"):
+        return ParabolicDiffusionPredictor5x5(
+            embed_dim=config.embed_dim,
+            depth=config.predictor_depth,
+            num_heads=config.predictor_heads,
+            mlp_ratio=config.mlp_ratio,
+            dropout=config.dropout,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
+            alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
+        )
+    elif predictor_type == "operator_diffusion":
         return OperatorDiffusionPredictor5x5(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,
@@ -339,7 +675,7 @@ def build_predictor_5x5(config) -> nn.Module:
             gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
             beta_init=getattr(config, "diffusion_beta_init", 0.5),
         )
-    elif predictor_type in ("standard", "default"):
+    elif predictor_type == "standard":
         return Predictor5x5(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,

@@ -74,6 +74,9 @@ class PECT_JEPA_5x5(nn.Module):
             eps=config.eps,
             liftoff_invar_weight=getattr(config, "liftoff_invar_weight", 0.0),
             phase_align_weight=getattr(config, "phase_align_weight", 0.0),
+            fluct_weight=getattr(config, "fluct_weight", 2.0),
+            adaptive_disturbance_weight=getattr(config, "adaptive_disturbance_weight", 2.0),
+            temporal_mono_weight=getattr(config, "temporal_mono_weight", 0.05),
             var_weight=getattr(config, "var_weight", 1.0),
             cov_weight=getattr(config, "cov_weight", 1.0),
             var_gamma=getattr(config, "var_gamma", 1.0),
@@ -87,12 +90,6 @@ class PECT_JEPA_5x5(nn.Module):
         # 7. Physical Alignment Modules (Option B)
         self.depth_head = nn.Linear(config.embed_dim, 1, bias=False)
         nn.init.trunc_normal_(self.depth_head.weight, std=0.02)
-
-        self.target_harmonic_proj = nn.Sequential(
-            nn.Linear(2, config.embed_dim),
-            nn.GELU(),
-            nn.Linear(config.embed_dim, config.embed_dim),
-        )
 
     @staticmethod
     def compute_characteristic_frequency(x: torch.Tensor, num_bins: int = 14) -> torch.Tensor:
@@ -124,7 +121,9 @@ class PECT_JEPA_5x5(nn.Module):
             p_tgt.requires_grad = False
 
     def update_target_encoder(self, momentum: Optional[float] = None):
-        """Update Target Encoder weights via EMA."""
+        """Update Target Encoder weights via EMA (no-op if use_target_ema=False)."""
+        if not getattr(self.config, "use_target_ema", False):
+            return
         if momentum is None:
             momentum = self.config.ema_momentum
         self.target_encoder.update_ema(self.context_encoder, momentum=momentum)
@@ -175,8 +174,22 @@ class PECT_JEPA_5x5(nn.Module):
         H_ctx = self.context_encoder(context_tokens, context_pos)
 
         # 5. Predictor (Predicts target representation from context and target queries)
-        is_operator_diff = hasattr(self.predictor, "op_embedding") and getattr(self.config, "predictor_type", "") == "operator_diffusion"
-        if is_operator_diff:
+        is_physics_predictor = hasattr(self.predictor, "op_embedding")
+        delta_pred = None
+        if hasattr(self.predictor, "residual_head"):
+            if freq_condition is None:
+                freq_condition = self.compute_characteristic_frequency(
+                    x, num_bins=getattr(self.config, "num_freq_bins", 14)
+                )
+            H_pred, delta_pred, _ = self.predictor(
+                H_context=H_ctx,
+                target_pos=target_pos,
+                context_indices=context_indices,
+                target_indices=target_indices,
+                freq_condition=freq_condition,
+                return_residual=True,
+            )
+        elif is_physics_predictor:
             if freq_condition is None:
                 freq_condition = self.compute_characteristic_frequency(
                     x, num_bins=getattr(self.config, "num_freq_bins", 14)
@@ -191,9 +204,19 @@ class PECT_JEPA_5x5(nn.Module):
         else:
             H_pred = self.predictor(H_context=H_ctx, target_pos=target_pos)
 
-        # 6. Target Encoder (EMA, detached - Pure Clean Physical Representation)
-        with torch.no_grad():
-            H_tgt = self.target_encoder(target_tokens, target_pos)
+        # 6. Target Representation & Unified Regularization
+        use_target_ema = getattr(self.config, "use_target_ema", False)
+        if use_target_ema:
+            with torch.no_grad():
+                H_tgt = self.target_encoder(target_tokens, target_pos)
+            H_rep_reg = H_ctx
+        else:
+            # Single Shared Encoder + Stop-Gradient Target (SimSiam/VICReg hybrid)
+            # H_tgt_full has active gradients for VICReg representation regularization
+            # H_tgt is detached for prediction loss to prevent chasing collapse
+            H_tgt_full = self.context_encoder(target_tokens, target_pos)
+            H_tgt = H_tgt_full.detach()
+            H_rep_reg = torch.cat([H_ctx, H_tgt_full], dim=1)
 
         # 7a. Compute Lift-Off Perturbation (if liftoff_invar_weight > 0)
         H_ctx_pert = None
@@ -209,25 +232,46 @@ class PECT_JEPA_5x5(nn.Module):
             H_ctx_pert = self.context_encoder(context_tokens_pert, context_pos)
 
         # 7b. Compute Energy-Weighted Spectral Phase for Phase-Depth Alignment (if phase_align_weight > 0)
+        z_depth_tgt = None
+        z_depth_pred = None
+        phase_tgt = None
         z_depth = None
         phase_ctx = None
         if getattr(self.config, "phase_align_weight", 0.0) > 0.0:
             phi_ewp = DualScaleDiffusionTokenizer5x5.compute_energy_weighted_phase(
                 x, num_bins=getattr(self.config, "num_freq_bins", 14)
             )  # [B, 25] in [-1, 1]
-            # Map context token indices to spatial grid indices (if 100 tokens: idx // 4, if 50 tokens: idx // 2, else idx)
-            spatial_idx = (context_indices // 4) if N_total == 100 else ((context_indices // 2) if N_total == 50 else context_indices)
-            phase_ctx = torch.gather(phi_ewp, dim=1, index=spatial_idx)  # [B, N_ctx]
-            z_depth = self.depth_head(H_ctx).squeeze(-1)  # [B, N_ctx]
+            if N_total == 100:
+                # Isolate deepest late diffusion stage tau=3 for target tokens
+                mask_t3 = (target_indices % 4 == 3)  # [B, N_tgt]
+                k_t3 = mask_t3[0].sum().item()
+                if k_t3 > 0:
+                    H_tgt_t3 = H_tgt[mask_t3].view(B, k_t3, -1)
+                    H_pred_t3 = H_pred[mask_t3].view(B, k_t3, -1)
+                    z_depth_tgt = self.depth_head(H_tgt_t3).squeeze(-1)   # [B, 8]
+                    z_depth_pred = self.depth_head(H_pred_t3).squeeze(-1) # [B, 8]
+                    spatial_tgt_idx = target_indices[mask_t3].view(B, k_t3) // 4  # [B, 8] in 0..24
+                    phase_tgt = torch.gather(phi_ewp, dim=1, index=spatial_tgt_idx) # [B, 8]
+            else:
+                spatial_idx = (context_indices // 2) if N_total == 50 else context_indices
+                phase_ctx = torch.gather(phi_ewp, dim=1, index=spatial_idx)
+                z_depth = self.depth_head(H_ctx).squeeze(-1)
 
         # 7c. Compute Combined JEPA Loss
         loss_dict = self.loss_fn(
             H_pred=H_pred,
             H_target=H_tgt,
+            target_indices=target_indices,
             H_ctx=H_ctx,
             H_ctx_pert=H_ctx_pert,
+            z_depth_tgt=z_depth_tgt,
+            z_depth_pred=z_depth_pred,
+            phase_tgt=phase_tgt,
             z_depth=z_depth,
             phase_ctx=phase_ctx,
+            x_raw=x,
+            delta_pred=delta_pred,
+            H_rep_reg=H_rep_reg,
         )
         loss_dict.update({
             "H_pred": H_pred,

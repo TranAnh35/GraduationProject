@@ -34,7 +34,7 @@ class Spatiotemporal5x5Config:
     max_files: Optional[int] = None
 
     # --------------------------------------------------------------- Masking
-    masker_type: str = "complementary_st" # 'complementary_st' (CST default) | 'spatiotemporal_diffusion' (3D) | 'contiguous_cluster' (2D)
+    masker_type: str = "auto"           # 'auto' (ContiguousCluster for 25 tok, CST for 100 tok) | 'complementary_st' | 'contiguous_cluster'
     min_masked: int = 10                # Backward compatibility alias
     max_masked: int = 15                # Backward compatibility alias
     num_spatial_cluster: int = 8        # Number of spatial grid points in cluster
@@ -43,7 +43,7 @@ class Spatiotemporal5x5Config:
     cst_mask_mode: str = "causal"       # 'causal' (early ctx -> late tgt) | 'random' (random complementary)
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "spatiotemporal_patch" # 'spatiotemporal_patch' (100 tok default) | 'continuous_stf' | 'dual_scale_diffusion' (50 tok) | 'dual_domain_attention' | 'dual_domain' | 'time_only'
+    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (Waveform-agnostic 25 tok default) | 'spatiotemporal_patch' | 'continuous_stf'
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
@@ -53,21 +53,26 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "operator_diffusion" # 'operator_diffusion' (Physics Neural Operator with Green's Attention Bias) | 'standard'
+    predictor_type: str = "residual_diffusion" # 'residual_diffusion' (Residual Diffusion Predictor) | 'parabolic_diffusion' | 'operator_diffusion' | 'standard'
     predictor_depth: int = 2
     predictor_heads: int = 4
     diffusion_gamma_init: float = 1.0   # Spatial diffusion attenuation rate gamma for Green's attention bias
-    diffusion_beta_init: float = 0.5    # Cross-scale depth barrier beta for Green's attention bias
+    diffusion_alpha_init: float = 0.5   # Geometric dispersion scale alpha for Parabolic Green's attention bias
+    diffusion_beta_init: float = 0.5    # Cross-scale depth barrier beta for legacy operator diffusion
     mlp_ratio: float = 4.0
     dropout: float = 0.0
-    ema_momentum: float = 0.990         # Start at 0.990 for fast early target evolution
+    use_target_ema: bool = False        # False: Unified Single Encoder + Stop-Gradient Target (SimSiam/VICReg); True: Legacy EMA Target Encoder
+    ema_momentum: float = 0.990         # Start at 0.990 for fast early target evolution (used if use_target_ema=True)
     ema_momentum_end: float = 0.999      # Capped at 0.999 (never 1.0) to keep target encoder dynamic
     use_momentum_schedule: bool = True
 
     # ------------------------------------------------------------------- Loss
-    loss_type: str = "l1"                # Pure I-JEPA L1 loss (preserves non-vanishing unit gradient)
-    liftoff_invar_weight: float = 0.05   # Lift-off invariance loss weight (decouples lift-off from depth)
-    phase_align_weight: float = 0.05     # Phase-depth monotonicity loss weight (enforces monotonic depth manifold)
+    loss_type: str = "l1"                # Base prediction norm ('l1' | 'smooth_l1')
+    fluct_weight: float = 2.0            # Context-Referenced Fluctuation Loss weight (magnifies 1-3% flaw contrast)
+    adaptive_disturbance_weight: float = 2.0 # Field-Disturbance Adaptive Loss weight kappa (boosts defect boundary patches)
+    temporal_mono_weight: float = 0.05   # Temporal diffusion delay monotonicity loss weight
+    liftoff_invar_weight: float = 0.0    # 0.0 (Pure JEPA: zero synthetic contractive perturbation; Dodd-Deeds Fourier phase provides intrinsic invariance)
+    phase_align_weight: float = 0.0      # 0.0 (Pure JEPA: Fourier phase is integrated directly in tokenizer attention)
     var_weight: float = 1.0              # VICReg coordinate-wise variance hinge weight (Bardes et al., ICLR 2022)
     cov_weight: float = 1.0              # VICReg covariance decorrelation penalty weight (Bardes et al., ICLR 2022)
     var_gamma: float = 1.0               # VICReg target standard deviation threshold gamma (anchors coordinate scale)
@@ -83,16 +88,16 @@ class Spatiotemporal5x5Config:
     min_lr: float = 1e-6
     warmup_epochs: int = 5
     weight_decay: float = 0.05
-    epochs: int = 30                     # 30 epochs ensures sustained representation convergence
+    epochs: int = 10                     # 10 epochs (5 warmup + 5 post-warmup convergence)
     grad_clip: float = 1.0
     mixed_precision: bool = True
     device: str = "cuda"
 
     # --------------------------------------------------- Experiment & Logging
-    exp_name: str = "pect_jepa_5x5_base"
+    exp_name: str = "exp11_dual_domain_pure_jepa"
     log_dir: str = "experiments/5x5"
     save_dir: Optional[str] = None       # If None/default, automatically unified into <log_dir>/<exp_name>/checkpoints
-    add_timestamp: bool = False          # False keeps fixed exp_name folder for seamless resume; True appends timestamp
+    add_timestamp: bool = True           # True appends timestamp for unique isolated experiment logging
     use_tensorboard: bool = True
     use_wandb: bool = False
     wandb_project: str = "PECT_JEPA_5x5"

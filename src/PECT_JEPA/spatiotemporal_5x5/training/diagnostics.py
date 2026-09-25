@@ -85,18 +85,24 @@ def extract_attention_receptive_fields(
         # attn: [B, num_heads, N_tokens, N_tokens]
         # Take center token attending to all tokens
         N_tokens = attn.shape[-1]
+        num_heads = attn.shape[1]
         if N_tokens == 50:
             center_shallow = 24
             center_deep = 25
             center_attn = 0.5 * (attn[:, :, center_shallow, :] + attn[:, :, center_deep, :])  # [B, num_heads, 50]
             mean_attn = torch.mean(center_attn, dim=0).detach().cpu().numpy()  # [num_heads, 50]
             mean_attn_spatial = 0.5 * (mean_attn[:, 0::2] + mean_attn[:, 1::2])  # [num_heads, 25]
+        elif N_tokens % 25 == 0 and N_tokens > 25:
+            T_s = N_tokens // 25
+            center_indices = [12 * T_s + tau for tau in range(T_s)]
+            center_attn = attn[:, :, center_indices, :].mean(dim=2)  # [B, num_heads, N_tokens]
+            mean_attn = torch.mean(center_attn, dim=0).detach().cpu().numpy()  # [num_heads, N_tokens]
+            mean_attn_spatial = mean_attn.reshape(num_heads, 25, T_s).mean(axis=-1)  # [num_heads, 25]
         else:
-            center_idx = 12
-            center_attn = attn[:, :, center_idx, :]  # [B, num_heads, 25]
-            mean_attn_spatial = torch.mean(center_attn, dim=0).detach().cpu().numpy()  # [num_heads, 25]
+            center_idx = min(12, N_tokens - 1)
+            center_attn = attn[:, :, center_idx, :]  # [B, num_heads, N_tokens]
+            mean_attn_spatial = torch.mean(center_attn, dim=0).detach().cpu().numpy()  # [num_heads, N_tokens]
 
-        num_heads = mean_attn_spatial.shape[0]
         attn_maps = mean_attn_spatial.reshape(num_heads, 5, 5)
         return attn_maps
 

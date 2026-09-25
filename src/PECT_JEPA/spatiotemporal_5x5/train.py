@@ -79,7 +79,7 @@ def get_optimal_num_workers(requested_workers: Any = "auto") -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("Unified 5x5 Spatiotemporal PECT-JEPA Training")
     p.add_argument("--data_dir", type=str, default="data", help="Directory containing TDMS files")
-    p.add_argument("--epochs", type=int, default=30, help="Total training epochs (default: 30)")
+    p.add_argument("--epochs", type=int, default=10, help="Total training epochs (default: 10)")
     p.add_argument("--batch_size", type=int, default=256, help="Batch size (recommended: 128 - 512 for 5x5)")
     p.add_argument("--k_per_file", type=int, default=8, help="Points per file in file-balanced sampler")
     p.add_argument("--num_workers", type=str, default="auto", help="Number of CPU workers (integer or 'auto')")
@@ -111,26 +111,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Norm-floor barrier weight to prevent zero-vector collapse (default: 0.1)")
     p.add_argument("--norm_floor_target", type=float, default=1.0,
                    help="Minimum target L2 norm of representations (default: 1.0)")
-    p.add_argument("--tokenizer_type", type=str, default="spatiotemporal_patch",
-                   choices=["spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_scale_diffusion", "dual_domain_attention", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'spatiotemporal_patch' (100 tokens: Space x Time diffusion stages, default), 'continuous_stf', 'dual_scale_diffusion' (50 tokens), or others")
-    p.add_argument("--masker_type", type=str, default="complementary_st",
+    p.add_argument("--tokenizer_type", type=str, default="dual_domain_attention",
+                   choices=["dual_domain_attention", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_scale_diffusion", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'dual_domain_attention' (Waveform-agnostic 25 tokens, default), 'spatiotemporal_patch', 'continuous_stf', etc.")
+    p.add_argument("--masker_type", type=str, default="auto",
                    choices=["auto", "complementary_st", "spatiotemporal_diffusion", "contiguous_cluster"],
-                   help="Masker strategy: 'complementary_st' (CST dual-domain default), 'spatiotemporal_diffusion', or 'contiguous_cluster'")
+                   help="Masker strategy: 'auto' (ContiguousCluster for 25 tok, CST for 100 tok, default), 'complementary_st', or 'contiguous_cluster'")
     p.add_argument("--num_temporal_stages", type=int, default=4,
                    help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
     p.add_argument("--cst_mask_mode", type=str, default="causal", choices=["causal", "random"],
                    help="CST masking temporal partition mode: 'causal' (early ctx -> late tgt) or 'random' (default: causal)")
-    p.add_argument("--predictor_type", type=str, default="operator_diffusion", choices=["operator_diffusion", "standard"],
-                   help="Predictor architecture: 'operator_diffusion' (Physics Neural Operator with Green's attention bias) or 'standard' (default: operator_diffusion)")
+    p.add_argument("--predictor_type", type=str, default="residual_diffusion",
+                   choices=["residual_diffusion", "residual", "parabolic_diffusion", "operator_diffusion", "standard"],
+                   help="Predictor architecture: 'residual_diffusion' (Residual Diffusion Predictor, default), 'parabolic_diffusion', 'operator_diffusion', or 'standard'")
+    p.add_argument("--use_target_ema", type=lambda v: v.lower() == "true", default=False,
+                   help="Use EMA target encoder (default: False for Single Shared Encoder + Stop-Gradient Target)")
+    p.add_argument("--adaptive_disturbance_weight", type=float, default=2.0,
+                   help="Field-Disturbance Adaptive Loss weight kappa to address 95% sound metal imbalance (default: 2.0)")
+    p.add_argument("--temporal_mono_weight", type=float, default=0.05,
+                   help="Temporal diffusion delay monotonicity loss weight (default: 0.05)")
     p.add_argument("--diffusion_gamma_init", type=float, default=1.0,
                    help="Initial spatial diffusion attenuation coefficient gamma for Green's attention bias (default: 1.0)")
+    p.add_argument("--diffusion_alpha_init", type=float, default=0.5,
+                   help="Initial geometric dispersion scale alpha for Parabolic Green's attention bias (default: 0.5)")
     p.add_argument("--diffusion_beta_init", type=float, default=0.5,
-                   help="Initial cross-scale vertical diffusion barrier beta for Green's attention bias (default: 0.5)")
-    p.add_argument("--liftoff_invar_weight", type=float, default=0.05,
-                   help="Physical lift-off invariance loss weight (default: 0.05)")
-    p.add_argument("--phase_align_weight", type=float, default=0.05,
-                   help="Self-supervised phase-depth monotonicity alignment loss weight (default: 0.05)")
+                   help="Initial cross-scale vertical diffusion barrier beta for legacy operator diffusion (default: 0.5)")
+    p.add_argument("--fluct_weight", type=float, default=2.0,
+                   help="Context-Referenced Fluctuation Loss weight for magnifying defect contrast (default: 2.0)")
+    p.add_argument("--liftoff_invar_weight", type=float, default=0.0,
+                   help="Physical lift-off invariance loss weight (default: 0.0 for pure JEPA)")
+    p.add_argument("--phase_align_weight", type=float, default=0.0,
+                   help="Self-supervised phase-depth monotonicity alignment loss weight (default: 0.0 for pure JEPA)")
     p.add_argument("--num_freq_bins", type=int, default=14,
                    help="Number of FFT frequency bins for spectral branch (default: 14, covers 0-2800 Hz)")
     p.add_argument("--spectral_features", type=str, default="phase_and_mag", choices=["phase_and_mag", "phase_only"],
@@ -154,11 +165,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
-    p.add_argument("--exp_name", type=str, default="pect_jepa_5x5_base", help="Experiment run name")
+    p.add_argument("--exp_name", type=str, default="exp11_dual_domain_pure_jepa", help="Experiment run name")
     p.add_argument("--save_dir", type=str, default=None,
                    help="Directory to save model checkpoints (default: None -> auto-unified inside experiments/5x5/<exp_name>/checkpoints/)")
-    p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=False,
-                   help="Append timestamp suffix to exp_name (default: False to preserve consistent folder for resume)")
+    p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True,
+                   help="Append timestamp suffix to exp_name (default: True for isolated run logging)")
     p.add_argument("--split_protocol", type=str, default="compound_ood",
                    choices=["compound_ood", "leave_liftoff", "leave_sensor", "leave_waveform", "leave_specimen", "random"],
                    help="Evaluation/training split protocol: compound_ood (Option A: hold out z3+TMR+Chirp simultaneously), leave_liftoff (LOLO), leave_sensor (LOSO), leave_waveform (LOWO), leave_specimen (LODO), random (default: compound_ood)")
@@ -243,8 +254,15 @@ def main():
         lowpass_order=args.lowpass_order,
         embed_dim=args.embed_dim,
         encoder_depth=args.encoder_depth,
+        use_target_ema=args.use_target_ema,
         predictor_type=args.predictor_type,
         predictor_depth=args.predictor_depth,
+        diffusion_gamma_init=args.diffusion_gamma_init,
+        diffusion_alpha_init=args.diffusion_alpha_init,
+        diffusion_beta_init=args.diffusion_beta_init,
+        fluct_weight=args.fluct_weight,
+        adaptive_disturbance_weight=args.adaptive_disturbance_weight,
+        temporal_mono_weight=args.temporal_mono_weight,
         device=args.device,
         seed=args.seed,
         mixed_precision=args.mixed_precision,

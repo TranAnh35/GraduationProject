@@ -111,6 +111,16 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.visualizations import (
 )
 
 
+def to_safe_path(path: str) -> str:
+    """Ensures paths on Windows bypass the MAX_PATH (260 char) limitation using extended prefix."""
+    if not path:
+        return path
+    abs_path = os.path.abspath(path)
+    if os.name == "nt" and not abs_path.startswith("\\\\?\\"):
+        return "\\\\?\\" + abs_path
+    return abs_path
+
+
 def find_ground_truth_mask(file_path: str, data_dir: str = "data") -> Optional[np.ndarray]:
     """
     Finds and loads the authoritative CAD ground-truth mask corresponding to a TDMS file's specimen.
@@ -348,10 +358,10 @@ def evaluate_single_file(
     specimen_key = gt_mgr.canonical_specimen_key(file_path)
 
     # 1. Modular Directory Paths
-    task1_dir = os.path.join(output_dir, "1_Anomaly_Detection", specimen_key)
-    task2_dir = os.path.join(output_dir, "2_Depth_Regression", specimen_key)
-    task3_dir = os.path.join(output_dir, "3_Severity_Classification", specimen_key)
-    task5_dir = os.path.join(output_dir, "5_Representation_Geometry", specimen_key)
+    task1_dir = to_safe_path(os.path.join(output_dir, "1_Anomaly_Detection", specimen_key))
+    task2_dir = to_safe_path(os.path.join(output_dir, "2_Depth_Regression", specimen_key))
+    task3_dir = to_safe_path(os.path.join(output_dir, "3_Severity_Classification", specimen_key))
+    task5_dir = to_safe_path(os.path.join(output_dir, "5_Representation_Geometry", specimen_key))
     for d in [task1_dir, task2_dir, task3_dir, task5_dir]:
         os.makedirs(d, exist_ok=True)
 
@@ -484,6 +494,10 @@ def evaluate_single_file(
         try:
             bench = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
             reg_benchmark = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=False)
+            try:
+                reg_benchmark_def = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=True)
+            except Exception:
+                reg_benchmark_def = {}
 
             flat_feats = sub_feat.reshape(-1, sub_feat.shape[-1]).astype(np.float32)
             flat_depth = sub_depth.reshape(-1).astype(np.float32)
@@ -541,6 +555,7 @@ def evaluate_single_file(
                 "linear_probe": lp_reg,
                 "mlp_2layer": mlp_reg,
                 "representation_gap": reg_benchmark.get("representation_gap", {}),
+                "defects_only": reg_benchmark_def.get("linear_probe", {}),
                 "pred_depth_map_path": pred_depth_map_path,
                 "depth_scatter_path": depth_scatter_path,
             }
@@ -625,7 +640,7 @@ def evaluate_single_file(
     )
 
     if save_features:
-        feat_path = os.path.join(output_dir, f"{fname_base}_features_5x5.npy")
+        feat_path = to_safe_path(os.path.join(output_dir, f"{fname_base}_features_5x5.npy"))
         np.save(feat_path, feature_map)
 
     # Consolidated flat metrics for summary tables & CSV
@@ -846,7 +861,7 @@ def evaluate_liftoff_invariance(
     print("  RUNNING MULTI-LIFT-OFF INVARIANCE ANALYSIS (Linear CKA & Cosine Sim)")
     print("=" * 70)
 
-    task4_dir = os.path.join(output_dir, "4_Liftoff_Invariance")
+    task4_dir = to_safe_path(os.path.join(output_dir, "4_Liftoff_Invariance"))
     os.makedirs(task4_dir, exist_ok=True)
 
     meta_by_fp = {fp: extract_file_metadata(fp) for fp in file_paths}
@@ -967,6 +982,7 @@ def main():
         ckpt_dir = os.path.dirname(checkpoint_path)
         parent_dir = os.path.dirname(ckpt_dir)
         args.output_dir = os.path.join(parent_dir, "evaluation_results") if os.path.isdir(parent_dir) else "evaluation_results/5x5"
+    args.output_dir = to_safe_path(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 70)

@@ -7,6 +7,11 @@ __pycache__/
 checkpoints/
 experiments/
 results/
+scripts/
+!scripts/compile_authoritative_ground_truth.py
+scratch/
+user_prompt_*.txt
+
 *.zip
 *.pt
 *.pth

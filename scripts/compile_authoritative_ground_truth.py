@@ -94,6 +94,7 @@ def compile_and_verify(buffer_px: int = 2):
 
         # 2. Export updated flaws configuration JSON
         cfg_path = os.path.join(out_dir, f"{dir_name}_flaws_config.json")
+        cropped_features = gt_mgr.get_flaw_features(cad_key, coordinate_system="cropped")
         flaws_config = {
             "specimen": dir_name,
             "title": disp_name,
@@ -103,11 +104,12 @@ def compile_and_verify(buffer_px: int = 2):
             "volume_formula": cad_spec.get("volumeFormula"),
             "grid_shape": list(mask.shape),
             "crop_border": gt_mgr.default_crop["crop_top"],
+            "coordinate_system": "cropped_standardized (x=col, y=row on cropped grid; cad_x, cad_y on nominal 300x300 CAD)",
             "buffer_px": buffer_px,
-            "num_total_features": len(features),
-            "num_defects": len([f for f in features if f.get("diameter") is not None and f.get("kind") != "rivet only"]),
+            "num_total_features": len(cropped_features),
+            "num_defects": len([f for f in cropped_features if f.get("diameter") is not None and f.get("kind") != "rivet only"]),
             "reference_file": ref_file,
-            "features": features,
+            "features": cropped_features,
         }
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump(flaws_config, f, indent=2)
@@ -136,22 +138,20 @@ def compile_and_verify(buffer_px: int = 2):
         # Panel 2: Physical C-Scan + Exact CAD ROIs
         im1 = axes[1].imshow(aligned_scan, cmap="viridis", origin="lower")
         axes[1].set_title("2. Physical C-Scan + CAD Overlay\n(Red: Defect ROIs, Cyan: Fasteners)", fontsize=11, fontweight="bold")
-        cl = gt_mgr.default_crop["crop_left"]
-        ct = gt_mgr.default_crop["crop_top"]
 
-        for feat in features:
+        for feat in cropped_features:
             rx = feat.get("x")
             ry = feat.get("y")
             rd = feat.get("rivetDiameter")
             if rx is not None and ry is not None and rd is not None:
-                # Fastener rivet ring
-                axes[1].add_patch(Circle((rx - cl, ry - ct), rd / 2.0, color="cyan", fill=False, linewidth=1.2, linestyle="--"))
+                # Fastener rivet ring (already in cropped coordinates)
+                axes[1].add_patch(Circle((rx, ry), rd / 2.0, color="cyan", fill=False, linewidth=1.2, linestyle="--"))
 
             diam = feat.get("diameter")
             if diam is not None and feat.get("kind") != "rivet only":
                 cx = feat.get("corrosionX") if feat.get("corrosionX") is not None else rx
                 cy = feat.get("corrosionY") if feat.get("corrosionY") is not None else ry
-                axes[1].add_patch(Circle((cx - cl, cy - ct), diam / 2.0, color="red", fill=False, linewidth=1.5))
+                axes[1].add_patch(Circle((cx, cy), diam / 2.0, color="red", fill=False, linewidth=1.5))
         fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
         # Panel 3: Binary Ground-Truth Mask

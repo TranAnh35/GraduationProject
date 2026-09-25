@@ -12,6 +12,16 @@ import matplotlib.pyplot as plt
 from typing import Optional, Dict, Any
 
 
+def to_safe_path(path: str) -> str:
+    """Ensures paths on Windows bypass the MAX_PATH (260 char) limitation using extended prefix."""
+    if not path:
+        return path
+    abs_path = os.path.abspath(path)
+    if os.name == "nt" and not abs_path.startswith("\\\\?\\"):
+        return "\\\\?\\" + abs_path
+    return abs_path
+
+
 def compute_anomaly_metrics(
     score_map: np.ndarray,
     gt_mask: Optional[np.ndarray] = None,
@@ -116,7 +126,8 @@ def plot_anomaly_heatmap_5x5(
     Uses 99th percentile clipping to prevent extreme edge/outlier artifacts from dominating the colormap.
     """
     if save_path:
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        save_path = to_safe_path(save_path)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig = plt.figure(figsize=(7, 6), dpi=150)
     vmin = float(np.min(anomaly_map))
     vmax = float(np.percentile(anomaly_map, clip_percentile))
@@ -434,7 +445,8 @@ def plot_latent_representation_quality(
     plt.tight_layout()
 
     if save_path:
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        save_path = to_safe_path(save_path)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path)
 
     result_dict = {

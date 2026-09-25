@@ -25,6 +25,9 @@ class JEPALoss5x5(nn.Module):
         eps: float = 1e-8,
         liftoff_invar_weight: float = 0.0,
         phase_align_weight: float = 0.0,
+        fluct_weight: float = 2.0,
+        adaptive_disturbance_weight: float = 2.0,
+        temporal_mono_weight: float = 0.05,
         var_weight: float = 1.0,
         cov_weight: float = 1.0,
         var_gamma: float = 1.0,
@@ -40,6 +43,9 @@ class JEPALoss5x5(nn.Module):
         self.eps = eps
         self.liftoff_invar_weight = liftoff_invar_weight
         self.phase_align_weight = phase_align_weight
+        self.fluct_weight = fluct_weight
+        self.adaptive_disturbance_weight = adaptive_disturbance_weight
+        self.temporal_mono_weight = temporal_mono_weight
         self.var_weight = var_weight
         self.cov_weight = cov_weight
         self.var_gamma = var_gamma
@@ -48,6 +54,152 @@ class JEPALoss5x5(nn.Module):
         self.uniformity_subsample = uniformity_subsample
         self.norm_floor_weight = norm_floor_weight
         self.norm_floor_target = norm_floor_target
+
+    def compute_disturbance_weights(self, x_raw: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """
+        Computes batch sample weights based on spatial-temporal field disturbance:
+            xi(x) = (1 / C) * sum_{c} [ StdDev_{s in 25}(x(s, :, c)) ]
+        w_b = 1.0 + kappa * (xi_b - min(xi)) / (max(xi) - min(xi) + eps)
+        where kappa = self.adaptive_disturbance_weight.
+        Gives defect/edge samples up to (1 + kappa)x higher weight than uniform sound metal.
+        """
+        if self.adaptive_disturbance_weight <= 0.0 or x_raw is None:
+            return None
+        # x_raw shape: [B, 5, 5, C] or [B, 5, 5, T, C] or [B, 25, ...]
+        B = x_raw.shape[0]
+        x_flat = x_raw.reshape(B, 25, -1).float()
+        spatial_std = x_flat.std(dim=1).mean(dim=-1)  # [B]
+        std_min = spatial_std.min()
+        std_max = spatial_std.max()
+        denom = std_max - std_min
+        if denom < 1e-7:
+            return torch.ones(B, 1, 1, device=x_raw.device, dtype=torch.float32)
+        norm_std = (spatial_std - std_min) / (denom + 1e-6)
+        weights = 1.0 + self.adaptive_disturbance_weight * norm_std
+        return weights.view(B, 1, 1).detach()
+
+    def temporal_diffusion_monotonicity_loss(
+        self,
+        delta_pred: Optional[torch.Tensor],
+        target_indices: Optional[torch.Tensor],
+        margin: float = 0.05,
+    ) -> torch.Tensor:
+        """
+        Enforces monotonic growth of representation deviation along diffusion stages:
+            norm(delta_H(tau_{k+1})) >= norm(delta_H(tau_k)) + margin
+        grounded in the irreversible diffusion of eddy currents through depth.
+        """
+        if self.temporal_mono_weight <= 0.0 or delta_pred is None or target_indices is None:
+            return torch.tensor(0.0, device=delta_pred.device if delta_pred is not None else "cpu", dtype=torch.float32)
+
+        if target_indices.max() < 50:
+            return torch.tensor(0.0, device=delta_pred.device, dtype=torch.float32)
+
+        B, N_tgt, D = delta_pred.shape
+        stages = target_indices % 4  # [B, N_tgt] in {0, 1, 2, 3}
+        norms = torch.norm(delta_pred.float(), p=2, dim=-1)  # [B, N_tgt]
+
+        unique_stages = torch.unique(stages)
+        if len(unique_stages) < 2:
+            return torch.tensor(0.0, device=delta_pred.device, dtype=torch.float32)
+
+        stage_means = []
+        valid_stages = []
+        for stg in unique_stages:
+            mask = (stages == stg)  # [B, N_tgt]
+            if mask.any():
+                denom = mask.sum(dim=-1).clamp(min=1)  # [B]
+                mean_norm = (norms * mask.float()).sum(dim=-1) / denom  # [B]
+                stage_means.append(mean_norm)
+                valid_stages.append(stg.item())
+
+        if len(valid_stages) < 2:
+            return torch.tensor(0.0, device=delta_pred.device, dtype=torch.float32)
+
+        loss_mono = torch.tensor(0.0, device=delta_pred.device, dtype=torch.float32)
+        count = 0
+        for k in range(len(valid_stages) - 1):
+            if valid_stages[k + 1] > valid_stages[k]:
+                diff = stage_means[k] - stage_means[k + 1] + margin
+                loss_mono = loss_mono + torch.relu(diff).mean()
+                count += 1
+
+        if count > 0:
+            return loss_mono / count
+        return torch.tensor(0.0, device=delta_pred.device, dtype=torch.float32)
+
+    def fluctuation_prediction_loss(
+        self,
+        H_pred: torch.Tensor,
+        H_target: torch.Tensor,
+        target_indices: Optional[torch.Tensor] = None,
+        weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Context-Referenced Fluctuation Prediction Loss with Adaptive Field Disturbance Weighting:
+        Decomposes target predictions into DC mean background decay and AC spatial fluctuation:
+            L_pred = L_mean + fluct_weight * L_fluct
+
+        Where:
+            L_mean = mean_tau || bar{H}_pred(tau) - bar{H}_tgt(tau) ||_1
+            L_fluct = mean_i || (H_pred(s_i, tau_i) - bar{H}_pred(tau_i)) - (H_tgt(s_i, tau_i) - bar{H}_tgt(tau_i)) ||_1
+
+        Optionally weights batch items by intrinsic field disturbance weights to resolve 95% sound metal imbalance.
+        """
+        H_pred = torch.nan_to_num(H_pred.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        H_target = torch.nan_to_num(H_target.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        B, N_tgt, D = H_pred.shape
+
+        def weighted_l1(a, b):
+            diff = (a - b).abs()
+            if weights is not None:
+                diff = diff * weights
+            return diff.mean()
+
+        if self.fluct_weight <= 0.0:
+            if weights is not None:
+                l_pred = weighted_l1(H_pred, H_target)
+            else:
+                l_pred = self.latent_prediction_loss(H_pred, H_target)
+            return l_pred, torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
+
+        if target_indices is not None and target_indices.max() >= 50:
+            stages = torch.unique(target_indices % 4)
+            l_mean_list = []
+            l_fluct_list = []
+
+            for stg in stages:
+                mask_stg = (target_indices % 4 == stg)  # [B, N_tgt]
+                k_tokens = mask_stg[0].sum().item()
+                if k_tokens < 2:
+                    continue
+
+                H_p_stg = H_pred[mask_stg].view(B, k_tokens, D)
+                H_t_stg = H_target[mask_stg].view(B, k_tokens, D)
+
+                mean_p = H_p_stg.mean(dim=1, keepdim=True)  # [B, 1, D]
+                mean_t = H_t_stg.mean(dim=1, keepdim=True)  # [B, 1, D]
+
+                l_mean_list.append(weighted_l1(mean_p, mean_t))
+
+                fluct_p = H_p_stg - mean_p
+                fluct_t = H_t_stg - mean_t
+                l_fluct_list.append(weighted_l1(fluct_p, fluct_t))
+
+            if l_mean_list:
+                l_mean = torch.stack(l_mean_list).mean()
+                l_fluct = torch.stack(l_fluct_list).mean()
+                total = l_mean + self.fluct_weight * l_fluct
+                return total, l_fluct
+
+        mean_p = H_pred.mean(dim=1, keepdim=True)
+        mean_t = H_target.mean(dim=1, keepdim=True)
+        l_mean = weighted_l1(mean_p, mean_t)
+        fluct_p = H_pred - mean_p
+        fluct_t = H_target - mean_t
+        l_fluct = weighted_l1(fluct_p, fluct_t)
+        total = l_mean + self.fluct_weight * l_fluct
+        return total, l_fluct
 
     def latent_prediction_loss(self, H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
         safe_eps = max(self.eps, 1e-5)
@@ -192,46 +344,68 @@ class JEPALoss5x5(nn.Module):
         self,
         H_pred: torch.Tensor,
         H_target: torch.Tensor,
+        target_indices: Optional[torch.Tensor] = None,
         H_ctx: Optional[torch.Tensor] = None,
         H_ctx_pert: Optional[torch.Tensor] = None,
+        z_depth_tgt: Optional[torch.Tensor] = None,
+        z_depth_pred: Optional[torch.Tensor] = None,
+        phase_tgt: Optional[torch.Tensor] = None,
         z_depth: Optional[torch.Tensor] = None,
         phase_ctx: Optional[torch.Tensor] = None,
+        x_raw: Optional[torch.Tensor] = None,
+        delta_pred: Optional[torch.Tensor] = None,
+        H_rep_reg: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        l_pred = self.latent_prediction_loss(H_pred, H_target)
+        weights = self.compute_disturbance_weights(x_raw)
+        l_pred, l_fluct = self.fluctuation_prediction_loss(H_pred, H_target, target_indices=target_indices, weights=weights)
         zero_loss = torch.tensor(0.0, device=H_pred.device, dtype=torch.float32)
+
+        # Physical Temporal Diffusion Monotonicity Loss
+        l_mono = zero_loss
+        if self.temporal_mono_weight > 0.0 and delta_pred is not None and target_indices is not None:
+            l_mono = self.temporal_diffusion_monotonicity_loss(delta_pred, target_indices)
 
         # Physical Lift-Off Invariance Loss
         l_liftoff = zero_loss
         if self.liftoff_invar_weight > 0.0 and H_ctx is not None and H_ctx_pert is not None:
             l_liftoff = self.liftoff_invariance_loss(H_ctx, H_ctx_pert)
 
-        # Physical Phase-Depth Monotonicity Loss
+        # Physical Phase-Depth Monotonicity Loss (Late Diffusion Stage Alignment)
         l_phase = zero_loss
-        if self.phase_align_weight > 0.0 and z_depth is not None and phase_ctx is not None:
-            l_phase = self.phase_depth_alignment_loss(z_depth, phase_ctx)
+        if self.phase_align_weight > 0.0:
+            if z_depth_tgt is not None and phase_tgt is not None:
+                l_p_tgt = self.phase_depth_alignment_loss(z_depth_tgt, phase_tgt)
+                l_p_pred = self.phase_depth_alignment_loss(z_depth_pred, phase_tgt) if z_depth_pred is not None else l_p_tgt
+                l_phase = 0.5 * (l_p_tgt + l_p_pred)
+            elif z_depth is not None and phase_ctx is not None:
+                l_phase = self.phase_depth_alignment_loss(z_depth, phase_ctx)
+
+        # Embedding to regularize (defaults to H_rep_reg if available, else H_ctx)
+        rep_reg = H_rep_reg if H_rep_reg is not None else H_ctx
 
         # Hypersphere Uniformity Dispersion Loss
         l_unif = zero_loss
-        if self.uniformity_weight > 0.0 and H_ctx is not None:
-            l_unif = self.hypersphere_uniformity_loss(H_ctx)
+        if self.uniformity_weight > 0.0 and rep_reg is not None:
+            l_unif = self.hypersphere_uniformity_loss(rep_reg)
 
         # VICReg Coordinate-Wise Variance & Covariance Penalties
         l_var = zero_loss
         l_cov = zero_loss
-        if (self.var_weight > 0.0 or self.cov_weight > 0.0) and H_ctx is not None:
+        if (self.var_weight > 0.0 or self.cov_weight > 0.0) and rep_reg is not None:
             if self.var_weight > 0.0:
-                l_var = self.variance_hinge(H_ctx)
+                l_var = self.variance_hinge(rep_reg)
             if self.cov_weight > 0.0:
-                l_cov = self.covariance_penalty(H_ctx)
+                l_cov = self.covariance_penalty(rep_reg)
 
         # Norm-Floor Barrier Loss (Anti Zero-Collapse)
         l_norm = zero_loss
         mean_norm = torch.tensor(1.0, device=H_pred.device, dtype=torch.float32)
-        if self.norm_floor_weight > 0.0 and H_ctx is not None:
-            l_norm, mean_norm = self.norm_floor_loss(H_ctx)
+        if self.norm_floor_weight > 0.0 and rep_reg is not None:
+            l_norm, mean_norm = self.norm_floor_loss(rep_reg)
 
         total = (
             l_pred
+            + self.temporal_mono_weight * l_mono
             + self.liftoff_invar_weight * l_liftoff
             + self.phase_align_weight * l_phase
             + self.var_weight * l_var
@@ -243,6 +417,8 @@ class JEPALoss5x5(nn.Module):
         return {
             "loss": total,
             "loss_pred": l_pred.detach(),
+            "loss_fluct": l_fluct.detach(),
+            "loss_mono": l_mono.detach(),
             "loss_liftoff": l_liftoff.detach(),
             "loss_phase": l_phase.detach(),
             "loss_var": l_var.detach(),

@@ -421,17 +421,18 @@ class ComplementarySpatiotemporalMasker5x5:
 def build_masker_5x5(config):
     """
     Factory function to construct masker based on config and tokenizer type.
-    Defaults to ComplementarySpatiotemporalMasker5x5 (CST-Masking: 100 tokens).
+    - 25 tokens (continuous_stf, spatial_grid, etc.): ContiguousClusterMasker5x5
+    - 50 tokens (dual_scale_diffusion): SpatiotemporalDiffusionMasker5x5
+    - 100 tokens (spatiotemporal_patch): ComplementarySpatiotemporalMasker5x5 (CST)
     """
     tokenizer_type = getattr(config, "tokenizer_type", "spatiotemporal_patch")
-    masker_type = getattr(config, "masker_type", "complementary_st")
+    masker_type = getattr(config, "masker_type", "auto")
 
-    if masker_type in ("complementary_st", "complementary_spatiotemporal", "cst", "auto", "default") or tokenizer_type in ("spatiotemporal_patch", "st_patch", "cst_patch"):
-        return ComplementarySpatiotemporalMasker5x5(
+    if tokenizer_type in ("continuous_stf", "continuous_filterbank", "spatial_grid", "time_only", "dual_domain_attention", "dual_domain"):
+        return ContiguousClusterMasker5x5(
+            min_masked=config.min_masked,
+            max_masked=config.max_masked,
             grid_size=config.grid_size,
-            num_temporal_stages=getattr(config, "num_temporal_stages", 4),
-            num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
-            mode=getattr(config, "cst_mask_mode", "causal"),
         )
     elif tokenizer_type in ("dual_scale_diffusion", "dual_scale") and masker_type != "contiguous_cluster":
         return SpatiotemporalDiffusionMasker5x5(
@@ -440,10 +441,11 @@ def build_masker_5x5(config):
             num_cross_diffusion=getattr(config, "num_cross_diffusion", 8),
         )
     else:
-        return ContiguousClusterMasker5x5(
-            min_masked=config.min_masked,
-            max_masked=config.max_masked,
+        return ComplementarySpatiotemporalMasker5x5(
             grid_size=config.grid_size,
+            num_temporal_stages=getattr(config, "num_temporal_stages", 4),
+            num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
+            mode=getattr(config, "cst_mask_mode", "causal"),
         )
 
 

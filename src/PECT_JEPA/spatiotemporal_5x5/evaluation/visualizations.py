@@ -18,6 +18,16 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
 
 
+def to_safe_path(path: str) -> str:
+    """Ensures paths on Windows bypass the MAX_PATH (260 char) limitation using extended prefix."""
+    if not path:
+        return path
+    abs_path = os.path.abspath(path)
+    if os.name == "nt" and not abs_path.startswith("\\\\?\\"):
+        return "\\\\?\\" + abs_path
+    return abs_path
+
+
 def plot_probability_heatmap(
     prob_map: np.ndarray,
     save_path: str,
@@ -29,7 +39,8 @@ def plot_probability_heatmap(
     """
     Plots and saves 2D defect probability heatmap with strict [0, 1] color range.
     """
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.5, 5.5), dpi=dpi)
     
     # Clip probabilities to [0, 1] for safety
@@ -62,7 +73,8 @@ def plot_roc_pr_curves(
     """
     Plots 2-panel figure showing ROC Curve (left) and PR Curve (right).
     """
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.8), dpi=dpi)
 
     # Panel 1: ROC Curve
@@ -105,7 +117,8 @@ def plot_depth_regression_maps(
     """
     Plots side-by-side comparison of True CAD Depth Map vs Model Predicted Depth Map (mm).
     """
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), dpi=dpi)
 
     vmax = max(1.0, float(np.max(true_depth_map)), float(np.max(pred_depth_map)))
@@ -145,7 +158,8 @@ def plot_depth_calibration_scatter(
     """
     Plots scatter plot of True CAD Depth (mm) vs Model Predicted Depth (mm).
     """
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig, ax = plt.subplots(figsize=(6, 5.5), dpi=dpi)
 
     y_t = true_depth.flatten()
@@ -212,7 +226,8 @@ def plot_severity_confusion_matrix(
     if class_names is None:
         class_names = ["Sound", "Shallow (<=0.2)", "Medium (0.3-0.6)", "Deep (>=0.7)"]
 
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
     cm_norm = cm.astype(np.float32) / (cm.sum(axis=1, keepdims=True) + 1e-8)
 
@@ -257,7 +272,8 @@ def plot_liftoff_cka_heatmap(
     """
     Plots heatmap matrix of Linear CKA invariance across lift-off heights.
     """
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.5, 5.5), dpi=dpi)
     
     im = ax.imshow(cka_matrix, cmap="YlGnBu", vmin=0.0, vmax=1.0)
