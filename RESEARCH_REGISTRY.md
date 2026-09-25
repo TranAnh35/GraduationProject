@@ -245,4 +245,57 @@ This document permanently tracks all completed, rejected, and active research hy
   - *Validation of Dodd-Deeds Lift-Off Invariance*: The linear CKA between lift-off heights reached up to **0.9928** without a single synthetic perturbation or contrastive distance loss. This empirically confirms that Dodd-Deeds Fourier Phase $\theta(f)$ inherently filters probe lift-off fluctuations while remaining 100% compliant with the non-contrastive Pure JEPA paradigm.
   - *Validation of Hurdle NDT Protocol*: Evaluated across all 57 compound OOD scans, the latent representation achieves **$R^2 = 0.8048$ on Corrosion flaws** and **0.5391 overall** for pixels with actual defects ($y > 0$), while plate $R^2$ is bounded by zero-inflated sound metal lift-off ripples.
 
+### EXP-12: Dual-Domain Spatio-Spectral Skin-Depth JEPA (10 Epochs)
+- **Run Directory**: `experiments/5x5/exp12_spatio_spectral_jepa_20260925_173316`
+- **Configuration**:
+  - Tokenizer: `SpatioSpectralTokenizer5x5` (100 tokens: 25 spatial probes $\times$ 4 physical skin-depth scales $\delta(f) \propto 1/\sqrt{f}$).
+  - Subband Decomposition: Analytic inverse FFT filtering ($\sum_{k=0}^3 x_k(t) = x(t)$, reconstruction error $< 10^{-6}$).
+  - Fusion: Dodd-Deeds Fourier phase gating $g_k = \sigma(W_{g,k} z_{\text{freq},k})$ + residual temporal highway $W_{r,k} z_{\text{time},k}$.
+  - Positional Embedding: Separable 3D learnable positional embedding $E(s, k) = E_{\text{spatial}}(s) + E_{\text{scale}}(k)$.
+  - Masker: `ComplementarySpatiotemporalMasker5x5` with `surface_to_depth` mode (context = surface scales 2, 3; target = subsurface scales 0, 1).
+  - Predictor: `ResidualDiffusionPredictor5x5` with Parabolic Green's attention bias ($M_{ij} = -\gamma d_{ij}^2 - \alpha \ln(d_{ij}^2 + 1)$).
+  - Architecture: Unified Single Encoder + Stop-Gradient Target (`use_target_ema=False`).
+  - Loss Formulation: **100% Pure JEPA** (`liftoff_invar_weight=0.0`, `phase_align_weight=0.0`), VICReg var=1.0, cov=1.0 on unified representation $H_{\text{rep\_reg}}$, file-balanced batch sampling (no minority oversampling), 10 epochs.
+- **Validation Loss & Intrinsic Dimension Trajectory Across 10 Epochs**:
+  - Epoch 01: `train_loss = 1.3629` (pred=0.5788), `val_loss_pred = 0.3832`, `twonn_dim = 7.90D`, `LiftOff-Sim = 0.80`
+  - Epoch 02: `train_loss = 0.3135` (pred=0.2524), `val_loss_pred = 0.1872`, `twonn_dim = 8.00D`, `LiftOff-Sim = 0.83`
+  - Epoch 03: `train_loss = 0.2517` (pred=0.2202), `val_loss_pred = 0.1616` (Best val prediction checkpoint), `twonn_dim = 9.00D`, `LiftOff-Sim = 0.83`
+  - Epoch 04: `train_loss = 0.2445` (pred=0.2187), `val_loss_pred = 0.1822`, `twonn_dim = 9.00D`, `LiftOff-Sim = 0.85`
+  - Epoch 05: `train_loss = 0.2301` (pred=0.2067), `val_loss_pred = 0.1971`, `twonn_dim = 8.90D`, `LiftOff-Sim = 0.87` (Warmup completed)
+  - Epoch 06: `train_loss = 0.2235` (pred=0.2013), `val_loss_pred = 0.2159`, `twonn_dim = 8.70D`, `LiftOff-Sim = 0.85`
+  - Epoch 07: `train_loss = 0.2110` (pred=0.1900), `val_loss_pred = 0.2100`, `twonn_dim = 8.60D`, `LiftOff-Sim = 0.89`
+  - Epoch 08: `train_loss = 0.1897` (pred=0.1699), `val_loss_pred = 0.1992`, `twonn_dim = 9.30D`, `LiftOff-Sim = 0.89`
+  - Epoch 09: `train_loss = 0.1771` (pred=0.1582), `val_loss_pred = 0.1912`, `twonn_dim = 9.40D`, `LiftOff-Sim = 0.89`
+  - Epoch 10: `train_loss = 0.1675` (pred=0.1490), `val_loss_pred = 0.1884`, `twonn_dim = 8.70D`, `LiftOff-Sim = 0.89`
+- **Downstream Empirical Metrics Across ALL 57 Held-Out Compound OOD Test Scans**:
+  - **Task 1 (Anomaly Detection)**:
+    - Mean AUC-ROC: **81.25% ± 10.45%** (Linear Probe)
+    - Mean Average Precision (AP): **37.56%** (Linear Probe)
+    - Mean Contrast-to-Noise Ratio (CNR): **1.67**
+    - On Rivet Specimen: **AUC = 90.67%**, **AP = 53.75%**, **CNR = 2.69**
+  - **Task 2 (Two-Stage Hurdle Depth Sizing Protocol)**:
+    - Overall Plate $R^2$: **0.1268**, Mean MAE: **0.1145 mm**
+    - **Defect-Only Depth Sizing ($y > 0$)**:
+      - **Corrosion Specimen**: Defect-Only $R^2 = \mathbf{0.7912}$
+      - **Rivet_v1 Specimen**: Defect-Only $R^2 = \mathbf{0.4831}$, Plate $R^2 = \mathbf{0.2000}$, MAE = **0.0735 mm**
+      - **Rivet_v2 Specimen**: Defect-Only $R^2 = \mathbf{0.2933}$
+      - **Overall Across All 57 Files**: Mean Defect-Only $R^2 = \mathbf{0.5225}$
+  - **Task 3 (Severity Classification)**: Macro F1 = **0.3839**
+  - **Task 4 (Multi-Lift-Off Invariance without Contrastive Loss)**:
+    - Mean Linear CKA: **0.4547**
+    - Mean Cosine Similarity across lift-off pairs: **0.9996**
+  - **Task 5 (Representation Geometry)**: Top-3 PCs explained variance = **93.3%**
+- **Breakdown by Waveform**:
+  - **Chirp (Holdout Waveform)**: AUC = **83.21%**, AP = **42.55%**, CNR = **1.91**, Defect-Only $R^2 = \mathbf{0.5325}$
+  - **Square**: AUC = **84.31%**, AP = **40.34%**, CNR = **1.81**, Defect-Only $R^2 = \mathbf{0.5405}$
+  - **Gaussian**: AUC = **74.64%**, AP = **25.80%**, CNR = **1.09**, Defect-Only $R^2 = \mathbf{0.4867}$
+- **Breakdown by Sensor**:
+  - **Hall Pot Core**: AUC = **84.07%**, AP = **41.75%**, CNR = **1.74**, Defect-Only $R^2 = \mathbf{0.5604}$
+  - **TMR (Held-Out Sensor)**: AUC = **81.79%**, AP = **38.76%**, CNR = **1.75**, Defect-Only $R^2 = \mathbf{0.4748}$
+  - **Hall Air Core**: AUC = **77.44%**, AP = **31.20%**, CNR = **1.46**, Defect-Only $R^2 = \mathbf{0.5705}$
+- **Empirical Rationale & Architectural Conclusion**:
+  - *Waveform-Agnostic Skin-Depth Representation*: Decomposing waveforms into analytic Fourier subbands with 100% time-domain conservation ($\sum x_k(t) = x(t)$) prevented the catastrophic collapse on Chirp waveforms and maintained high Two-NN intrinsic dimension (**8.7D – 9.4D**).
+  - *Resolution of Zero-Inflated Depth Sizing*: While previous 100-token models collapsed on defect depth sizing ($R^2 < 0$), EXP-12 maintains **$R^2 = 0.7912$ on Corrosion** and **$0.4831$ on Rivet_v1**, achieving positive depth sizing without minority oversampling.
+
+
 
