@@ -42,7 +42,8 @@ class Spatiotemporal5x5Config:
     cst_mask_mode: str = "surface_to_depth" # 'surface_to_depth' (surface ctx -> deep subsurface tgt) | 'causal' | 'random'
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "spatio_spectral" # 'spatio_spectral' (EXP-12: 100 skin-depth dual-domain tokens) | 'dual_domain_attention' | 'spatiotemporal_patch'
+    tokenizer_type: str = "spatio_spectral" # 'spatio_spectral' (EXP-12: 100 skin-depth tokens) | 'dual_domain_attention' | 'spatiotemporal_patch'
+    num_temporal_stages: int = 4        # Number of chronological diffusion stages (for CST backward compatibility)
     num_scales: int = 4                 # Number of physical skin-depth scales (for spatio_spectral)
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
     num_freq_bins: int = 14             # Number of FFT frequency bins (1..14, default 14 = 0-2800 Hz)

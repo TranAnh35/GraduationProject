@@ -244,6 +244,7 @@ def main():
         ema_momentum=args.ema_momentum,
         ema_momentum_end=args.ema_momentum_end,
         tokenizer_type=args.tokenizer_type,
+        num_scales=args.num_scales,
         masker_type=args.masker_type,
         num_temporal_stages=args.num_temporal_stages,
         cst_mask_mode=args.cst_mask_mode,
