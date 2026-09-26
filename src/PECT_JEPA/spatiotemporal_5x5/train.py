@@ -213,6 +213,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Stop training early if monitored metric fails to improve for N epochs (default: 10; 0 = disabled)")
     p.add_argument("--early_stopping_warmup", type=int, default=5,
                    help="Number of initial epochs during which early stopping patience counter is paused (default: 5)")
+    p.add_argument("--use_mask_bank", type=lambda v: v.lower() == "true", default=True,
+                   help="Enable precomputed GPU/CPU mask bank for sub-microsecond batch mask sampling (default: True)")
+    p.add_argument("--mask_bank_size", type=int, default=2048,
+                   help="Precomputed mask bank size per configuration (default: 2048)")
+    p.add_argument("--steps_per_epoch", type=int, default=None,
+                   help="Maximum batches per epoch for rapid experimentation (default: None for full dataset scan)")
+    p.add_argument("--compile", type=lambda v: v.lower() == "true", default=False,
+                   help="Enable torch.compile for PyTorch 2.x kernel fusion (default: False)")
+    p.add_argument("--log_interval", type=int, default=20,
+                   help="Step interval for logging metrics to CSV/TensorBoard and updating tqdm progress (default: 20)")
     p.add_argument("--eval_after_train", type=lambda v: v.lower() == "true", default=False,
                    help="Automatically run downstream evaluation suite immediately after training completes")
     p.add_argument("--eval_3d", type=lambda v: v.lower() == "true", default=False,
@@ -300,6 +310,11 @@ def main():
         log_histograms=args.log_histograms,
         diagnostics_interval=args.diagnostics_interval,
         resume=args.resume,
+        use_mask_bank=args.use_mask_bank,
+        mask_bank_size=args.mask_bank_size,
+        steps_per_epoch=args.steps_per_epoch,
+        compile_model=args.compile,
+        log_interval=args.log_interval,
     )
 
     # Initialize unified logger
@@ -307,6 +322,8 @@ def main():
 
     if torch.cuda.is_available() and config.device == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     # Unify checkpoint save_dir inside experiment directory if not explicitly custom
     if config.save_dir is None or config.save_dir in ("checkpoints/pect_jepa_5x5", "auto"):
@@ -399,6 +416,7 @@ def main():
         batch_size=config.batch_size,
         k_per_file=args.k_per_file,
         seed=config.seed,
+        steps_per_epoch=config.steps_per_epoch,
     )
 
     train_loader_kwargs = {
@@ -463,6 +481,13 @@ def main():
     model = PECT_JEPA_5x5(config)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"PECT_JEPA_5x5 Trainable Parameters: {n_params / 1e6:.2f}M")
+
+    if getattr(config, "compile_model", False) and hasattr(torch, "compile"):
+        try:
+            logger.info("Compiling PECT_JEPA_5x5 model via torch.compile (Inductor backend)...")
+            model = torch.compile(model)
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}. Falling back to standard eager mode.")
 
     # 4. Trainer
     trainer = Trainer5x5(

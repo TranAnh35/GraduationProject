@@ -257,7 +257,7 @@ class PECT5x5Dataset(Dataset):
         )
 
         if not self.return_meta:
-            return torch.from_numpy(patch).float()
+            return torch.from_numpy(patch)
 
         meta = dict(self.metadata_list[file_idx])
         meta["point_idx"] = point_idx
@@ -266,7 +266,7 @@ class PECT5x5Dataset(Dataset):
         meta["col"] = col
         meta["orig_row"] = row + self.crop_border
         meta["orig_col"] = col + self.crop_border
-        return torch.from_numpy(patch).float(), meta
+        return torch.from_numpy(patch), meta
 
 
 class FileBalancedBatchSampler5x5(Sampler[List[int]]):
@@ -282,6 +282,7 @@ class FileBalancedBatchSampler5x5(Sampler[List[int]]):
         k_per_file: int = 8,
         shuffle: bool = True,
         seed: int = 42,
+        steps_per_epoch: Optional[int] = None,
     ):
         super().__init__()
         self.dataset = dataset
@@ -290,6 +291,7 @@ class FileBalancedBatchSampler5x5(Sampler[List[int]]):
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
+        self.steps_per_epoch = steps_per_epoch
 
         # Group sample indices by file
         self.file_to_indices: Dict[int, List[int]] = {}
@@ -301,7 +303,7 @@ class FileBalancedBatchSampler5x5(Sampler[List[int]]):
         self.num_files = len(self.file_to_indices)
         self.files_per_batch = max(1, batch_size // self.k_per_file)
         total_samples = len(dataset)
-        self.num_batches = max(1, total_samples // batch_size)
+        self.num_batches = steps_per_epoch if steps_per_epoch is not None else max(1, total_samples // batch_size)
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
@@ -353,6 +355,7 @@ def collate_5x5_batch(batch: List[Any]) -> Dict[str, Any]:
         data = torch.stack([item[0] for item in batch], dim=0)
         meta = [item[1] for item in batch]
         return {"data": data, "meta": meta}
+    elif isinstance(batch[0], torch.Tensor):
+        return {"data": torch.stack(batch, dim=0)}
     else:
-        data = torch.stack(batch, dim=0)
-        return {"data": data}
+        return {"data": torch.from_numpy(np.stack(batch, axis=0)).float()}

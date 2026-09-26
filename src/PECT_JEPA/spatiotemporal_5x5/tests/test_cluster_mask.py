@@ -123,6 +123,17 @@ class TestComplementarySpatiotemporalMasker5x5(unittest.TestCase):
                 self.assertEqual(len(ctx_probes), 17, f"Expected 17 spatial context probes, got {len(ctx_probes)}")
                 self.assertEqual(len(tgt_probes & ctx_probes), 0, "Target and context spatial probes must be disjoint!")
 
+    def test_mask_bank_sampling(self):
+        """Test that mask bank sampling (seed=None) produces disjoint, valid tensor shapes."""
+        ctx, tgt, mask_bool = self.masker.sample_mask(batch_size=16)
+        self.assertEqual(ctx.shape, (16, 34))
+        self.assertEqual(tgt.shape, (16, 16))
+        self.assertEqual(mask_bool.shape, (16, 100))
+        for b in range(16):
+            ctx_set = set(ctx[b].tolist())
+            tgt_set = set(tgt[b].tolist())
+            self.assertEqual(len(ctx_set & tgt_set), 0, "Bank mask context and target must be strictly disjoint!")
+
 
 if __name__ == "__main__":
     unittest.main()

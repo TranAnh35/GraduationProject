@@ -24,12 +24,22 @@ class ContiguousClusterMasker5x5:
     equipped with Hole-Filling and Island Pruning.
     """
 
-    def __init__(self, min_masked: int = 10, max_masked: int = 15, grid_size: int = 5):
+    def __init__(
+        self,
+        min_masked: int = 10,
+        max_masked: int = 15,
+        grid_size: int = 5,
+        use_mask_bank: bool = True,
+        bank_size: int = 2048,
+    ):
         self.min_masked = min_masked
         self.max_masked = max_masked
         self.grid_size = grid_size
         self.total_tokens = grid_size * grid_size  # 25
         self.all_pts: Set[Tuple[int, int]] = set((i, j) for i in range(grid_size) for j in range(grid_size))
+        self.use_mask_bank = use_mask_bank
+        self.bank_size = bank_size
+        self._banks: dict = {}
 
         if not (0 < min_masked <= max_masked < self.total_tokens):
             raise ValueError(f"Invalid mask bounds: {min_masked} - {max_masked} for grid size {grid_size}")
@@ -168,6 +178,25 @@ class ContiguousClusterMasker5x5:
         ctx = [i for i in range(self.total_tokens) if i not in tgt]
         return ctx, tgt
 
+    def _get_or_create_bank(self, num_mask: int, device: torch.device):
+        dev_key = (str(device), num_mask)
+        if dev_key not in self._banks:
+            rng = random.Random(42 + num_mask * 1009)
+            ctx_all = []
+            tgt_all = []
+            mask_grid_all = np.zeros((self.bank_size, self.total_tokens), dtype=bool)
+            for _ in range(self.bank_size):
+                ctx, tgt = self.sample_one(rng, num_mask)
+                ctx_all.append(ctx)
+                tgt_all.append(tgt)
+                mask_grid_all[len(ctx_all) - 1, tgt] = True
+
+            ctx_t = torch.tensor(ctx_all, dtype=torch.long, device=device)
+            tgt_t = torch.tensor(tgt_all, dtype=torch.long, device=device)
+            bool_t = torch.from_numpy(mask_grid_all).to(device)
+            self._banks[dev_key] = (ctx_t, tgt_t, bool_t)
+        return self._banks[dev_key]
+
     def sample_mask(
         self,
         batch_size: int,
@@ -183,6 +212,12 @@ class ContiguousClusterMasker5x5:
             target_indices:  [B, N_tgt] long tensor
             mask_bool:       [B, 25] boolean tensor (True = target/masked)
         """
+        if seed is None and self.use_mask_bank:
+            num_mask = random.randint(self.min_masked, self.max_masked)
+            ctx_bank, tgt_bank, bool_bank = self._get_or_create_bank(num_mask, device)
+            idx = torch.randint(0, self.bank_size, (batch_size,), device=device)
+            return ctx_bank[idx], tgt_bank[idx], bool_bank[idx]
+
         rng = random.Random(seed) if seed is not None else random
         num_mask = rng.randint(self.min_masked, self.max_masked)
 
@@ -230,6 +265,8 @@ class SpatiotemporalDiffusionMasker5x5:
         grid_size: int = 5,
         num_spatial_cluster: int = 8,
         num_cross_diffusion: int = 8,
+        use_mask_bank: bool = True,
+        bank_size: int = 2048,
     ):
         self.grid_size = grid_size
         self.total_spatial = grid_size * grid_size  # 25
@@ -238,6 +275,9 @@ class SpatiotemporalDiffusionMasker5x5:
         self.num_cross_diffusion = min(num_cross_diffusion, self.total_spatial - self.num_spatial_cluster)
         self.num_tgt = self.num_spatial_cluster * 2 + self.num_cross_diffusion
         self.num_ctx = self.total_tokens - self.num_tgt
+        self.use_mask_bank = use_mask_bank
+        self.bank_size = bank_size
+        self._banks: dict = {}
 
     def _get_neighbors(self, x: int, y: int) -> List[Tuple[int, int]]:
         nbs = []
@@ -289,12 +329,36 @@ class SpatiotemporalDiffusionMasker5x5:
 
         return sorted(ctx_tokens), sorted(tgt_tokens)
 
+    def _get_or_create_bank(self, device: torch.device):
+        dev_key = str(device)
+        if dev_key not in self._banks:
+            rng = random.Random(42 + 50)
+            ctx_all = []
+            tgt_all = []
+            mask_grid_all = np.zeros((self.bank_size, self.total_tokens), dtype=bool)
+            for _ in range(self.bank_size):
+                ctx, tgt = self.sample_one(rng)
+                ctx_all.append(ctx)
+                tgt_all.append(tgt)
+                mask_grid_all[len(ctx_all) - 1, tgt] = True
+
+            ctx_t = torch.tensor(ctx_all, dtype=torch.long, device=device)
+            tgt_t = torch.tensor(tgt_all, dtype=torch.long, device=device)
+            bool_t = torch.from_numpy(mask_grid_all).to(device)
+            self._banks[dev_key] = (ctx_t, tgt_t, bool_t)
+        return self._banks[dev_key]
+
     def sample_mask(
         self,
         batch_size: int,
         device: torch.device = torch.device("cpu"),
         seed: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if seed is None and self.use_mask_bank:
+            ctx_bank, tgt_bank, bool_bank = self._get_or_create_bank(device)
+            idx = torch.randint(0, self.bank_size, (batch_size,), device=device)
+            return ctx_bank[idx], tgt_bank[idx], bool_bank[idx]
+
         ctx_all = []
         tgt_all = []
         mask_grid_all = np.zeros((batch_size, self.total_tokens), dtype=bool)
@@ -341,6 +405,8 @@ class ComplementarySpatiotemporalMasker5x5:
         num_temporal_stages: int = 4,
         num_spatial_cluster: int = 8,
         mode: str = "causal",
+        use_mask_bank: bool = True,
+        bank_size: int = 2048,
     ):
         self.grid_size = grid_size
         self.total_spatial = grid_size * grid_size  # 25
@@ -348,12 +414,17 @@ class ComplementarySpatiotemporalMasker5x5:
         self.total_tokens = self.total_spatial * num_temporal_stages  # 100
         self.num_spatial_cluster = min(num_spatial_cluster, self.total_spatial - 2)
         self.mode = mode
+        self.use_mask_bank = use_mask_bank
+        self.bank_size = bank_size
+        self._banks: dict = {}
 
         # Base spatial cluster generator
         self.spatial_masker = ContiguousClusterMasker5x5(
             min_masked=self.num_spatial_cluster,
             max_masked=self.num_spatial_cluster,
             grid_size=grid_size,
+            use_mask_bank=use_mask_bank,
+            bank_size=bank_size,
         )
 
         # Token counts
@@ -399,12 +470,36 @@ class ComplementarySpatiotemporalMasker5x5:
 
         return sorted(ctx_tokens), sorted(tgt_tokens)
 
+    def _get_or_create_bank(self, device: torch.device):
+        dev_key = str(device)
+        if dev_key not in self._banks:
+            rng = random.Random(42 + 100)
+            ctx_all = []
+            tgt_all = []
+            mask_grid_all = np.zeros((self.bank_size, self.total_tokens), dtype=bool)
+            for _ in range(self.bank_size):
+                ctx, tgt = self.sample_one(rng)
+                ctx_all.append(ctx)
+                tgt_all.append(tgt)
+                mask_grid_all[len(ctx_all) - 1, tgt] = True
+
+            ctx_t = torch.tensor(ctx_all, dtype=torch.long, device=device)
+            tgt_t = torch.tensor(tgt_all, dtype=torch.long, device=device)
+            bool_t = torch.from_numpy(mask_grid_all).to(device)
+            self._banks[dev_key] = (ctx_t, tgt_t, bool_t)
+        return self._banks[dev_key]
+
     def sample_mask(
         self,
         batch_size: int,
         device: torch.device = torch.device("cpu"),
         seed: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if seed is None and self.use_mask_bank:
+            ctx_bank, tgt_bank, bool_bank = self._get_or_create_bank(device)
+            idx = torch.randint(0, self.bank_size, (batch_size,), device=device)
+            return ctx_bank[idx], tgt_bank[idx], bool_bank[idx]
+
         ctx_all = []
         tgt_all = []
         mask_grid_all = np.zeros((batch_size, self.total_tokens), dtype=bool)
@@ -431,18 +526,24 @@ def build_masker_5x5(config):
     """
     tokenizer_type = getattr(config, "tokenizer_type", "spatiotemporal_patch")
     masker_type = getattr(config, "masker_type", "auto")
+    use_mask_bank = getattr(config, "use_mask_bank", True)
+    bank_size = getattr(config, "mask_bank_size", 2048)
 
     if tokenizer_type in ("continuous_stf", "continuous_filterbank", "spatial_grid", "time_only", "dual_domain_attention", "dual_domain"):
         return ContiguousClusterMasker5x5(
             min_masked=config.min_masked,
             max_masked=config.max_masked,
             grid_size=config.grid_size,
+            use_mask_bank=use_mask_bank,
+            bank_size=bank_size,
         )
     elif tokenizer_type in ("dual_scale_diffusion", "dual_scale") and masker_type != "contiguous_cluster":
         return SpatiotemporalDiffusionMasker5x5(
             grid_size=config.grid_size,
             num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
             num_cross_diffusion=getattr(config, "num_cross_diffusion", 8),
+            use_mask_bank=use_mask_bank,
+            bank_size=bank_size,
         )
     elif tokenizer_type in ("spatio_spectral", "skin_depth"):
         return ComplementarySpatiotemporalMasker5x5(
@@ -450,6 +551,8 @@ def build_masker_5x5(config):
             num_temporal_stages=getattr(config, "num_scales", 4),
             num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
             mode=getattr(config, "cst_mask_mode", "surface_to_depth"),
+            use_mask_bank=use_mask_bank,
+            bank_size=bank_size,
         )
     else:
         return ComplementarySpatiotemporalMasker5x5(
@@ -457,6 +560,8 @@ def build_masker_5x5(config):
             num_temporal_stages=getattr(config, "num_temporal_stages", 4),
             num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
             mode=getattr(config, "cst_mask_mode", "causal"),
+            use_mask_bank=use_mask_bank,
+            bank_size=bank_size,
         )
 
 

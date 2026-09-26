@@ -104,7 +104,11 @@ class PECT_JEPA_5x5(nn.Module):
         nn.init.trunc_normal_(self.depth_head.weight, std=0.02)
 
     @staticmethod
-    def compute_characteristic_frequency(x: torch.Tensor, num_bins: int = 14) -> torch.Tensor:
+    def compute_characteristic_frequency(
+        x: torch.Tensor,
+        num_bins: int = 14,
+        X_fft: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Computes the normalized Energy-Weighted Characteristic Frequency (omega_bar)
         for each sample in the batch:
@@ -115,10 +119,19 @@ class PECT_JEPA_5x5(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(0)
         B, H, W, C = x.shape
-        x_flat = x.reshape(B, H * W, C).float()
-        # Compute FFT along temporal dimension
-        X_fft = torch.fft.rfft(x_flat, dim=-1)[:, :, 1:num_bins + 1]  # [B, 25, K], exclude DC
-        pwr = torch.sum(torch.abs(X_fft) ** 2, dim=1)  # [B, K], spatial average power per freq bin
+        if X_fft is None:
+            x_flat = x.reshape(B, H * W, C).float()
+            # Compute FFT along temporal dimension
+            X_fft_sub = torch.fft.rfft(x_flat, dim=-1)[:, :, 1:num_bins + 1]  # [B, 25, K], exclude DC
+        else:
+            if X_fft.ndim == 3 and X_fft.shape[1] == H * W and X_fft.shape[-1] > num_bins:
+                X_fft_sub = X_fft[:, :, 1:num_bins + 1]
+            elif X_fft.ndim == 4:
+                X_fft_sub = X_fft.reshape(B, H * W, -1)[:, :, 1:num_bins + 1]
+            else:
+                X_fft_sub = X_fft[:, :, 1:num_bins + 1]
+
+        pwr = torch.sum(torch.abs(X_fft_sub) ** 2, dim=1)  # [B, K], spatial average power per freq bin
         # Frequency bins: 1, 2, ..., K normalized to (0, 1]
         k_indices = torch.linspace(1.0 / float(num_bins), 1.0, num_bins, device=x.device, dtype=torch.float32)  # [K]
         total_pwr = torch.sum(pwr, dim=-1, keepdim=True) + 1e-12
@@ -165,6 +178,7 @@ class PECT_JEPA_5x5(nn.Module):
         # 1. Tokenization -> tokens [B, N_total, D], pos [B, N_total, D] (N_total is 50 for dual_scale or 25)
         tokens, pos = self.tokenizer(x)
         N_total = tokens.shape[1]
+        last_fft = getattr(self.tokenizer, "_last_fft", None)
 
         # 2. Sample or use custom mask
         if custom_context_indices is not None and custom_target_indices is not None:
@@ -191,7 +205,7 @@ class PECT_JEPA_5x5(nn.Module):
         if hasattr(self.predictor, "residual_head"):
             if freq_condition is None:
                 freq_condition = self.compute_characteristic_frequency(
-                    x, num_bins=getattr(self.config, "num_freq_bins", 14)
+                    x, num_bins=getattr(self.config, "num_freq_bins", 14), X_fft=last_fft
                 )
             H_pred, delta_pred, _ = self.predictor(
                 H_context=H_ctx,
@@ -204,7 +218,7 @@ class PECT_JEPA_5x5(nn.Module):
         elif is_physics_predictor:
             if freq_condition is None:
                 freq_condition = self.compute_characteristic_frequency(
-                    x, num_bins=getattr(self.config, "num_freq_bins", 14)
+                    x, num_bins=getattr(self.config, "num_freq_bins", 14), X_fft=last_fft
                 )
             H_pred = self.predictor(
                 H_context=H_ctx,

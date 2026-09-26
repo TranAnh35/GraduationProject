@@ -139,17 +139,13 @@ class Trainer5x5:
 
     def train_epoch(self) -> Dict[str, float]:
         self.model.train()
-        total_loss = 0.0
-        total_pred = 0.0
-        total_liftoff = 0.0
-        total_phase = 0.0
-        total_var = 0.0
-        total_cov = 0.0
-        total_unif = 0.0
-        total_norm = 0.0
-        total_mean_norm = 0.0
+        loss_accum_gpu = torch.zeros(9, device=self.device, dtype=torch.float32)
         total_inter_cos = 0.0
+        n_inter_cos_samples = 0
+        last_inter_cos_val = 1.0
         n_batches = 0
+        log_interval = max(1, getattr(self.config, "log_interval", 20))
+        total_batches = len(self.train_loader) if hasattr(self.train_loader, "__len__") else 0
 
         pbar = tqdm(
             self.train_loader,
@@ -158,7 +154,7 @@ class Trainer5x5:
             leave=False
         )
 
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             x = batch["data"].to(self.device, non_blocking=True)
             lr = self.lr_scheduler.step(self.global_step)
             for pg in self.optimizer.param_groups:
@@ -184,62 +180,84 @@ class Trainer5x5:
             # EMA target update
             self.model.update_target_encoder(momentum=momentum)
 
-            loss_val = float(loss.item())
-            pred_val = float(loss_dict["loss_pred"].item())
-            liftoff_val = float(loss_dict.get("loss_liftoff", torch.tensor(0.0)).item())
-            phase_val = float(loss_dict.get("loss_phase", torch.tensor(0.0)).item())
-            var_val = float(loss_dict.get("loss_var", torch.tensor(0.0)).item())
-            cov_val = float(loss_dict.get("loss_cov", torch.tensor(0.0)).item())
-            unif_val = float(loss_dict.get("loss_unif", torch.tensor(0.0)).item())
-            norm_val = float(loss_dict.get("loss_norm", torch.tensor(0.0)).item())
-            mean_norm_val = float(loss_dict.get("mean_norm", torch.tensor(1.0)).item())
-
-            # Inter-sample diversity monitoring (anti-collapse health metric)
-            with torch.no_grad():
-                H_tgt_step = loss_dict.get("H_tgt")
-                if H_tgt_step is not None and H_tgt_step.shape[0] > 1:
-                    H_tgt_p = F.normalize(H_tgt_step.detach().mean(dim=1).float(), p=2, dim=-1)
-                    sim_b = torch.mm(H_tgt_p, H_tgt_p.t())
-                    mask_b = ~torch.eye(sim_b.shape[0], dtype=torch.bool, device=sim_b.device)
-                    inter_cos_val = float(sim_b[mask_b].mean().item())
-                else:
-                    inter_cos_val = 1.0
-
-            total_loss += loss_val
-            total_pred += pred_val
-            total_liftoff += liftoff_val
-            total_phase += phase_val
-            total_var += var_val
-            total_cov += cov_val
-            total_unif += unif_val
-            total_norm += norm_val
-            total_mean_norm += mean_norm_val
-            total_inter_cos += inter_cos_val
+            # Asynchronous metric accumulation directly on GPU (no blocking host sync)
+            loss_t = torch.stack([
+                loss.detach().float(),
+                loss_dict["loss_pred"].detach().float(),
+                loss_dict.get("loss_liftoff", torch.zeros((), device=self.device)).detach().float(),
+                loss_dict.get("loss_phase", torch.zeros((), device=self.device)).detach().float(),
+                loss_dict.get("loss_var", torch.zeros((), device=self.device)).detach().float(),
+                loss_dict.get("loss_cov", torch.zeros((), device=self.device)).detach().float(),
+                loss_dict.get("loss_unif", torch.zeros((), device=self.device)).detach().float(),
+                loss_dict.get("loss_norm", torch.zeros((), device=self.device)).detach().float(),
+                loss_dict.get("mean_norm", torch.ones((), device=self.device)).detach().float(),
+            ])
+            loss_accum_gpu.add_(loss_t)
             n_batches += 1
 
-            if self.logger:
-                step_metrics = {
-                    "loss": loss_val,
-                    "loss_pred": pred_val,
-                    "loss_liftoff": liftoff_val,
-                    "loss_phase": phase_val,
-                    "loss_unif": unif_val,
-                    "loss_norm": norm_val,
-                    "mean_norm": mean_norm_val,
-                    "inter_cos": inter_cos_val,
-                    "lr": lr,
-                    "momentum": momentum,
-                    "grad_norm": grad_norm,
+            should_log = (self.global_step % log_interval == 0) or (total_batches > 0 and batch_idx == total_batches - 1)
+
+            if should_log:
+                loss_val = float(loss.item())
+                pred_val = float(loss_dict["loss_pred"].item())
+                liftoff_val = float(loss_dict.get("loss_liftoff", torch.tensor(0.0)).item())
+                phase_val = float(loss_dict.get("loss_phase", torch.tensor(0.0)).item())
+                var_val = float(loss_dict.get("loss_var", torch.tensor(0.0)).item())
+                cov_val = float(loss_dict.get("loss_cov", torch.tensor(0.0)).item())
+                unif_val = float(loss_dict.get("loss_unif", torch.tensor(0.0)).item())
+                norm_val = float(loss_dict.get("loss_norm", torch.tensor(0.0)).item())
+                mean_norm_val = float(loss_dict.get("mean_norm", torch.tensor(1.0)).item())
+
+                # Inter-sample diversity monitoring on log steps
+                with torch.no_grad():
+                    H_tgt_step = loss_dict.get("H_tgt")
+                    if H_tgt_step is not None and H_tgt_step.shape[0] > 1:
+                        H_tgt_p = F.normalize(H_tgt_step.detach().mean(dim=1).float(), p=2, dim=-1)
+                        sim_b = torch.mm(H_tgt_p, H_tgt_p.t())
+                        mask_b = ~torch.eye(sim_b.shape[0], dtype=torch.bool, device=sim_b.device)
+                        last_inter_cos_val = float(sim_b[mask_b].mean().item())
+                    else:
+                        last_inter_cos_val = 1.0
+
+                total_inter_cos += last_inter_cos_val
+                n_inter_cos_samples += 1
+
+                if self.logger:
+                    step_metrics = {
+                        "loss": loss_val,
+                        "loss_pred": pred_val,
+                        "loss_liftoff": liftoff_val,
+                        "loss_phase": phase_val,
+                        "loss_unif": unif_val,
+                        "loss_norm": norm_val,
+                        "mean_norm": mean_norm_val,
+                        "inter_cos": last_inter_cos_val,
+                        "lr": lr,
+                        "momentum": momentum,
+                        "grad_norm": grad_norm,
+                    }
+                    if var_val > 0.0 or getattr(self.config, "var_weight", 0.0) > 0.0:
+                        step_metrics["loss_var"] = var_val
+                    if cov_val > 0.0 or getattr(self.config, "cov_weight", 0.0) > 0.0:
+                        step_metrics["loss_cov"] = cov_val
+                    self.logger.log_step(
+                        step=self.global_step,
+                        metrics=step_metrics,
+                        epoch=self.current_epoch + 1
+                    )
+
+                postfix = {
+                    "loss": f"{loss_val:.4f}",
+                    "pred": f"{pred_val:.4f}",
                 }
-                if var_val > 0.0 or getattr(self.config, "var_weight", 0.0) > 0.0:
-                    step_metrics["loss_var"] = var_val
-                if cov_val > 0.0 or getattr(self.config, "cov_weight", 0.0) > 0.0:
-                    step_metrics["loss_cov"] = cov_val
-                self.logger.log_step(
-                    step=self.global_step,
-                    metrics=step_metrics,
-                    epoch=self.current_epoch + 1
-                )
+                if var_val > 0.0:
+                    postfix["var"] = f"{var_val:.3f}"
+                postfix.update({
+                    "norm": f"{mean_norm_val:.2f}",
+                    "cos": f"{last_inter_cos_val:.3f}",
+                    "lr": f"{lr:.1e}"
+                })
+                pbar.set_postfix(postfix)
 
             self.global_step += 1
 
@@ -256,30 +274,19 @@ class Trainer5x5:
                     if self.logger:
                         self.logger.warning(f"[Trainer] Periodic checkpoint save failed: {e}")
 
-            postfix = {
-                "loss": f"{loss_val:.4f}",
-                "pred": f"{pred_val:.4f}",
-            }
-            if var_val > 0.0:
-                postfix["var"] = f"{var_val:.3f}"
-            postfix.update({
-                "norm": f"{mean_norm_val:.2f}",
-                "cos": f"{inter_cos_val:.3f}",
-                "lr": f"{lr:.1e}"
-            })
-            pbar.set_postfix(postfix)
-
+        # Single GPU-to-CPU sync for entire epoch
+        accum_cpu = (loss_accum_gpu / max(1, n_batches)).cpu().tolist()
         metrics = {
-            "loss": total_loss / max(1, n_batches),
-            "loss_pred": total_pred / max(1, n_batches),
-            "loss_liftoff": total_liftoff / max(1, n_batches),
-            "loss_phase": total_phase / max(1, n_batches),
-            "loss_var": total_var / max(1, n_batches),
-            "loss_cov": total_cov / max(1, n_batches),
-            "loss_unif": total_unif / max(1, n_batches),
-            "loss_norm": total_norm / max(1, n_batches),
-            "mean_norm": total_mean_norm / max(1, n_batches),
-            "inter_cos": total_inter_cos / max(1, n_batches),
+            "loss": float(accum_cpu[0]),
+            "loss_pred": float(accum_cpu[1]),
+            "loss_liftoff": float(accum_cpu[2]),
+            "loss_phase": float(accum_cpu[3]),
+            "loss_var": float(accum_cpu[4]),
+            "loss_cov": float(accum_cpu[5]),
+            "loss_unif": float(accum_cpu[6]),
+            "loss_norm": float(accum_cpu[7]),
+            "mean_norm": float(accum_cpu[8]),
+            "inter_cos": total_inter_cos / max(1, n_inter_cos_samples) if n_inter_cos_samples > 0 else 1.0,
         }
         return metrics
 

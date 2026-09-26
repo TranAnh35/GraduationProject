@@ -816,6 +816,7 @@ class SpatioSpectralTokenizer5x5(nn.Module):
 
         # Compute full complex FFT: [B, 25, 65]
         X_fft = torch.fft.rfft(x_fp32, dim=-1)
+        self._last_fft = X_fft
 
         # Vectorized analytic temporal subbands across all scales in 1 single CUDA kernel:
         # [4, 1, 1, 65] * [1, B, 25, 65] -> [4, B, 25, 65] -> irfft -> [4, B, 25, in_channels]

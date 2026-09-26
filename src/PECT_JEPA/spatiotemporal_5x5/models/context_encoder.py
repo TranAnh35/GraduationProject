@@ -73,14 +73,17 @@ class ContextEncoder5x5(nn.Module):
                 # context_indices: [B, N_ctx]
                 dist_full = self.dist_matrix_100 if hasattr(self, "dist_matrix_100") and self.dist_matrix_100.shape[0] >= N_ctx else getattr(self, "dist_matrix_25", None)
                 if dist_full is not None:
-                    dist_full = dist_full.to(h.device)
+                    if dist_full.device != h.device:
+                        dist_full = dist_full.to(h.device)
                     idx = context_indices.long()
                     dist_ctx = dist_full[idx.unsqueeze(2), idx.unsqueeze(1)]  # [B, N_ctx, N_ctx]
                     attn_bias = self.radial_bias(dist_ctx)  # [B, H, N_ctx, N_ctx]
             elif N_ctx == 100 and hasattr(self, "dist_matrix_100"):
-                attn_bias = self.radial_bias(self.dist_matrix_100.to(h.device))
+                mat = self.dist_matrix_100 if self.dist_matrix_100.device == h.device else self.dist_matrix_100.to(h.device)
+                attn_bias = self.radial_bias(mat)
             elif N_ctx == 25 and hasattr(self, "dist_matrix_25"):
-                attn_bias = self.radial_bias(self.dist_matrix_25.to(h.device))
+                mat = self.dist_matrix_25 if self.dist_matrix_25.device == h.device else self.dist_matrix_25.to(h.device)
+                attn_bias = self.radial_bias(mat)
 
         last_attn = None
         for i, blk in enumerate(self.blocks):

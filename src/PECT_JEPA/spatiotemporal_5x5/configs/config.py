@@ -43,6 +43,8 @@ class Spatiotemporal5x5Config:
     num_spatial_cluster: int = 8        # Number of spatial grid points in cluster
     num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (for dual_scale)
     cst_mask_mode: str = "surface_to_depth" # 'surface_to_depth' (surface ctx -> deep subsurface tgt) | 'causal' | 'random'
+    use_mask_bank: bool = True          # Enable precomputed GPU/CPU mask bank for sub-microsecond batch mask sampling
+    mask_bank_size: int = 2048          # Precomputed mask pool size per configuration
 
     # ------------------------------------------------------------ Architecture
     tokenizer_type: str = "spatio_spectral" # 'spatio_spectral' (EXP-12: 100 skin-depth tokens) | 'dual_domain_attention' | 'spatiotemporal_patch'
@@ -99,6 +101,8 @@ class Spatiotemporal5x5Config:
     grad_clip: float = 1.0
     mixed_precision: bool = True
     device: str = "cuda"
+    steps_per_epoch: Optional[int] = None # Optional maximum batches per epoch (None = full dataset scan)
+    compile_model: bool = False          # Enable torch.compile for PyTorch 2.x kernel fusion
 
     # --------------------------------------------------- Experiment & Logging
     exp_name: str = "exp11_dual_domain_pure_jepa"
