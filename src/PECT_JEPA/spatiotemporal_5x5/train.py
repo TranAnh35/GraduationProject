@@ -215,6 +215,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Number of initial epochs during which early stopping patience counter is paused (default: 5)")
     p.add_argument("--eval_after_train", type=lambda v: v.lower() == "true", default=False,
                    help="Automatically run downstream evaluation suite immediately after training completes")
+    p.add_argument("--eval_3d", type=lambda v: v.lower() == "true", default=False,
+                   help="Enable 3D volumetric defect tomography and topological defect graph in evaluation (default: False)")
     p.add_argument("--resume", type=str, default=None,
                    help="Resume training from checkpoint: filepath (.pt), 'latest', 'best', or 'auto' (default: None)")
 
@@ -492,6 +494,8 @@ def main():
                 "--device", config.device,
                 "--crop_border", str(config.crop_border),
             ]
+            if getattr(args, "eval_3d", False):
+                eval_args.append("--eval_3d")
             old_argv = sys.argv
             try:
                 sys.argv = [old_argv[0]] + eval_args
