@@ -449,7 +449,11 @@ class ParabolicDiffusionPredictor5x5(Predictor5x5):
         # 3. Exact Parabolic Green's Function Attention Bias
         attn_bias = None
         if context_indices is not None and target_indices is not None:
-            if target_indices.max() >= 50:
+            is_100_tokens = (
+                hasattr(self, "dist_sq_table_100")
+                and (target_indices.max() >= 25 or context_indices.max() >= 25)
+            )
+            if is_100_tokens:
                 t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
                 c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
 
@@ -469,12 +473,13 @@ class ParabolicDiffusionPredictor5x5(Predictor5x5):
                 alpha = F.softplus(self.raw_alpha)
 
                 causal_mask = (d_tau > 0)
-                safe_d_tau = torch.clamp(d_tau, min=1.0)
+                has_causal = causal_mask.any(dim=-1, keepdim=True)
+                safe_d_tau = torch.clamp(d_tau.abs(), min=1.0)
 
                 # M_{ij}^{diff} = - gamma * (||Delta r||^2 / Delta tau) - alpha * log(Delta tau)
                 M_diff = - gamma * (d_sq / safe_d_tau) - alpha * torch.log(safe_d_tau)
                 M_diff = torch.where(
-                    causal_mask,
+                    causal_mask | (~has_causal),
                     M_diff,
                     torch.tensor(-10000.0, device=device, dtype=M_diff.dtype)
                 )
@@ -591,7 +596,11 @@ class ResidualDiffusionPredictor5x5(ParabolicDiffusionPredictor5x5):
         # 3. Exact Parabolic Green's Function Attention Bias
         attn_bias = None
         if context_indices is not None and target_indices is not None:
-            if target_indices.max() >= 50:
+            is_100_tokens = (
+                hasattr(self, "dist_sq_table_100")
+                and (target_indices.max() >= 25 or context_indices.max() >= 25)
+            )
+            if is_100_tokens:
                 t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
                 c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
 
@@ -611,12 +620,13 @@ class ResidualDiffusionPredictor5x5(ParabolicDiffusionPredictor5x5):
                 alpha = F.softplus(self.raw_alpha)
 
                 causal_mask = (d_tau > 0)
-                safe_d_tau = torch.clamp(d_tau, min=1.0)
+                has_causal = causal_mask.any(dim=-1, keepdim=True)
+                safe_d_tau = torch.clamp(d_tau.abs(), min=1.0)
 
                 # Green's Attention Bias
                 M_diff = - gamma * (d_sq / safe_d_tau) - alpha * torch.log(safe_d_tau)
                 M_diff = torch.where(
-                    causal_mask,
+                    causal_mask | (~has_causal),
                     M_diff,
                     torch.tensor(-10000.0, device=device, dtype=M_diff.dtype)
                 )

@@ -363,6 +363,110 @@ class DownstreamBenchmarkSuite:
         }
 
     # =========================================================================
+    # Task 4b: Two-Stage Hurdle Protocol for Zero-Inflated Depth Regression
+    # =========================================================================
+    def benchmark_hurdle_depth_regression(
+        self,
+        features: np.ndarray,      # [N, D]
+        depth_map: np.ndarray,     # [N] continuous float depth in mm
+    ) -> Dict[str, Any]:
+        """
+        Two-Stage Hurdle Protocol (Rule 3 in GEMINI.md):
+        Stage 1: Flaw Gate Classifier (P(y > 0 | z)) identifies defective metal vs sound metal.
+        Stage 2: Conditional Sizing Regressor (E[y | y > 0, z]) regresses true flaw depth.
+        Compound: y_hurdle = I(p > tau) * d_pred.
+        Eliminates the zero-inflation noise penalty across 80,000 sound pixels.
+        """
+        flat_feats = features.reshape(-1, features.shape[-1])
+        flat_depth = depth_map.reshape(-1)
+
+        valid_idx = np.where(flat_depth >= 0.0)[0]
+        X = flat_feats[valid_idx].astype(np.float32)
+        y = flat_depth[valid_idx].astype(np.float32)
+        y_bin = (y > 0.0).astype(np.int64)
+
+        if np.sum(y_bin) < self.n_splits * 2:
+            return {"error": "Too few defect samples for hurdle regression"}
+
+        # Subsample sound background to prevent quadratic latency in CV
+        def_idx = np.where(y_bin == 1)[0]
+        snd_idx = np.where(y_bin == 0)[0]
+        if len(snd_idx) > 8000:
+            rng = np.random.RandomState(self.random_state)
+            sub_snd = rng.choice(snd_idx, size=8000, replace=False)
+            keep_idx = np.sort(np.concatenate([def_idx, sub_snd]))
+            X = X[keep_idx]
+            y = y[keep_idx]
+            y_bin = y_bin[keep_idx]
+
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+        gate_auc, gate_ap = [], []
+        standard_r2, standard_mae = [], []
+        hurdle_r2, hurdle_mae = [], []
+        defect_r2, defect_mae = [], []
+
+        for train_idx, test_idx in skf.split(X, y_bin):
+            X_tr, X_te = X[train_idx], X[test_idx]
+            y_tr, y_te = y[train_idx], y[test_idx]
+            y_bin_tr, y_bin_te = y_bin[train_idx], y_bin[test_idx]
+
+            scaler = StandardScaler()
+            X_tr_s = scaler.fit_transform(X_tr)
+            X_te_s = scaler.transform(X_te)
+
+            # Stage 1: Balanced Gate Classifier
+            clf = LogisticRegression(C=1.0, max_iter=500, class_weight="balanced", random_state=self.random_state)
+            clf.fit(X_tr_s, y_bin_tr)
+            p_te = clf.predict_proba(X_te_s)[:, 1]
+            gate_auc.append(float(roc_auc_score(y_bin_te, p_te)))
+            gate_ap.append(float(average_precision_score(y_bin_te, p_te)))
+
+            # Stage 2: Conditional Sizing Regressor (fitted on y > 0)
+            def_mask_tr = (y_tr > 0.0)
+            ridge_def = Ridge(alpha=1.0, random_state=self.random_state)
+            ridge_def.fit(X_tr_s[def_mask_tr], y_tr[def_mask_tr])
+            d_pred_te = np.maximum(0.0, ridge_def.predict(X_te_s))
+
+            # Baseline Standard Regressor (fitted on all y)
+            ridge_all = Ridge(alpha=1.0, random_state=self.random_state)
+            ridge_all.fit(X_tr_s, y_tr)
+            y_pred_all = ridge_all.predict(X_te_s)
+            standard_r2.append(float(r2_score(y_te, y_pred_all)))
+            standard_mae.append(float(mean_absolute_error(y_te, y_pred_all)))
+
+            # Compound Hurdle Prediction (tau = 0.5)
+            y_hurdle_te = np.where(p_te >= 0.5, d_pred_te, 0.0)
+            hurdle_r2.append(float(r2_score(y_te, y_hurdle_te)))
+            hurdle_mae.append(float(mean_absolute_error(y_te, y_hurdle_te)))
+
+            # Defect-only sizing on true flaws
+            def_mask_te = (y_te > 0.0)
+            if np.sum(def_mask_te) >= 2:
+                defect_r2.append(float(r2_score(y_te[def_mask_te], d_pred_te[def_mask_te])))
+                defect_mae.append(float(mean_absolute_error(y_te[def_mask_te], d_pred_te[def_mask_te])))
+
+        return {
+            "samples": len(y),
+            "defect_samples": int(np.sum(y_bin)),
+            "gate": {
+                "auc_roc": round(float(np.mean(gate_auc)), 4),
+                "average_precision": round(float(np.mean(gate_ap)), 4),
+            },
+            "conditional_defect_sizing": {
+                "r2_score": round(float(np.mean(defect_r2)), 4) if defect_r2 else 0.0,
+                "mae_mm": round(float(np.mean(defect_mae)), 4) if defect_mae else 0.0,
+            },
+            "compound_hurdle": {
+                "plate_r2_score": round(float(np.mean(hurdle_r2)), 4),
+                "plate_mae_mm": round(float(np.mean(hurdle_mae)), 4),
+            },
+            "standard_unclamped": {
+                "plate_r2_score": round(float(np.mean(standard_r2)), 4),
+                "plate_mae_mm": round(float(np.mean(standard_mae)), 4),
+            },
+        }
+
+    # =========================================================================
     # Task 1b: True Cross-File Out-of-Distribution (OOD) Transfer Benchmark
     # =========================================================================
     def benchmark_cross_file_ood(

@@ -49,7 +49,9 @@ def extract_full_cscan_map(
     pad = max(grid_size // 2, max_off)
 
     padded = np.pad(full_cscan_3d, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
-    out_map = np.zeros((sY, sX, model.config.embed_dim), dtype=np.float32)
+    extraction_mode = getattr(model.config, "feature_extraction_mode", "unified")
+    feat_dim = (2 * model.config.embed_dim) if extraction_mode == "unified" else model.config.embed_dim
+    out_map = np.zeros((sY, sX, feat_dim), dtype=np.float32)
 
     all_r, all_c = np.meshgrid(np.arange(sY), np.arange(sX), indexing="ij")
     all_r = all_r.reshape(-1)
@@ -72,8 +74,8 @@ def extract_full_cscan_map(
             patch_b = padded[sample_r, sample_c, :].reshape(-1, grid_size, grid_size, C)
             x_b = torch.from_numpy(patch_b).float().to(dev)
 
-            z_center = model.extract_center_feature(x_b).cpu().numpy()
-            out_map[all_r[k:k_end], all_c[k:k_end]] = z_center
+            z_feat = model.extract_features(x_b).cpu().numpy()
+            out_map[all_r[k:k_end], all_c[k:k_end]] = z_feat
 
     return out_map
 

@@ -171,6 +171,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--embed_dim", type=int, default=64, help="Latent embedding dimension D (default: 64)")
     p.add_argument("--encoder_depth", type=int, default=4, help="Context/Target encoder Transformer depth")
     p.add_argument("--predictor_depth", type=int, default=2, help="Predictor Transformer depth")
+    p.add_argument("--use_radial_attention_bias", type=lambda v: v.lower() == "true", default=True,
+                   help="Enable continuous physical radial distance attention bias in ContextEncoder (default: True)")
+    p.add_argument("--use_phase_curvature", type=lambda v: v.lower() == "true", default=True,
+                   help="Enable harmonic radial phase curvature kappa_theta(f) in SpatioSpectralTokenizer (default: True)")
+    p.add_argument("--feature_extraction_mode", type=str, default="unified", choices=["unified", "context"],
+                   help="Feature representation mode for C-scan feature extraction (default: unified)")
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
@@ -267,6 +273,9 @@ def main():
         embed_dim=args.embed_dim,
         encoder_depth=args.encoder_depth,
         use_target_ema=args.use_target_ema,
+        use_radial_attention_bias=args.use_radial_attention_bias,
+        use_phase_curvature=args.use_phase_curvature,
+        feature_extraction_mode=args.feature_extraction_mode,
         predictor_type=args.predictor_type,
         predictor_depth=args.predictor_depth,
         diffusion_gamma_init=args.diffusion_gamma_init,

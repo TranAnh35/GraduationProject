@@ -504,6 +504,10 @@ def evaluate_single_file(
                 reg_benchmark_def = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=True)
             except Exception:
                 reg_benchmark_def = {}
+            try:
+                hurdle_benchmark = bench.benchmark_hurdle_depth_regression(sub_feat, sub_depth)
+            except Exception as e:
+                hurdle_benchmark = {"error": str(e)}
 
             flat_feats = sub_feat.reshape(-1, sub_feat.shape[-1]).astype(np.float32)
             flat_depth = sub_depth.reshape(-1).astype(np.float32)
@@ -562,6 +566,7 @@ def evaluate_single_file(
                 "mlp_2layer": mlp_reg,
                 "representation_gap": reg_benchmark.get("representation_gap", {}),
                 "defects_only": reg_benchmark_def.get("linear_probe", {}),
+                "hurdle_depth_protocol": hurdle_benchmark,
                 "pred_depth_map_path": pred_depth_map_path,
                 "depth_scatter_path": depth_scatter_path,
             }
@@ -1260,6 +1265,17 @@ def main():
     all_f1s = [r["metrics"]["linear_probe_f1"] for r in file_results if r["metrics"].get("linear_probe_f1") is not None]
     all_r2s = [r["metrics"]["depth_r2"] for r in file_results if r["metrics"].get("depth_r2") is not None]
     all_maes = [r["metrics"]["depth_mae_mm"] for r in file_results if r["metrics"].get("depth_mae_mm") is not None]
+    all_defect_r2s = [
+        r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score")
+        for r in file_results
+        if r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score") is not None
+    ]
+    all_hurdle_r2s = [
+        r.get("task2_depth_regression", {}).get("hurdle_depth_protocol", {}).get("compound_hurdle", {}).get("plate_r2_score")
+        for r in file_results
+        if isinstance(r.get("task2_depth_regression", {}).get("hurdle_depth_protocol"), dict)
+        and r.get("task2_depth_regression", {}).get("hurdle_depth_protocol", {}).get("compound_hurdle", {}).get("plate_r2_score") is not None
+    ]
     all_sev_f1s = [r["metrics"]["severity_macro_f1"] for r in file_results if r["metrics"].get("severity_macro_f1") is not None]
 
     report = {
@@ -1287,6 +1303,8 @@ def main():
             "task2_depth_regression": {
                 "mean_depth_r2": float(np.mean(all_r2s)) if all_r2s else None,
                 "mean_depth_mae_mm": float(np.mean(all_maes)) if all_maes else None,
+                "mean_hurdle_plate_r2": float(np.mean(all_hurdle_r2s)) if all_hurdle_r2s else None,
+                "mean_defect_only_r2": float(np.mean(all_defect_r2s)) if all_defect_r2s else None,
             },
             "task3_severity_classification": {
                 "mean_severity_macro_f1": float(np.mean(all_sev_f1s)) if all_sev_f1s else None,
@@ -1357,6 +1375,8 @@ def main():
         print(f"Task 1 (Defect Contrast Ratio CNR):     Mean CNR = {np.mean(all_cnrs):.2f}")
     if all_r2s:
         print(f"Task 2 (Depth Regression R²):           Mean R²  = {np.mean(all_r2s):.4f} | Mean MAE = {np.mean(all_maes):.4f} mm")
+    if all_hurdle_r2s:
+        print(f"Task 2 (Two-Stage Hurdle Plate R²):     Mean R²  = {np.mean(all_hurdle_r2s):.4f} | Defect-Only R² = {np.mean(all_defect_r2s):.4f}")
     if all_sev_f1s:
         print(f"Task 3 (Severity Classification):       Mean F1  = {np.mean(all_sev_f1s):.4f}")
     if liftoff_summary.get("mean_linear_cka") is not None:

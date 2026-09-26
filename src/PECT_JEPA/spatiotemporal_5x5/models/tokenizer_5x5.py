@@ -714,6 +714,8 @@ class SpatioSpectralTokenizer5x5(nn.Module):
         phase_noise_floor: float = 0.05,
         pos_embed_type: str = "learnable_2d",
         dropout: float = 0.0,
+        use_phase_curvature: bool = False,
+        spatial_topology: str = "concentric_star",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -724,6 +726,8 @@ class SpatioSpectralTokenizer5x5(nn.Module):
         self.num_tokens = self.num_spatial * num_scales  # 100
         self.phase_snr_tapering = phase_snr_tapering
         self.phase_noise_floor = max(1e-6, float(phase_noise_floor))
+        self.use_phase_curvature = use_phase_curvature
+        self.spatial_topology = spatial_topology
 
         num_fft_bins = in_channels // 2 + 1  # 65 for in_channels=128
 
@@ -763,6 +767,14 @@ class SpatioSpectralTokenizer5x5(nn.Module):
         self.ln_freq = nn.ModuleList([
             nn.LayerNorm(half_dim) for _ in range(num_scales)
         ])
+
+        if use_phase_curvature:
+            self.curv_proj = nn.ModuleList([
+                nn.Linear(size, half_dim) for size in self.band_sizes
+            ])
+            self.curv_ln = nn.ModuleList([
+                nn.LayerNorm(half_dim) for _ in range(num_scales)
+            ])
 
         # 3. Physics-Gated Dual-Domain Fusion per scale
         self.gate_proj = nn.ModuleList([
@@ -834,6 +846,19 @@ class SpatioSpectralTokenizer5x5(nn.Module):
             spectral_feat_k = torch.cat([phase_k, mag_k], dim=-1).to(x.dtype)  # [B, 25, 2*M_k]
             z_freq = self.ln_freq[k](self.freq_proj[k](spectral_feat_k)) + self.domain_freq  # [B, 25, D//2]
 
+            # Harmonic Radial Phase Curvature: kappa_theta = d^2 theta / dr^2
+            if self.use_phase_curvature and self.spatial_topology in ("concentric_star", "star", "octagram"):
+                # Probes 1..8: Ring 1 (1mm), 9..16: Ring 2 (3mm), 17..24: Ring 3 (7mm)
+                r1_p = phase_k[:, 1:9, :].mean(dim=1)
+                r2_p = phase_k[:, 9:17, :].mean(dim=1)
+                r3_p = phase_k[:, 17:25, :].mean(dim=1)
+                # Radial phase differences: dr12=2mm, dr23=4mm
+                d12 = (r2_p - r1_p) / 2.0
+                d23 = (r3_p - r2_p) / 4.0
+                curv_k = (d23 - d12) / 3.0  # [B, M_k]
+                z_curv = self.curv_ln[k](self.curv_proj[k](curv_k)).unsqueeze(1)  # [B, 1, D//2]
+                z_freq = z_freq + z_curv
+
             # 3. Physics-Gated Dual-Domain Fusion
             gate = torch.sigmoid(self.gate_proj[k](z_freq))  # [B, 25, D//2]
             z_time_gated = z_time * gate
@@ -870,6 +895,8 @@ def build_tokenizer_5x5(config) -> nn.Module:
             phase_noise_floor=getattr(config, "phase_noise_floor", 0.05),
             pos_embed_type=config.pos_embed_type,
             dropout=config.dropout,
+            use_phase_curvature=getattr(config, "use_phase_curvature", False),
+            spatial_topology=getattr(config, "spatial_topology", "concentric_star"),
         )
     elif tokenizer_type in ("spatiotemporal_patch", "st_patch", "cst_patch", "auto", "default"):
         return SpatiotemporalPatchTokenizer5x5(

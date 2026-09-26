@@ -21,7 +21,8 @@ class TargetEncoder5x5(nn.Module):
         depth: int = 4,
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
         self.encoder = ContextEncoder5x5(
@@ -29,7 +30,8 @@ class TargetEncoder5x5(nn.Module):
             depth=depth,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
-            dropout=dropout
+            dropout=dropout,
+            **kwargs,
         )
         # Freeze target encoder parameters
         for p in self.parameters():
@@ -41,5 +43,10 @@ class TargetEncoder5x5(nn.Module):
         for p_tgt, p_ctx in zip(self.encoder.parameters(), context_encoder.parameters()):
             p_tgt.data.mul_(momentum).add_(p_ctx.data, alpha=1.0 - momentum)
 
-    def forward(self, target_tokens: torch.Tensor, target_pos: torch.Tensor) -> torch.Tensor:
-        return self.encoder(target_tokens, target_pos)
+    def forward(
+        self,
+        target_tokens: torch.Tensor,
+        target_pos: torch.Tensor,
+        target_indices: torch.Tensor = None,
+    ) -> torch.Tensor:
+        return self.encoder(target_tokens, target_pos, context_indices=target_indices)

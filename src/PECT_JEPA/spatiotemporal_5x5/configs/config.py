@@ -69,6 +69,9 @@ class Spatiotemporal5x5Config:
     ema_momentum: float = 0.990         # Start at 0.990 for fast early target evolution (used if use_target_ema=True)
     ema_momentum_end: float = 0.999      # Capped at 0.999 (never 1.0) to keep target encoder dynamic
     use_momentum_schedule: bool = True
+    use_radial_attention_bias: bool = True # Continuous physical radial distance bias B_radial in Context Encoder
+    use_phase_curvature: bool = True       # Harmonic radial phase curvature kappa_theta(f) across concentric rings
+    feature_extraction_mode: str = "unified" # 'unified' ([H_ctx; Delta_H]) | 'context' (H_ctx only)
 
     # ------------------------------------------------------------------- Loss
     loss_type: str = "l1"                # Base prediction norm ('l1' | 'smooth_l1')

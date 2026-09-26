@@ -24,14 +24,24 @@ class MultiheadSelfAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, return_attention: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attention: bool = False,
+        attn_bias: Optional[torch.Tensor] = None,
+    ):
         B, N, D = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0].contiguous(), qkv[1].contiguous(), qkv[2].contiguous()  # [B, H, N, d]
 
+        if attn_bias is not None and attn_bias.dtype != q.dtype:
+            attn_bias = attn_bias.to(dtype=q.dtype)
+
         attn_weights = None
         if return_attention or not hasattr(F, "scaled_dot_product_attention"):
             attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+            if attn_bias is not None:
+                attn_scores = attn_scores + attn_bias
             attn_scores = torch.clamp(attn_scores, min=-65000.0, max=65000.0)
             attn_weights = torch.softmax(attn_scores.float(), dim=-1).to(q.dtype)
             attn_drop = self.drop(attn_weights)
@@ -40,6 +50,7 @@ class MultiheadSelfAttention(nn.Module):
             # FlashAttention / Memory-Efficient attention with internal FP32 accumulation
             out = F.scaled_dot_product_attention(
                 q, k, v,
+                attn_mask=attn_bias,
                 dropout_p=self.dropout if self.training else 0.0,
                 scale=self.scale
             )
@@ -140,12 +151,57 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp = MLP(in_features=embed_dim, hidden_features=int(embed_dim * mlp_ratio), dropout=dropout)
 
-    def forward(self, x: torch.Tensor, return_attention: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attention: bool = False,
+        attn_bias: Optional[torch.Tensor] = None,
+    ):
         if return_attention:
-            attn_out, attn_weights = self.attn(self.norm1(x), return_attention=True)
+            attn_out, attn_weights = self.attn(self.norm1(x), return_attention=True, attn_bias=attn_bias)
             x = x + attn_out
             x = x + self.mlp(self.norm2(x))
             return x, attn_weights
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), attn_bias=attn_bias)
         x = x + self.mlp(self.norm2(x))
         return x
+
+
+class RadialAttentionBias(nn.Module):
+    """
+    Continuous Physical Radial Distance Attention Bias.
+    Computes B_radial(i, j) = -softplus(gamma_h) * d_ij^2 - softplus(alpha_h) * ln(1 + d_ij^2)
+    where d_ij is the true Euclidean distance between probes in millimeters.
+    """
+    def __init__(
+        self,
+        num_heads: int = 4,
+        init_gamma: float = 0.05,
+        init_alpha: float = 0.1,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        # Learnable decay rates per head
+        self.log_gamma = nn.Parameter(torch.full((1, num_heads, 1, 1), math.log(max(1e-4, init_gamma))))
+        self.log_alpha = nn.Parameter(torch.full((1, num_heads, 1, 1), math.log(max(1e-4, init_alpha))))
+
+    def forward(self, dist_matrix: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            dist_matrix: [N, N] or [B, N, N] pairwise physical Euclidean distance in mm.
+        Returns:
+            attn_bias: [1, H, N, N] or [B, H, N, N] attention bias tensor.
+        """
+        gamma = torch.exp(self.log_gamma)  # [1, H, 1, 1] > 0
+        alpha = torch.exp(self.log_alpha)  # [1, H, 1, 1] > 0
+        if dist_matrix.ndim == 2:
+            d = dist_matrix.unsqueeze(0).unsqueeze(0).to(gamma.device)  # [1, 1, N, N]
+        elif dist_matrix.ndim == 3:
+            d = dist_matrix.unsqueeze(1).to(gamma.device)  # [B, 1, N, N]
+        else:
+            d = dist_matrix.to(gamma.device)
+
+        d2 = d ** 2
+        # Parabolic Green's diffusion log-polynomial decay: -gamma * d^2 - alpha * ln(1 + d^2)
+        bias = - gamma * d2 - alpha * torch.log1p(d2)  # [B/1, H, N, N]
+        return bias

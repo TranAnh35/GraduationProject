@@ -52,7 +52,13 @@ class PECT_JEPA_5x5(nn.Module):
             depth=config.encoder_depth,
             num_heads=config.encoder_heads,
             mlp_ratio=config.mlp_ratio,
-            dropout=config.dropout
+            dropout=config.dropout,
+            use_radial_attention_bias=getattr(config, "use_radial_attention_bias", False),
+            spatial_topology=getattr(config, "spatial_topology", "concentric_star"),
+            star_radii=getattr(config, "star_radii", (1, 3, 7)),
+            grid_size=config.grid_size,
+            diffusion_gamma_init=getattr(config, "diffusion_gamma_init", 0.05),
+            diffusion_alpha_init=getattr(config, "diffusion_alpha_init", 0.1),
         )
 
         # 4. Target Encoder (EMA)
@@ -61,7 +67,13 @@ class PECT_JEPA_5x5(nn.Module):
             depth=config.encoder_depth,
             num_heads=config.encoder_heads,
             mlp_ratio=config.mlp_ratio,
-            dropout=config.dropout
+            dropout=config.dropout,
+            use_radial_attention_bias=getattr(config, "use_radial_attention_bias", False),
+            spatial_topology=getattr(config, "spatial_topology", "concentric_star"),
+            star_radii=getattr(config, "star_radii", (1, 3, 7)),
+            grid_size=config.grid_size,
+            diffusion_gamma_init=getattr(config, "diffusion_gamma_init", 0.05),
+            diffusion_alpha_init=getattr(config, "diffusion_alpha_init", 0.1),
         )
         self._init_target_encoder()
 
@@ -171,7 +183,7 @@ class PECT_JEPA_5x5(nn.Module):
         target_pos = pos[batch_arange, target_indices]
 
         # 4. Context Encoder (only sees visible context tokens)
-        H_ctx = self.context_encoder(context_tokens, context_pos)
+        H_ctx = self.context_encoder(context_tokens, context_pos, context_indices=context_indices)
 
         # 5. Predictor (Predicts target representation from context and target queries)
         is_physics_predictor = hasattr(self.predictor, "op_embedding")
@@ -208,13 +220,13 @@ class PECT_JEPA_5x5(nn.Module):
         use_target_ema = getattr(self.config, "use_target_ema", False)
         if use_target_ema:
             with torch.no_grad():
-                H_tgt = self.target_encoder(target_tokens, target_pos)
+                H_tgt = self.target_encoder(target_tokens, target_pos, target_indices=target_indices)
             H_rep_reg = H_ctx
         else:
             # Single Shared Encoder + Stop-Gradient Target (SimSiam/VICReg hybrid)
             # H_tgt_full has active gradients for VICReg representation regularization
             # H_tgt is detached for prediction loss to prevent chasing collapse
-            H_tgt_full = self.context_encoder(target_tokens, target_pos)
+            H_tgt_full = self.context_encoder(target_tokens, target_pos, context_indices=target_indices)
             H_tgt = H_tgt_full.detach()
             H_rep_reg = torch.cat([H_ctx, H_tgt_full], dim=1)
 
@@ -286,7 +298,7 @@ class PECT_JEPA_5x5(nn.Module):
     @torch.no_grad()
     def extract_center_feature(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Inference feature extraction for center point (2, 2) of the 5x5 grid (all points visible).
+        Inference feature extraction for center point of the grid (all points visible).
         Input: [B, 5, 5, C] -> Output: [B, D]
         """
         if x.ndim == 3:
@@ -294,15 +306,119 @@ class PECT_JEPA_5x5(nn.Module):
         B = x.shape[0]
         tokens, pos = self.tokenizer(x)
         H = self.context_encoder(tokens, pos)  # [B, N_total, D]
-        if tokens.shape[1] == 100:
-            # Center spatial pixel is index 12 -> 4 temporal stages: indices 48, 49, 50, 51
-            return H[:, 48:52, :].mean(dim=1)  # [B, D]
-        elif tokens.shape[1] == 50:
-            # Center spatial pixel is index 12 -> shallow is 24, deep is 25
-            return 0.5 * (H[:, 24, :] + H[:, 25, :])  # [B, D]
+
+        if getattr(self.config, "spatial_topology", "dense_5x5") in ("concentric_star", "star", "octagram"):
+            center_spatial_idx = 0
         else:
-            center_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)  # index 12
-            return H[:, center_idx, :]  # [B, D]
+            center_spatial_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)
+
+        if tokens.shape[1] == 100:
+            s_tok = center_spatial_idx * 4
+            return H[:, s_tok : s_tok + 4, :].mean(dim=1)  # [B, D]
+        elif tokens.shape[1] == 50:
+            s_tok = center_spatial_idx * 2
+            return 0.5 * (H[:, s_tok, :] + H[:, s_tok + 1, :])  # [B, D]
+        else:
+            return H[:, center_spatial_idx, :]  # [B, D]
+
+    @torch.no_grad()
+    def extract_unified_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Dual-Perspective Representation Extraction:
+        Concatenates Context Encoder representation H_ctx with the JEPA
+        physical prediction discrepancy vector Delta_H = |H_target - H_pred|.
+        
+        Input: [B, 5, 5, C] -> Output: [B, 2 * D]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        device = x.device
+
+        # 1. Full tokenization
+        tokens, pos = self.tokenizer(x)
+        N_total = tokens.shape[1]
+
+        # 2. Context features from visible tokens
+        H_full = self.context_encoder(tokens, pos)  # [B, N_total, D]
+
+        if getattr(self.config, "spatial_topology", "dense_5x5") in ("concentric_star", "star", "octagram"):
+            center_spatial_idx = 0
+        else:
+            center_spatial_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)
+
+        if N_total == 100:
+            s_tok = center_spatial_idx * 4
+            h_ctx_center = H_full[:, s_tok : s_tok + 4, :].mean(dim=1)  # [B, D]
+            center_tgt_indices = torch.arange(s_tok, s_tok + 4, device=device)
+        elif N_total == 50:
+            s_tok = center_spatial_idx * 2
+            h_ctx_center = 0.5 * (H_full[:, s_tok, :] + H_full[:, s_tok + 1, :])  # [B, D]
+            center_tgt_indices = torch.tensor([s_tok, s_tok + 1], device=device)
+        else:
+            h_ctx_center = H_full[:, center_spatial_idx, :]  # [B, D]
+            center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
+
+        # 3. Context & Target Mask for JEPA Prediction Discrepancy
+        batch_arange = torch.arange(B, device=device).unsqueeze(1)
+        all_indices = torch.arange(N_total, device=device)
+        mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
+        mask_tgt[center_tgt_indices] = True
+
+        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)  # [B, N_ctx]
+        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)      # [B, N_tgt]
+
+        ctx_tokens = tokens[batch_arange, ctx_idx]
+        ctx_pos = pos[batch_arange, ctx_idx]
+        target_pos = pos[batch_arange, tgt_idx]
+
+        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+
+        # Predict center target tokens from surrounding context
+        if hasattr(self.predictor, "residual_head"):
+            freq_cond = self.compute_characteristic_frequency(
+                x, num_bins=getattr(self.config, "num_freq_bins", 14)
+            )
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
+        else:
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+            )
+
+        # Target representation
+        target_tokens = tokens[batch_arange, tgt_idx]
+        if getattr(self.config, "use_target_ema", False):
+            H_tgt = self.target_encoder(target_tokens, target_pos, target_indices=tgt_idx)
+        else:
+            H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+
+        # Coordinate-wise physical discrepancy: mean across center target tokens
+        delta_H = torch.abs(H_tgt - H_pred).mean(dim=1)  # [B, D]
+
+        # Concatenate into unified [B, 2 * D] vector
+        Z_unified = torch.cat([h_ctx_center, delta_H], dim=-1)  # [B, 2 * D]
+        return Z_unified
+
+    @torch.no_grad()
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Unified feature extractor dispatching according to config.feature_extraction_mode.
+        'unified': [B, 2 * D] dual-perspective representation
+        'context': [B, D] context encoder center feature
+        """
+        mode = getattr(self.config, "feature_extraction_mode", "unified")
+        if mode == "unified":
+            return self.extract_unified_features(x)
+        return self.extract_center_feature(x)
 
     @torch.no_grad()
     def extract_all_features(self, x: torch.Tensor) -> torch.Tensor:
