@@ -183,6 +183,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=512, help="Batch size for sliding window feature extraction")
     p.add_argument("--device", type=str, default="cuda", help="Target device: 'cuda' or 'cpu'")
     p.add_argument("--max_eval_files", type=int, default=None, help="Optional limit on number of test files to evaluate")
+    p.add_argument("--eval_3d", action="store_true", default=False, help="Extract 3D volumetric slices and topological defect graphs")
     return p
 
 
@@ -350,6 +351,7 @@ def evaluate_single_file(
     device: str = "cuda",
     save_features: bool = False,
     crop_border: int = 15,
+    eval_3d: bool = False,
 ) -> Dict[str, Any]:
     """
     Runs full C-scan feature extraction and executes the 4 single-file downstream benchmark tasks:
@@ -357,6 +359,7 @@ def evaluate_single_file(
     - Task 2: Quantitative Depth Regression (2_Depth_Regression/<specimen>/)
     - Task 3: Defect Severity Classification (3_Severity_Classification/<specimen>/)
     - Task 5: Representation Geometry (5_Representation_Geometry/<specimen>/)
+    - Task 6 (Optional): 3D Defect Tomography & Topological Graph (6_3D_Tomography_and_Graph/<specimen>/)
     """
     fname_base = os.path.splitext(os.path.basename(file_path))[0]
     meta = extract_file_metadata(file_path)
@@ -368,8 +371,11 @@ def evaluate_single_file(
     task2_dir = to_safe_path(os.path.join(output_dir, "2_Depth_Regression", specimen_key))
     task3_dir = to_safe_path(os.path.join(output_dir, "3_Severity_Classification", specimen_key))
     task5_dir = to_safe_path(os.path.join(output_dir, "5_Representation_Geometry", specimen_key))
+    task6_dir = to_safe_path(os.path.join(output_dir, "6_3D_Tomography_and_Graph", specimen_key))
     for d in [task1_dir, task2_dir, task3_dir, task5_dir]:
         os.makedirs(d, exist_ok=True)
+    if eval_3d:
+        os.makedirs(task6_dir, exist_ok=True)
 
     print(f"\n--- Extracting C-Scan Features: {os.path.basename(file_path)} ---")
     grid_3d = load_cscan_from_tdms(
@@ -385,13 +391,25 @@ def evaluate_single_file(
         lowpass_order=getattr(model.config, "lowpass_order", 4),
     )
 
-    feature_map = extract_full_cscan_map(
-        model=model,
-        full_cscan_3d=grid_3d,
-        batch_size=batch_size,
-        device=device,
-        show_pbar=False,
-    )
+    volume_3d = None
+    if eval_3d:
+        feature_map, volume_3d = extract_full_cscan_map(
+            model=model,
+            full_cscan_3d=grid_3d,
+            batch_size=batch_size,
+            device=device,
+            show_pbar=False,
+            return_volume_3d=True,
+        )
+    else:
+        feature_map = extract_full_cscan_map(
+            model=model,
+            full_cscan_3d=grid_3d,
+            batch_size=batch_size,
+            device=device,
+            show_pbar=False,
+            return_volume_3d=False,
+        )
 
     # Load Ground Truth representations
     gt_mask = gt_mgr.get_ground_truth_mask_for_file(file_path, aligned_scan=True)
@@ -682,6 +700,90 @@ def evaluate_single_file(
         "knn_5_accuracy": task1_res.get("knn_5_accuracy"),
     }
 
+    # =========================================================================
+    # Task 6: 3D Defect Tomography & Topological Graph Representation
+    # =========================================================================
+    task6_res: Dict[str, Any] = {}
+    if volume_3d is not None:
+        try:
+            from .evaluation.tomography_3d import (
+                plot_3d_ortho_slices,
+                export_3d_interactive_html,
+            )
+            from .evaluation.graph_defect import (
+                build_defect_graph,
+                compute_crack_metrics,
+                compute_corrosion_volume,
+                plot_defect_graph_3d,
+                export_graph_interactive_html,
+            )
+
+            # 1. Multi-slice Orthogonal Visualization
+            ortho_path = os.path.join(task6_dir, f"{fname_base}_3d_ortho_slices.png")
+            plot_3d_ortho_slices(
+                volume_3d=volume_3d[:min_Y, :min_X],
+                mask_2d=sub_gt,
+                save_path=ortho_path,
+                title=f"3D Tomography: {fname_base}",
+                specimen=specimen_key,
+            )
+
+            # 2. Interactive 3D HTML
+            html_3d_path = os.path.join(task6_dir, f"{fname_base}_3d_tomography.html")
+            export_3d_interactive_html(
+                volume_3d=volume_3d[:min_Y, :min_X],
+                save_path=html_3d_path,
+                title=f"3D PECT-JEPA Volumetric Tomography: {fname_base}",
+            )
+
+            # 3. 3D Defect Graph Network
+            graph_data = build_defect_graph(volume_3d[:min_Y, :min_X], threshold_percentile=95.0)
+
+            # 4. Quantitative Metrics
+            crack_metrics = None
+            corrosion_metrics = None
+            if "rivet" in specimen_key.lower():
+                crack_metrics = compute_crack_metrics(graph_data)
+            elif "corrosion" in specimen_key.lower():
+                corrosion_metrics = compute_corrosion_volume(graph_data)
+            else:
+                crack_metrics = compute_crack_metrics(graph_data)
+                corrosion_metrics = compute_corrosion_volume(graph_data)
+
+            # 5. Graph Plots
+            graph_png_path = os.path.join(task6_dir, f"{fname_base}_defect_graph_3d.png")
+            plot_defect_graph_3d(
+                graph_data=graph_data,
+                crack_metrics=crack_metrics,
+                save_path=graph_png_path,
+                title=f"3D Defect Graph Network: {fname_base}",
+            )
+
+            graph_html_path = os.path.join(task6_dir, f"{fname_base}_defect_graph_3d.html")
+            export_graph_interactive_html(
+                graph_data=graph_data,
+                crack_metrics=crack_metrics,
+                save_path=graph_html_path,
+                title=f"Interactive 3D Defect Graph: {fname_base}",
+            )
+
+            task6_res = {
+                "ortho_slices_path": ortho_path,
+                "interactive_3d_html": html_3d_path,
+                "graph_plot_path": graph_png_path,
+                "graph_interactive_html": graph_html_path,
+                "num_defect_nodes": graph_data.get("num_nodes", 0),
+                "num_defect_edges": graph_data.get("num_edges", 0),
+                "crack_metrics": crack_metrics,
+                "corrosion_metrics": corrosion_metrics,
+            }
+            if crack_metrics and "crack_length_mm" in crack_metrics:
+                print(f"    --> [3D Graph NDT] Crack Length L={crack_metrics['crack_length_mm']:.2f} mm | Morphology: {crack_metrics.get('morphology')}")
+            elif corrosion_metrics and "volumetric_metal_loss_mm3" in corrosion_metrics:
+                print(f"    --> [3D Graph NDT] Metal Loss V={corrosion_metrics['volumetric_metal_loss_mm3']:.2f} mm³ | Area: {corrosion_metrics.get('surface_area_mm2')} mm²")
+        except Exception as e:
+            print(f"  [Task 6 Notice] 3D Tomography & Graph failed: {e}")
+
     result = {
         "file": file_path,
         "file_name": os.path.basename(file_path),
@@ -695,6 +797,7 @@ def evaluate_single_file(
             "latent_quality": lq_dict,
             "latent_geometry_path": latent_geom_path,
         },
+        "task6_3d_tomography_and_graph": task6_res,
     }
 
     auc_str = f" | AUC: {metrics_flat['auc_roc']:.4f} | AP: {metrics_flat['average_precision']:.4f}" if metrics_flat.get("auc_roc") is not None else ""
@@ -1082,6 +1185,7 @@ def main():
             device=args.device,
             save_features=args.save_features,
             crop_border=crop_border,
+            eval_3d=args.eval_3d,
         )
         file_results.append(res)
 

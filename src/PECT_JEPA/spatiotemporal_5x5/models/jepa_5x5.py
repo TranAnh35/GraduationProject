@@ -409,6 +409,108 @@ class PECT_JEPA_5x5(nn.Module):
         return Z_unified
 
     @torch.no_grad()
+    def extract_unified_and_depth_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Dual-Perspective Representation & 3D Volumetric Depth Extraction:
+        Returns:
+            Z_unified: [B, 2 * D] 2D representation for downstream benchmarks
+            V_depth:   [B, 4] Physical 4-layer depth anomaly energy:
+                       [Layer 0 (Near-surface, 0.0 - 0.5 mm),
+                        Layer 1 (Mid-shallow, 0.5 - 1.2 mm),
+                        Layer 2 (Mid-deep, 1.2 - 2.0 mm),
+                        Layer 3 (Deepest back-wall, 2.0 - 3.0 mm)]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        device = x.device
+
+        # 1. Full tokenization
+        tokens, pos = self.tokenizer(x)
+        N_total = tokens.shape[1]
+
+        # 2. Context features from visible tokens
+        H_full = self.context_encoder(tokens, pos)  # [B, N_total, D]
+
+        if getattr(self.config, "spatial_topology", "dense_5x5") in ("concentric_star", "star", "octagram"):
+            center_spatial_idx = 0
+        else:
+            center_spatial_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)
+
+        if N_total == 100:
+            s_tok = center_spatial_idx * 4
+            h_ctx_center = H_full[:, s_tok : s_tok + 4, :].mean(dim=1)  # [B, D]
+            center_tgt_indices = torch.arange(s_tok, s_tok + 4, device=device)
+        elif N_total == 50:
+            s_tok = center_spatial_idx * 2
+            h_ctx_center = 0.5 * (H_full[:, s_tok, :] + H_full[:, s_tok + 1, :])  # [B, D]
+            center_tgt_indices = torch.tensor([s_tok, s_tok + 1], device=device)
+        else:
+            h_ctx_center = H_full[:, center_spatial_idx, :]  # [B, D]
+            center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
+
+        # 3. Context & Target Mask for JEPA Prediction Discrepancy
+        batch_arange = torch.arange(B, device=device).unsqueeze(1)
+        all_indices = torch.arange(N_total, device=device)
+        mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
+        mask_tgt[center_tgt_indices] = True
+
+        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)  # [B, N_ctx]
+        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)      # [B, N_tgt]
+
+        ctx_tokens = tokens[batch_arange, ctx_idx]
+        ctx_pos = pos[batch_arange, ctx_idx]
+        target_pos = pos[batch_arange, tgt_idx]
+
+        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+
+        # Predict center target tokens from surrounding context
+        if hasattr(self.predictor, "residual_head"):
+            freq_cond = self.compute_characteristic_frequency(
+                x, num_bins=getattr(self.config, "num_freq_bins", 14)
+            )
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
+        else:
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+            )
+
+        # Target representation
+        target_tokens = tokens[batch_arange, tgt_idx]
+        if getattr(self.config, "use_target_ema", False):
+            H_tgt = self.target_encoder(target_tokens, target_pos, target_indices=tgt_idx)
+        else:
+            H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+
+        # Discrepancy per token: [B, N_tgt, D]
+        delta_H_tokens = torch.abs(H_tgt - H_pred)
+        delta_H = delta_H_tokens.mean(dim=1)  # [B, D]
+        Z_unified = torch.cat([h_ctx_center, delta_H], dim=-1)  # [B, 2 * D]
+
+        if N_total == 100:
+            # Tokenizer subbands (0: Deepest, 1: Mid-deep, 2: Mid-shallow, 3: Near-surface)
+            # Map from top surface (z=0) to bottom (z=3mm):
+            e_surf = delta_H_tokens[:, 3, :].norm(dim=-1)      # Layer 0: Near-surface (0.0 - 0.5 mm)
+            e_mid_shal = delta_H_tokens[:, 2, :].norm(dim=-1)  # Layer 1: Mid-shallow (0.5 - 1.2 mm)
+            e_mid_deep = delta_H_tokens[:, 1, :].norm(dim=-1)  # Layer 2: Mid-deep (1.2 - 2.0 mm)
+            e_deep = delta_H_tokens[:, 0, :].norm(dim=-1)      # Layer 3: Deepest (2.0 - 3.0 mm)
+            V_depth = torch.stack([e_surf, e_mid_shal, e_mid_deep, e_deep], dim=-1)  # [B, 4]
+        else:
+            e_mean = delta_H.norm(dim=-1)
+            V_depth = e_mean.unsqueeze(-1).expand(-1, 4)
+
+        return Z_unified, V_depth
+
+    @torch.no_grad()
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """
         Unified feature extractor dispatching according to config.feature_extraction_mode.

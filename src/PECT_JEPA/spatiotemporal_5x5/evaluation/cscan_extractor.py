@@ -23,17 +23,21 @@ from ..data.preprocessing import (
 from ..data.topologies import get_spatial_topology_offsets
 
 
+from typing import Tuple, Union, Optional
+
 @torch.no_grad()
 def extract_full_cscan_map(
     model: PECT_JEPA_5x5,
     full_cscan_3d: np.ndarray,  # [sY, sX, C]
     batch_size: int = 2048,
     device: str = "cuda",
-    show_pbar: bool = False
-) -> np.ndarray:
+    show_pbar: bool = False,
+    return_volume_3d: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """
     Extract exact [sY, sX, D] feature map from a 3D C-scan grid [sY, sX, C].
     Uses high-speed vectorized spatial topology indexing (20x faster than single-slice loops).
+    If return_volume_3d=True, also returns [sY, sX, 4] physical depth slice anomaly energy.
     """
     dev = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
     model.to(dev)
@@ -52,6 +56,7 @@ def extract_full_cscan_map(
     extraction_mode = getattr(model.config, "feature_extraction_mode", "unified")
     feat_dim = (2 * model.config.embed_dim) if extraction_mode == "unified" else model.config.embed_dim
     out_map = np.zeros((sY, sX, feat_dim), dtype=np.float32)
+    out_vol_3d = np.zeros((sY, sX, 4), dtype=np.float32) if return_volume_3d else None
 
     all_r, all_c = np.meshgrid(np.arange(sY), np.arange(sX), indexing="ij")
     all_r = all_r.reshape(-1)
@@ -74,9 +79,16 @@ def extract_full_cscan_map(
             patch_b = padded[sample_r, sample_c, :].reshape(-1, grid_size, grid_size, C)
             x_b = torch.from_numpy(patch_b).float().to(dev)
 
-            z_feat = model.extract_features(x_b).cpu().numpy()
-            out_map[all_r[k:k_end], all_c[k:k_end]] = z_feat
+            if return_volume_3d and hasattr(model, "extract_unified_and_depth_features"):
+                z_feat, v_depth = model.extract_unified_and_depth_features(x_b)
+                out_map[all_r[k:k_end], all_c[k:k_end]] = z_feat.cpu().numpy()
+                out_vol_3d[all_r[k:k_end], all_c[k:k_end]] = v_depth.cpu().numpy()
+            else:
+                z_feat = model.extract_features(x_b).cpu().numpy()
+                out_map[all_r[k:k_end], all_c[k:k_end]] = z_feat
 
+    if return_volume_3d:
+        return out_map, out_vol_3d
     return out_map
 
 

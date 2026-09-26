@@ -411,6 +411,13 @@ This document permanently tracks all completed, rejected, and active research hy
     - Mean Cosine Similarity across lift-off: **0.9941**
     - Mean Linear CKA across lift-off pairs: **0.4764** (vs 0.3874 in EXP-13)
   - **Task 5 (Representation Geometry)**: Top-3 PCs explained variance = **95.1%** (vs 86.7% in EXP-13)
+  - **Task 6 (3D Tomography & Topological Defect Graph Q-NDE)** (Dual 2D+3D capability):
+    - *Physical Formulation*: Extracts 4 volumetric skin-depth subbands ($0.0-0.5\,\text{mm}, 0.5-1.2\,\text{mm}, 1.2-2.0\,\text{mm}, 2.0-3.0\,\text{mm}$) via `extract_unified_and_depth_features`.
+    - *Topological Defect Graph*: Vectorized KD-tree spatial graph $G = (\mathcal{V}, \mathcal{E})$ with Dijkstra geodesic crack tracking and volumetric loss integration.
+    - *Quantitative NDT Outputs*:
+      - Rivet Specimen: Crack Length $L_{\text{crack}} = 101.65\,\text{mm}$, Orientation $= 94.0^\circ$, Morphology: Linear Fatigue Crack, Surface Defect Layer Distribution (1591 nodes in Layer 0).
+      - Corrosion Specimen: Metal Loss Volume $V_{\text{loss}} = 2754.75\,\text{mm}^3$, Surface Area $= 3673.0\,\text{mm}^2$, Max Pit Depth $= 0.25\,\text{mm}$.
+    - *Zero Regression on 2D Benchmarks*: 2D detection remains 100% intact (Rivet AUC 0.9980, AP 0.9476, CNR 9.25; Corrosion AUC 0.9531, AP 0.8133, CNR 3.17).
 - **Breakdown by Waveform**:
   - **Chirp (Held-out Waveform)**: AUC = **90.40%**, AP = **60.90%**, CNR = **3.21**, Defect $R^2 = \mathbf{0.5994}$
   - **Square**: AUC = **91.68%**, AP = **62.02%**, CNR = **2.97**, Defect $R^2 = \mathbf{0.6772}$
