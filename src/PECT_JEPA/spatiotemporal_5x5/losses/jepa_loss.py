@@ -31,6 +31,7 @@ class JEPALoss5x5(nn.Module):
         var_weight: float = 1.0,
         cov_weight: float = 1.0,
         var_gamma: float = 1.0,
+        use_centered_vicreg: bool = True,
         uniformity_weight: float = 0.0,
         uniformity_t: float = 2.0,
         uniformity_subsample: int = 1024,
@@ -49,6 +50,7 @@ class JEPALoss5x5(nn.Module):
         self.var_weight = var_weight
         self.cov_weight = cov_weight
         self.var_gamma = var_gamma
+        self.use_centered_vicreg = use_centered_vicreg
         self.uniformity_weight = uniformity_weight
         self.uniformity_t = uniformity_t
         self.uniformity_subsample = uniformity_subsample
@@ -219,23 +221,52 @@ class JEPALoss5x5(nn.Module):
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
-    def variance_hinge(self, H_rep: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def center_by_file(z: torch.Tensor, file_ids: Optional[torch.Tensor], B: int, N: int) -> torch.Tensor:
+        """
+        Centers latent tokens by their in-scan file mean:
+            \tilde{z}_i = z_i - \mu_{file(i)}
+        Eliminates inter-file DC baseline offsets and sensor centroid drift from VICReg variance,
+        forcing the model to satisfy the variance threshold exclusively from within-scan flaw/structural variance.
+        """
+        if file_ids is None or file_ids.numel() == 0:
+            return z - z.mean(dim=0, keepdim=True)
+
+        if file_ids.ndim == 1:
+            file_ids_expanded = file_ids.unsqueeze(1).expand(B, N).reshape(-1)
+        else:
+            file_ids_expanded = file_ids.reshape(-1)
+
+        unique_files, inverse_indices, counts = torch.unique(file_ids_expanded, return_inverse=True, return_counts=True)
+        D = z.shape[-1]
+        file_sums = torch.zeros(len(unique_files), D, device=z.device, dtype=z.dtype)
+        file_sums.scatter_add_(0, inverse_indices.unsqueeze(1).expand(-1, D), z)
+        file_means = file_sums / counts.unsqueeze(1).clamp(min=1)
+
+        z_centered = z - file_means[inverse_indices]
+        return z_centered
+
+    def variance_hinge(self, H_rep: torch.Tensor, file_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         VICReg Variance Hinge Loss (Bardes et al., ICLR 2022).
         L_var = (1/D) * sum_{d=1}^D max(0, gamma - std_b(z_{:, d}))
-        Forces batch variance along each dimension to be >= var_gamma (computed in FP32).
-        Acts as a rigid coordinate scale anchor in R^D, preventing EMA target encoder drift.
+        If use_centered_vicreg=True and file_ids is provided, centers tokens by file mean first,
+        guaranteeing that variance is driven by intra-scan flaw/spatial dynamics, not inter-file drift.
         """
         z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
         B, N, D = z.shape
-        z = z.reshape(B * N, D)
+        z_flat = z.reshape(B * N, D)
+        if self.use_centered_vicreg and file_ids is not None:
+            z_eval = self.center_by_file(z_flat, file_ids, B, N)
+        else:
+            z_eval = z_flat
         safe_eps = max(self.eps, 1e-5)
-        var = torch.clamp(z.var(dim=0, unbiased=False), min=0.0)
+        var = torch.clamp(z_eval.var(dim=0, unbiased=False), min=0.0)
         std = torch.sqrt(var + safe_eps)
         std = torch.nan_to_num(std, nan=0.0, posinf=self.var_gamma)
         return torch.mean(F.relu(self.var_gamma - std))
 
-    def covariance_penalty(self, H_rep: torch.Tensor) -> torch.Tensor:
+    def covariance_penalty(self, H_rep: torch.Tensor, file_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         VICReg Covariance Decorrelation Loss (Bardes et al., ICLR 2022).
         L_cov = (1/D) * sum_{i != j} [C(z)]_{ij}^2
@@ -243,9 +274,12 @@ class JEPALoss5x5(nn.Module):
         """
         z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
         B, N, D = z.shape
-        z = z.reshape(B * N, D)
-        z = z - z.mean(dim=0, keepdim=True)
-        cov = (z.T @ z) / max(1, z.shape[0] - 1)
+        z_flat = z.reshape(B * N, D)
+        if self.use_centered_vicreg and file_ids is not None:
+            z_eval = self.center_by_file(z_flat, file_ids, B, N)
+        else:
+            z_eval = z_flat - z_flat.mean(dim=0, keepdim=True)
+        cov = (z_eval.T @ z_eval) / max(1, z_eval.shape[0] - 1)
         off_diag = cov - torch.diag(torch.diag(cov))
         cov_penalty = (off_diag ** 2).sum() / D
         return torch.nan_to_num(cov_penalty, nan=0.0, posinf=10.0)
@@ -355,6 +389,7 @@ class JEPALoss5x5(nn.Module):
         x_raw: Optional[torch.Tensor] = None,
         delta_pred: Optional[torch.Tensor] = None,
         H_rep_reg: Optional[torch.Tensor] = None,
+        file_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         weights = self.compute_disturbance_weights(x_raw)
         l_pred, l_fluct = self.fluctuation_prediction_loss(H_pred, H_target, target_indices=target_indices, weights=weights)
@@ -388,14 +423,14 @@ class JEPALoss5x5(nn.Module):
         if self.uniformity_weight > 0.0 and rep_reg is not None:
             l_unif = self.hypersphere_uniformity_loss(rep_reg)
 
-        # VICReg Coordinate-Wise Variance & Covariance Penalties
+        # VICReg Coordinate-Wise Variance & Covariance Penalties (In-Scan Centered if enabled)
         l_var = zero_loss
         l_cov = zero_loss
         if (self.var_weight > 0.0 or self.cov_weight > 0.0) and rep_reg is not None:
             if self.var_weight > 0.0:
-                l_var = self.variance_hinge(rep_reg)
+                l_var = self.variance_hinge(rep_reg, file_ids=file_ids)
             if self.cov_weight > 0.0:
-                l_cov = self.covariance_penalty(rep_reg)
+                l_cov = self.covariance_penalty(rep_reg, file_ids=file_ids)
 
         # Norm-Floor Barrier Loss (Anti Zero-Collapse)
         l_norm = zero_loss

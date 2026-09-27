@@ -230,6 +230,7 @@ class PECT5x5Dataset(Dataset):
             patch = self._data[point_idx]
             meta = dict(self.metadata_list[file_idx])
             meta["point_idx"] = point_idx
+            meta["file_idx"] = file_idx
             return torch.from_numpy(patch).float(), meta
 
         # Map 1D point_idx back to 2D (row, col) in cropped interior grid
@@ -257,7 +258,7 @@ class PECT5x5Dataset(Dataset):
         )
 
         if not self.return_meta:
-            return torch.from_numpy(patch)
+            return torch.from_numpy(patch), {"file_idx": file_idx}
 
         meta = dict(self.metadata_list[file_idx])
         meta["point_idx"] = point_idx
@@ -354,7 +355,8 @@ def collate_5x5_batch(batch: List[Any]) -> Dict[str, Any]:
     if isinstance(batch[0], tuple):
         data = torch.stack([item[0] for item in batch], dim=0)
         meta = [item[1] for item in batch]
-        return {"data": data, "meta": meta}
+        file_ids = torch.tensor([m.get("file_idx", 0) for m in meta], dtype=torch.long)
+        return {"data": data, "meta": meta, "file_ids": file_ids}
     elif isinstance(batch[0], torch.Tensor):
         return {"data": torch.stack(batch, dim=0)}
     else:

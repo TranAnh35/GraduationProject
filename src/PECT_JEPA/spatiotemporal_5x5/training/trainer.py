@@ -156,6 +156,9 @@ class Trainer5x5:
 
         for batch_idx, batch in enumerate(pbar):
             x = batch["data"].to(self.device, non_blocking=True)
+            file_ids = batch.get("file_ids", None)
+            if file_ids is not None:
+                file_ids = file_ids.to(self.device, non_blocking=True)
             lr = self.lr_scheduler.step(self.global_step)
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
@@ -163,7 +166,7 @@ class Trainer5x5:
 
             self.optimizer.zero_grad(set_to_none=True)
             with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
-                loss_dict = self.model(x)
+                loss_dict = self.model(x, file_ids=file_ids)
                 loss = loss_dict["loss"]
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -316,8 +319,11 @@ class Trainer5x5:
             if max_val_batches is not None and batch_idx >= max_val_batches:
                 break
             x = batch["data"].to(self.device, non_blocking=True)
+            file_ids = batch.get("file_ids", None)
+            if file_ids is not None:
+                file_ids = file_ids.to(self.device, non_blocking=True)
             with create_autocast(self.device.type, enabled=self.config.mixed_precision and self.device.type == "cuda"):
-                loss_dict = self.model(x)
+                loss_dict = self.model(x, file_ids=file_ids)
 
             loss_tensor = loss_dict["loss"]
             if torch.isnan(loss_tensor) or torch.isinf(loss_tensor):

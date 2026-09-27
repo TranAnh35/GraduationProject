@@ -148,6 +148,9 @@ class Predictor5x5(nn.Module):
         target_pos: torch.Tensor,
         diffusion_operator: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         B, N_tgt, D = target_pos.shape
         queries = self.mask_token.expand(B, N_tgt, -1) + target_pos

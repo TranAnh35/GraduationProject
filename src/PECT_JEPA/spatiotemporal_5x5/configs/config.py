@@ -47,7 +47,7 @@ class Spatiotemporal5x5Config:
     mask_bank_size: int = 2048          # Precomputed mask pool size per configuration
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "spatio_spectral" # 'spatio_spectral' (EXP-12: 100 skin-depth tokens) | 'dual_domain_attention' | 'spatiotemporal_patch'
+    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (EXP-16: strictly waveform-agnostic 25 continuous tokens, 1 per probe)
     num_temporal_stages: int = 4        # Number of chronological diffusion stages (for CST backward compatibility)
     num_scales: int = 4                 # Number of physical skin-depth scales (for spatio_spectral)
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
@@ -59,7 +59,7 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "residual_diffusion" # 'residual_diffusion' (Residual Diffusion Predictor) | 'parabolic_diffusion' | 'operator_diffusion' | 'standard'
+    predictor_type: str = "standard"    # 'standard' (Pure JEPA Transformer Cross-Attention) | 'residual_diffusion'
     predictor_depth: int = 2
     predictor_heads: int = 4
     diffusion_gamma_init: float = 1.0   # Spatial diffusion attenuation rate gamma for Green's attention bias
@@ -77,14 +77,15 @@ class Spatiotemporal5x5Config:
 
     # ------------------------------------------------------------------- Loss
     loss_type: str = "l1"                # Base prediction norm ('l1' | 'smooth_l1')
-    fluct_weight: float = 2.0            # Context-Referenced Fluctuation Loss weight (magnifies 1-3% flaw contrast)
-    adaptive_disturbance_weight: float = 2.0 # Field-Disturbance Adaptive Loss weight kappa (boosts defect boundary patches)
-    temporal_mono_weight: float = 0.05   # Temporal diffusion delay monotonicity loss weight
+    fluct_weight: float = 0.0            # 0.0 for pure JEPA
+    adaptive_disturbance_weight: float = 0.0 # 0.0 for pure JEPA
+    temporal_mono_weight: float = 0.0    # 0.0 for pure JEPA
     liftoff_invar_weight: float = 0.0    # 0.0 (Pure JEPA: zero synthetic contractive perturbation; Dodd-Deeds Fourier phase provides intrinsic invariance)
     phase_align_weight: float = 0.0      # 0.0 (Pure JEPA: Fourier phase is integrated directly in tokenizer attention)
     var_weight: float = 1.0              # VICReg coordinate-wise variance hinge weight (Bardes et al., ICLR 2022)
     cov_weight: float = 1.0              # VICReg covariance decorrelation penalty weight (Bardes et al., ICLR 2022)
     var_gamma: float = 1.0               # VICReg target standard deviation threshold gamma (anchors coordinate scale)
+    use_centered_vicreg: bool = True     # EXP-16: In-Scan Centered VICReg (centers latent tokens by file mean to eliminate inter-file drift)
     uniformity_weight: float = 0.0       # Hypersphere Uniformity loss weight (0.0 to prevent artificial repulsion of sound metal)
     uniformity_t: float = 2.0            # Gaussian potential parameter t for hypersphere uniformity
     uniformity_subsample: int = 1024     # Subsample size for stable, memory-efficient pairwise similarity
@@ -105,7 +106,7 @@ class Spatiotemporal5x5Config:
     compile_model: bool = False          # Enable torch.compile for PyTorch 2.x kernel fusion
 
     # --------------------------------------------------- Experiment & Logging
-    exp_name: str = "exp15_file_peak_jepa"
+    exp_name: str = "exp16_centered_jepa"
     log_dir: str = "experiments/5x5"
     save_dir: Optional[str] = None       # If None/default, automatically unified into <log_dir>/<exp_name>/checkpoints
     add_timestamp: bool = True           # True appends timestamp for unique isolated experiment logging

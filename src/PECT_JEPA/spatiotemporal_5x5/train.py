@@ -110,6 +110,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="VICReg covariance decorrelation penalty weight (Bardes et al., ICLR 2022, default: 1.0)")
     p.add_argument("--var_gamma", type=float, default=1.0,
                    help="VICReg target standard deviation threshold gamma (anchors coordinate scale, default: 1.0)")
+    p.add_argument("--use_centered_vicreg", type=lambda v: v.lower() == "true", default=True,
+                   help="Enable In-Scan Centered VICReg to eliminate inter-file centroid drift (EXP-16, default: True)")
     p.add_argument("--uniformity_weight", type=float, default=0.0,
                    help="Hypersphere Uniformity loss weight (Wang & Isola, ICML 2020, default: 0.0)")
     p.add_argument("--uniformity_t", type=float, default=2.0,
@@ -120,9 +122,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Norm-floor barrier weight to prevent zero-vector collapse (default: 0.1)")
     p.add_argument("--norm_floor_target", type=float, default=1.0,
                    help="Minimum target L2 norm of representations (default: 1.0)")
-    p.add_argument("--tokenizer_type", type=str, default="spatio_spectral",
-                   choices=["spatio_spectral", "skin_depth", "dual_domain_attention", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_scale_diffusion", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'spatio_spectral' (EXP-12: 100 skin-depth tokens, default), 'dual_domain_attention', etc.")
+    p.add_argument("--tokenizer_type", type=str, default="dual_domain_attention",
+                   choices=["dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_scale_diffusion", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'dual_domain_attention' (EXP-16: 25 continuous tokens, 1 per probe, waveform-agnostic, default), 'spatio_spectral', etc.")
     p.add_argument("--num_scales", type=int, default=4,
                    help="Number of physical skin-depth scales for spatio_spectral tokenizer (default: 4)")
     p.add_argument("--masker_type", type=str, default="auto",
@@ -132,23 +134,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
     p.add_argument("--cst_mask_mode", type=str, default="surface_to_depth", choices=["surface_to_depth", "causal", "random"],
                    help="CST masking temporal partition mode: 'surface_to_depth' (default), 'causal', or 'random'")
-    p.add_argument("--predictor_type", type=str, default="residual_diffusion",
-                   choices=["residual_diffusion", "residual", "parabolic_diffusion", "operator_diffusion", "standard"],
-                   help="Predictor architecture: 'residual_diffusion' (Residual Diffusion Predictor, default), 'parabolic_diffusion', 'operator_diffusion', or 'standard'")
+    p.add_argument("--predictor_type", type=str, default="standard",
+                   choices=["standard", "residual_diffusion", "residual", "parabolic_diffusion", "operator_diffusion"],
+                   help="Predictor architecture: 'standard' (Pure JEPA Transformer Cross-Attention, default), 'residual_diffusion', etc.")
     p.add_argument("--use_target_ema", type=lambda v: v.lower() == "true", default=False,
                    help="Use EMA target encoder (default: False for Single Shared Encoder + Stop-Gradient Target)")
-    p.add_argument("--adaptive_disturbance_weight", type=float, default=2.0,
-                   help="Field-Disturbance Adaptive Loss weight kappa to address 95% sound metal imbalance (default: 2.0)")
-    p.add_argument("--temporal_mono_weight", type=float, default=0.05,
-                   help="Temporal diffusion delay monotonicity loss weight (default: 0.05)")
+    p.add_argument("--adaptive_disturbance_weight", type=float, default=0.0,
+                   help="Field-Disturbance Adaptive Loss weight kappa (default: 0.0 for pure JEPA)")
+    p.add_argument("--temporal_mono_weight", type=float, default=0.0,
+                   help="Temporal diffusion delay monotonicity loss weight (default: 0.0 for pure JEPA)")
     p.add_argument("--diffusion_gamma_init", type=float, default=1.0,
                    help="Initial spatial diffusion attenuation coefficient gamma for Green's attention bias (default: 1.0)")
     p.add_argument("--diffusion_alpha_init", type=float, default=0.5,
                    help="Initial geometric dispersion scale alpha for Parabolic Green's attention bias (default: 0.5)")
     p.add_argument("--diffusion_beta_init", type=float, default=0.5,
                    help="Initial cross-scale vertical diffusion barrier beta for legacy operator diffusion (default: 0.5)")
-    p.add_argument("--fluct_weight", type=float, default=2.0,
-                   help="Context-Referenced Fluctuation Loss weight for magnifying defect contrast (default: 2.0)")
+    p.add_argument("--fluct_weight", type=float, default=0.0,
+                   help="Context-Referenced Fluctuation Loss weight (default: 0.0 for pure JEPA)")
     p.add_argument("--liftoff_invar_weight", type=float, default=0.0,
                    help="Physical lift-off invariance loss weight (default: 0.0 for pure JEPA)")
     p.add_argument("--phase_align_weight", type=float, default=0.0,
@@ -182,7 +184,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
-    p.add_argument("--exp_name", type=str, default="exp15_file_peak_jepa", help="Experiment run name")
+    p.add_argument("--exp_name", type=str, default="exp16_centered_jepa", help="Experiment run name")
     p.add_argument("--save_dir", type=str, default=None,
                    help="Directory to save model checkpoints (default: None -> auto-unified inside experiments/5x5/<exp_name>/checkpoints/)")
     p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True,
@@ -260,6 +262,7 @@ def main():
         var_weight=args.var_weight,
         cov_weight=args.cov_weight,
         var_gamma=args.var_gamma,
+        use_centered_vicreg=args.use_centered_vicreg,
         uniformity_weight=args.uniformity_weight,
         uniformity_t=args.uniformity_t,
         uniformity_subsample=args.uniformity_subsample,

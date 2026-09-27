@@ -86,12 +86,13 @@ class PECT_JEPA_5x5(nn.Module):
             eps=config.eps,
             liftoff_invar_weight=getattr(config, "liftoff_invar_weight", 0.0),
             phase_align_weight=getattr(config, "phase_align_weight", 0.0),
-            fluct_weight=getattr(config, "fluct_weight", 2.0),
-            adaptive_disturbance_weight=getattr(config, "adaptive_disturbance_weight", 2.0),
-            temporal_mono_weight=getattr(config, "temporal_mono_weight", 0.05),
+            fluct_weight=getattr(config, "fluct_weight", 0.0),
+            adaptive_disturbance_weight=getattr(config, "adaptive_disturbance_weight", 0.0),
+            temporal_mono_weight=getattr(config, "temporal_mono_weight", 0.0),
             var_weight=getattr(config, "var_weight", 1.0),
             cov_weight=getattr(config, "cov_weight", 1.0),
             var_gamma=getattr(config, "var_gamma", 1.0),
+            use_centered_vicreg=getattr(config, "use_centered_vicreg", True),
             uniformity_weight=getattr(config, "uniformity_weight", 0.0),
             uniformity_t=getattr(config, "uniformity_t", 2.0),
             uniformity_subsample=getattr(config, "uniformity_subsample", 1024),
@@ -159,6 +160,7 @@ class PECT_JEPA_5x5(nn.Module):
         custom_context_indices: Optional[torch.Tensor] = None,
         custom_target_indices: Optional[torch.Tensor] = None,
         freq_condition: Optional[torch.Tensor] = None,
+        file_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward self-supervised step with Physics Operator Diffusion & Physical Alignment.
@@ -167,6 +169,7 @@ class PECT_JEPA_5x5(nn.Module):
             custom_context_indices: optional override [B, N_ctx]
             custom_target_indices:  optional override [B, N_tgt]
             freq_condition: optional explicit frequency diffusion query [B]
+            file_ids: optional batch file identifier tensor [B] for In-Scan Centered VICReg
 
         Returns dict of loss and representations.
         """
@@ -298,6 +301,7 @@ class PECT_JEPA_5x5(nn.Module):
             x_raw=x,
             delta_pred=delta_pred,
             H_rep_reg=H_rep_reg,
+            file_ids=file_ids,
         )
         loss_dict.update({
             "H_pred": H_pred,
