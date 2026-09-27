@@ -98,7 +98,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--in_channels", type=int, default=128, help="Number of temporal channels (128 for linear, 256 for dual)")
     p.add_argument("--crop_border", type=int, default=15,
                    help="Number of outer boundary pixels to crop on each edge (default: 15 to remove air/edge effect)")
-    p.add_argument("--normalization", type=str, default="global_peak", choices=["global_peak", "zscore", "peak_early", "min_max"])
+    p.add_argument("--normalization", type=str, default="file_peak",
+                   choices=["file_peak", "global_peak", "dataset_peak", "per_sample_peak", "zscore", "peak_early", "min_max"],
+                   help="Waveform normalization strategy: 'file_peak' (EXP-15: true C-scan peak, preserves Delta V, default), 'dataset_peak', 'per_sample_peak', etc.")
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
     p.add_argument("--loss_type", type=str, default="l1", choices=["l1", "smooth_l1", "l2", "cosine"],
                    help="JEPA latent prediction loss function (default: l1)")
@@ -180,7 +182,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
-    p.add_argument("--exp_name", type=str, default="exp11_dual_domain_pure_jepa", help="Experiment run name")
+    p.add_argument("--exp_name", type=str, default="exp15_file_peak_jepa", help="Experiment run name")
     p.add_argument("--save_dir", type=str, default=None,
                    help="Directory to save model checkpoints (default: None -> auto-unified inside experiments/5x5/<exp_name>/checkpoints/)")
     p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True,

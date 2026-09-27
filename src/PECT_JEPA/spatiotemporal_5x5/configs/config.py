@@ -21,7 +21,7 @@ class Spatiotemporal5x5Config:
     t_start_frac: float = 0.02          # Grid start fraction (for log mode)
     num_channels: int = 1               # 1 channel (pure linear waveform)
     in_channels: int = 128              # 1 channel * 128 samples = 128 temporal features
-    normalization: str = "global_peak"  # 'global_peak' | 'zscore' | 'peak_early' | 'min_max'
+    normalization: str = "file_peak"  # 'file_peak' (EXP-15: true C-scan scalar peak, preserves Delta V) | 'dataset_peak' | 'per_sample_peak' | 'zscore' | 'min_max'
     early_window_frac: float = 0.10
     raster_correction: bool = True
     crop_border: int = 15               # Crop outer boundary pixels to remove air/edge effect (15 pixels each side)
@@ -105,7 +105,7 @@ class Spatiotemporal5x5Config:
     compile_model: bool = False          # Enable torch.compile for PyTorch 2.x kernel fusion
 
     # --------------------------------------------------- Experiment & Logging
-    exp_name: str = "exp11_dual_domain_pure_jepa"
+    exp_name: str = "exp15_file_peak_jepa"
     log_dir: str = "experiments/5x5"
     save_dir: Optional[str] = None       # If None/default, automatically unified into <log_dir>/<exp_name>/checkpoints
     add_timestamp: bool = True           # True appends timestamp for unique isolated experiment logging

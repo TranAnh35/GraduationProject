@@ -137,7 +137,7 @@ class PECT5x5Dataset(Dataset):
             if self.use_memmap:
                 radii_str = "_".join(str(r) for r in self.star_radii)
                 h = hashlib.md5(
-                    f"{fp}_topo_{self.spatial_topology}_radii{radii_str}_pad{self.pad}_{self.resample_mode}_{self.in_channels}_{self.normalization}_crop{self.crop_border}_lp{self.apply_lowpass}_{self.lowpass_cutoff}_{self.lowpass_order}".encode("utf-8")
+                    f"{fp}_norm_v2_topo_{self.spatial_topology}_radii{radii_str}_pad{self.pad}_{self.resample_mode}_{self.in_channels}_{self.normalization}_crop{self.crop_border}_lp{self.apply_lowpass}_{self.lowpass_cutoff}_{self.lowpass_order}".encode("utf-8")
                 ).hexdigest()
                 cache_path = os.path.join(self.cache_dir, f"{h}_padded.dat")
                 meta_path = os.path.join(self.cache_dir, f"{h}_padded.meta")
