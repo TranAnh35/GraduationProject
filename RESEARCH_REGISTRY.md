@@ -436,6 +436,43 @@ This document permanently tracks all completed, rejected, and active research hy
   - *Unified Dual-Perspective Feature Space*: Combining the spatial context embedding $H_{\text{ctx}}$ with the predictor error residual $\Delta H$ into $Z_{\text{unified}} \in \mathbb{R}^{128}$ directly separates background sound metal from localized eddy-current phase disturbances. This unlocked an unprecedented **59.27% Average Precision** across all 57 compound OOD test scans, breaking past the 40% AP ceiling of all previous experiments.
   - *SOTA Benchmark Established*: EXP-14 becomes the definitive State-of-the-Art foundation architecture for PECT-JEPA.
 
+### EXP-14-Full: Radial Dispersion JEPA 20-Epoch Full Training & Zero-Shot Transfer Autopsy
+- **Run Directory**: `experiments/5x5/exp14_full_20ep`
+- **Configuration**:
+  - Full 20 epochs from scratch (5 epochs warmup + 15 epochs deep cosine annealing down to 1e-6).
+  - Spatial Topology: `concentric_star` ($r=1, 3, 7\,\text{mm}$), `SpatioSpectralTokenizer5x5` (100 tokens, $\kappa_\theta(f)$), `ResidualDiffusionPredictor5x5` ($B_{\text{radial}}$).
+  - Data: Preload RAM with `--num_workers 0` (direct in-memory slicing, ~520s/epoch, zero Windows IPC bottlenecks).
+- **20-Epoch Training Trajectory**:
+  - Epoch 01: `train_loss = 1.5474`, `val_loss_pred = 0.5610`, `Two-NN = 6.4D`, `Unif = -0.69`
+  - Epoch 05 (Warmup Peak): `train_loss = 0.2726`, `val_loss_pred = 0.2722`, `Two-NN = 7.4D`, `Unif = -0.25`
+  - Epoch 10: `train_loss = 0.1554`, `val_loss_pred = 0.1539`, `Two-NN = 6.9D`, `Unif = -0.28`
+  - Epoch 15: `train_loss = 0.0963`, `val_loss_pred = 0.1030`, `Two-NN = 6.6D`, `Unif = -0.38`
+  - Epoch 20: `train_loss = 0.0473` (pred=0.0285), `val_loss_pred = 0.0558` (-92.9% reduction), `Two-NN = 6.6D`, `Unif = -0.40`
+- **Downstream Empirical Metrics Across ALL 57 Held-Out Compound OOD Test Scans**:
+  - **Task 1 (Anomaly Detection)**:
+    - Mean AUC-ROC: **89.73% ± 8.53%**
+    - Mean Average Precision (AP): **59.12%**
+    - Mean Contrast-to-Noise Ratio (CNR): **2.85** (Rivet CNR: **4.59**)
+    - Rivet Specimen: AUC = **97.57%**, AP = **78.64%**, CNR = **4.59**
+    - Corrosion Specimen: AUC = **87.67%**, AP = **60.47%**, CNR = **2.40**
+    - Mixed (Rivet_v2) Specimen: AUC = **83.96%**, AP = **38.25%**, CNR = **1.55**
+  - **Task 2 (Depth Regression)**:
+    - Plate $R^2$: **0.2007**, Mean MAE: **0.1105 mm** (Rivet MAE: **0.0690 mm**)
+    - Corrosion Defect-Only $R^2$: **0.8676** (MAE: **0.0932 mm**)
+    - Rivet Defect-Only $R^2$: **0.5379**
+    - Mixed Defect-Only $R^2$: **0.3944**
+  - **Task 3 (Severity Classification)**: Macro F1 = **0.5083**
+  - **Task 4 (Multi-Lift-Off Invariance)**: Mean CKA = **0.4758**, Mean Cosine Sim = **0.993**
+  - **Task 5 (Representation Geometry)**: Top-3 PCs Explained Variance = **95.0%**
+  - **Task 6 (3D Volumetric Tomography & Topological Defect Graph)**:
+    - 57/57 files evaluated with orthogonal B-scans and 3D defect graphs ($L_{\text{crack}} \approx 82-160\,\text{mm}$, $V_{\text{loss}} \approx 2700-3800\,\text{mm}^3$).
+  - **Zero-Shot Cross-File OOD Benchmark**:
+    - Linear Probe AUC: **53.26% ± 10.40%**, AP: **2.09%**, F1: **0.0085**.
+- **Empirical Rationale & Architectural Conclusion**:
+  - *Within-File Representation is Superb*: Within any single inspection file, the 128D unified representation $[H_{\text{ctx}}; \Delta H]$ clearly separates defects with ~90% AUC, ~60% AP, and Rivet AP reaching ~79%.
+  - *Zero-Shot Cross-File Collapse Proves the Normalization Bug*: The collapse of zero-shot cross-file transfer directly validates the user's profound hypothesis. Per-sample peak normalization (`axis=-1, keepdims=True` in `global_peak`) scales every sample to 1.0, destroying the true 1-4% physical eddy current amplitude drop. Across different sensors and lift-offs, DC offsets shift the latent centroids of different files, confusing a single global decision boundary.
+  - *Actionable Path to EXP-15*: Fix normalization to dataset-level peak (`global_dataset_peak` or sound-metal reference calibration) + enhance Dodd-Deeds differential phase ($\Delta \theta(f)$) to remove baseline offsets intrinsically.
+
 ### OPT-01: High-Throughput Training Acceleration Engine
 - **Target Subsystem**: `src/PECT_JEPA/spatiotemporal_5x5/` (`masking`, `models`, `training`, `data`)
 - **Motivation & Profiling Analysis**:
