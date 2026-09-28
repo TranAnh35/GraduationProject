@@ -40,14 +40,14 @@ class Spatiotemporal5x5Config:
     masker_type: str = "auto"           # 'auto' (ContiguousCluster for 25 tok, CST for 100 tok) | 'complementary_st' | 'contiguous_cluster'
     min_masked: int = 10                # Backward compatibility alias
     max_masked: int = 15                # Backward compatibility alias
-    num_spatial_cluster: int = 10       # Number of spatial grid points in cluster (EXP-18: 10 deep tokens)
-    num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (for dual_scale)
-    cst_mask_mode: str = "surface_to_bulk" # 'surface_to_bulk' (EXP-18: surface ctx -> deep bulk tgt) | 'surface_to_depth' | 'causal' | 'random'
+    num_spatial_cluster: int = 8        # Number of spatial grid points in cluster (EXP-19: 8 cluster probes)
+    num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (8 cross points)
+    cst_mask_mode: str = "cluster"      # 'cluster' (EXP-19: symmetric dual-cluster masking: masks both surface & deep) | 'surface_to_bulk'
     use_mask_bank: bool = True          # Enable precomputed GPU/CPU mask bank for sub-microsecond batch mask sampling
     mask_bank_size: int = 2048          # Precomputed mask pool size per configuration
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "uncrushed_diffusion" # 'uncrushed_diffusion' (EXP-18: 50 tokens, uncrushed harmonic dispersion) | 'dual_scale_diffusion'
+    tokenizer_type: str = "uncrushed_diffusion" # 'uncrushed_diffusion' (EXP-18/19: 50 tokens, uncrushed harmonic dispersion) | 'dual_scale_diffusion'
     num_temporal_stages: int = 4        # Number of chronological diffusion stages (for CST backward compatibility)
     num_scales: int = 4                 # Number of physical skin-depth scales (for spatio_spectral)
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
@@ -59,13 +59,14 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "continuous_helmholtz" # 'continuous_helmholtz' (EXP-18: 3D Continuous Helmholtz Diffusion World Model) | 'operator_diffusion'
+    predictor_type: str = "continuous_helmholtz" # 'continuous_helmholtz' (EXP-18/19: 3D Continuous Helmholtz Diffusion World Model) | 'operator_diffusion'
     predictor_depth: int = 2
     predictor_heads: int = 4
     diffusion_gamma_init: float = 1.0   # Spatial diffusion attenuation rate gamma for Green's attention bias
     diffusion_alpha_init: float = 0.5   # Geometric dispersion scale alpha for Parabolic Green's attention bias
     diffusion_beta_init: float = 0.5    # Cross-scale depth barrier beta for legacy operator diffusion
-    diffusion_d_scale_init: float = 1.5 # EXP-18: Physical depth scale init in mm for continuous 3D Helmholtz kernel
+    diffusion_d_scale_init: float = 1.5 # EXP-18/19: Physical depth scale init in mm for continuous 3D Helmholtz kernel
+    diffusion_d_scale_min: float = 1.0  # EXP-19: Physical depth scale lower bound in mm (prevents shortcut collapse)
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     use_target_ema: bool = False        # False: Unified Single Encoder + Stop-Gradient Target (SimSiam/VICReg); True: Legacy EMA Target Encoder
@@ -108,10 +109,10 @@ class Spatiotemporal5x5Config:
     compile_model: bool = False          # Enable torch.compile for PyTorch 2.x kernel fusion
 
     # --------------------------------------------------- Experiment & Logging
-    exp_name: str = "exp18_helmholtz_diffusion_jepa"
+    exp_name: str = "exp19_symmetric_helmholtz_jepa"
     log_dir: str = "experiments/5x5"
     save_dir: Optional[str] = None       # If None/default, automatically unified into <log_dir>/<exp_name>/checkpoints
-    add_timestamp: bool = True           # True appends timestamp for unique isolated experiment logging
+    add_timestamp: bool = False          # False keeps deterministic directory path for reproducible checkpoints
     use_tensorboard: bool = True
     use_wandb: bool = False
     wandb_project: str = "PECT_JEPA_5x5"

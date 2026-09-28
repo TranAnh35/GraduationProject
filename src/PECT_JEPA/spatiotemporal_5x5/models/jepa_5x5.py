@@ -332,10 +332,8 @@ class PECT_JEPA_5x5(nn.Module):
         tokens, pos = self.tokenizer(x)
         H = self.context_encoder(tokens, pos)  # [B, N_total, D]
 
-        if getattr(self.config, "spatial_topology", "dense_5x5") in ("concentric_star", "star", "octagram"):
-            center_spatial_idx = 0
-        else:
-            center_spatial_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)
+        # In topologies.py, (0, 0) is always placed at index 0 for all spatial topologies
+        center_spatial_idx = 0
 
         if tokens.shape[1] == 100:
             s_tok = center_spatial_idx * 4
@@ -367,10 +365,8 @@ class PECT_JEPA_5x5(nn.Module):
         # 2. Context features from visible tokens
         H_full = self.context_encoder(tokens, pos)  # [B, N_total, D]
 
-        if getattr(self.config, "spatial_topology", "dense_5x5") in ("concentric_star", "star", "octagram"):
-            center_spatial_idx = 0
-        else:
-            center_spatial_idx = (self.config.grid_size // 2) * self.config.grid_size + (self.config.grid_size // 2)
+        # In topologies.py, (0, 0) is always placed at index 0 for all spatial topologies
+        center_spatial_idx = 0
 
         if N_total == 100:
             s_tok = center_spatial_idx * 4

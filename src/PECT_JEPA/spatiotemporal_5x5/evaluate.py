@@ -96,6 +96,7 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import (
     plot_anomaly_heatmap_5x5,
     plot_latent_representation_quality,
     compute_anomaly_metrics,
+    MahalanobisDetector,
 )
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.linear_probe import LinearProbeEvaluator
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
@@ -475,6 +476,31 @@ def evaluate_single_file(
                 "knn_5_accuracy": lp_res.get("knn_5_accuracy"),
             }
 
+            # Unsupervised Latent Anomaly Discrimination (Zero Labels, Pure Latent Mahalanobis)
+            try:
+                maha = MahalanobisDetector(regularize_eps=1e-4)
+                maha.fit(sub_feat, contamination=0.05)
+                maha_score = maha.score_map(sub_feat)
+                valid_m = (sub_gt.reshape(-1) >= 0)
+                y_m = sub_gt.reshape(-1)[valid_m]
+                s_m = maha_score.reshape(-1)[valid_m]
+                if len(np.unique(y_m)) > 1:
+                    maha_auc = float(roc_auc_score(y_m, s_m))
+                    maha_ap = float(average_precision_score(y_m, s_m))
+                    def_pts = maha_score[sub_gt == 1]
+                    snd_pts = maha_score[sub_gt == 0]
+                    maha_cnr = float((np.mean(def_pts) - np.mean(snd_pts)) / (np.std(snd_pts) + 1e-8)) if len(def_pts) > 0 and len(snd_pts) > 0 else 0.0
+                else:
+                    maha_auc, maha_ap, maha_cnr = None, None, None
+            except Exception as e:
+                maha_auc, maha_ap, maha_cnr = None, None, None
+
+            task1_res["unsupervised_mahalanobis"] = {
+                "auc_roc": maha_auc,
+                "average_precision": maha_ap,
+                "contrast_ratio_cnr": maha_cnr,
+            }
+
             # In-Scan Spatial-Block Evaluation with Buffer Margin (Zero Patch Overlap)
             try:
                 bench_sb = DownstreamBenchmarkSuite(random_state=42)
@@ -743,6 +769,9 @@ def evaluate_single_file(
         "severity_macro_f1": t3_lp.get("macro_f1"),
         "severity_accuracy": t3_lp.get("accuracy"),
         "knn_5_accuracy": task1_res.get("knn_5_accuracy"),
+        "unsupervised_maha_auc": task1_res.get("unsupervised_mahalanobis", {}).get("auc_roc"),
+        "unsupervised_maha_ap": task1_res.get("unsupervised_mahalanobis", {}).get("average_precision"),
+        "unsupervised_maha_cnr": task1_res.get("unsupervised_mahalanobis", {}).get("contrast_ratio_cnr"),
     }
 
     # =========================================================================
@@ -1434,6 +1463,38 @@ def main():
         and r.get("task2_depth_regression", {}).get("hurdle_depth_protocol", {}).get("compound_hurdle", {}).get("plate_r2_score") is not None
     ]
     all_sev_f1s = [r["metrics"]["severity_macro_f1"] for r in file_results if r["metrics"].get("severity_macro_f1") is not None]
+    all_maha_aucs = [r["metrics"]["unsupervised_maha_auc"] for r in file_results if r["metrics"].get("unsupervised_maha_auc") is not None]
+    all_maha_aps = [r["metrics"]["unsupervised_maha_ap"] for r in file_results if r["metrics"].get("unsupervised_maha_ap") is not None]
+
+    # Per-Specimen Breakdown
+    per_specimen_summary = {}
+    for sp_name, sp_res_list in specimen_groups.items():
+        sp_aucs = [r["metrics"]["linear_probe_auc_roc"] for r in sp_res_list if r["metrics"].get("linear_probe_auc_roc") is not None]
+        sp_aps = [r["metrics"]["linear_probe_average_precision"] for r in sp_res_list if r["metrics"].get("linear_probe_average_precision") is not None]
+        sp_cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in sp_res_list if r["metrics"].get("contrast_ratio_cnr") is not None]
+        sp_maha_aucs = [r["metrics"]["unsupervised_maha_auc"] for r in sp_res_list if r["metrics"].get("unsupervised_maha_auc") is not None]
+        sp_maha_aps = [r["metrics"]["unsupervised_maha_ap"] for r in sp_res_list if r["metrics"].get("unsupervised_maha_ap") is not None]
+        sp_defect_r2s = [
+            r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score")
+            for r in sp_res_list
+            if r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score") is not None
+        ]
+        sp_maes = [r["metrics"]["depth_mae_mm"] for r in sp_res_list if r["metrics"].get("depth_mae_mm") is not None]
+        sp_rmses = [r["metrics"]["depth_rmse_mm"] for r in sp_res_list if r["metrics"].get("depth_rmse_mm") is not None]
+        sp_sev_f1s = [r["metrics"]["severity_macro_f1"] for r in sp_res_list if r["metrics"].get("severity_macro_f1") is not None]
+
+        per_specimen_summary[sp_name] = {
+            "total_files": len(sp_res_list),
+            "linear_probe_auc": float(np.mean(sp_aucs)) if sp_aucs else None,
+            "linear_probe_ap": float(np.mean(sp_aps)) if sp_aps else None,
+            "contrast_ratio_cnr": float(np.mean(sp_cnrs)) if sp_cnrs else None,
+            "unsupervised_maha_auc": float(np.mean(sp_maha_aucs)) if sp_maha_aucs else None,
+            "unsupervised_maha_ap": float(np.mean(sp_maha_aps)) if sp_maha_aps else None,
+            "defect_only_r2": float(np.mean(sp_defect_r2s)) if sp_defect_r2s else None,
+            "depth_mae_mm": float(np.mean(sp_maes)) if sp_maes else None,
+            "depth_rmse_mm": float(np.mean(sp_rmses)) if sp_rmses else None,
+            "severity_macro_f1": float(np.mean(sp_sev_f1s)) if sp_sev_f1s else None,
+        }
 
     report = {
         "evaluation_protocol": protocol_name,
@@ -1456,6 +1517,8 @@ def main():
                 "mean_linear_probe_average_precision": float(np.mean(all_aps)) if all_aps else None,
                 "mean_linear_probe_f1": float(np.mean(all_f1s)) if all_f1s else None,
                 "mean_contrast_ratio_cnr": float(np.mean(all_cnrs)) if all_cnrs else None,
+                "mean_unsupervised_maha_auc": float(np.mean(all_maha_aucs)) if all_maha_aucs else None,
+                "mean_unsupervised_maha_ap": float(np.mean(all_maha_aps)) if all_maha_aps else None,
             },
             "task2_depth_regression": {
                 "mean_depth_r2": float(np.mean(all_r2s)) if all_r2s else None,
@@ -1476,6 +1539,7 @@ def main():
                 "mean_angular_auc": geom_summary.get("mean_angular_auc"),
             },
         },
+        "per_specimen_summary": per_specimen_summary,
         "per_file_results": file_results,
         "liftoff_invariance": liftoff_summary,
     }
@@ -1522,24 +1586,49 @@ def main():
                 f"{lq.get('angular_auc', 0.0):.4f}" if lq.get('angular_auc') is not None else "",
             ])
 
-    print("\n" + "=" * 70)
-    print("  EVALUATION SUMMARY REPORT")
-    print("=" * 70)
+    print("\n" + "=" * 78)
+    print("  EVALUATION SUMMARY REPORT (PER-SPECIMEN & UNSUPERVISED LATENT BREAKDOWN)")
+    print("=" * 78)
     print(f"Protocol: {protocol_name.upper()} | Holdout Target: {holdout_target}")
     print(f"Evaluated Test Files: {len(file_results)} ({len(all_aucs)} with Ground Truth labels)")
-    if all_aucs:
-        print(f"Task 1 (Linear Probe Defect Detection): Mean AUC = {np.mean(all_aucs):.4f} +/- {np.std(all_aucs):.4f} | Mean AP = {np.mean(all_aps):.4f}")
-        print(f"Task 1 (Defect Contrast Ratio CNR):     Mean CNR = {np.mean(all_cnrs):.2f}")
-    if all_r2s:
-        print(f"Task 2 (Depth Regression R²):           Mean R²  = {np.mean(all_r2s):.4f} | Mean MAE = {np.mean(all_maes):.4f} mm")
-    if all_hurdle_r2s:
-        print(f"Task 2 (Two-Stage Hurdle Plate R²):     Mean R²  = {np.mean(all_hurdle_r2s):.4f} | Defect-Only R² = {np.mean(all_defect_r2s):.4f}")
-    if all_sev_f1s:
-        print(f"Task 3 (Severity Classification):       Mean F1  = {np.mean(all_sev_f1s):.4f}")
-    if liftoff_summary.get("mean_linear_cka") is not None:
-        print(f"Task 4 (Lift-off Invariance CKA):       Mean CKA = {liftoff_summary['mean_linear_cka']:.4f}")
+
+    # 1. Per-Specimen Disentangled Benchmark
+    print("\n" + "-" * 78)
+    print("  1. PER-SPECIMEN BENCHMARK BREAKDOWN")
+    print("-" * 78)
+    for sp_name in ("corrosion", "rivet", "mixed"):
+        sp_info = per_specimen_summary.get(sp_name, {})
+        if not sp_info or sp_info.get("total_files", 0) == 0:
+            continue
+        print(f"\n>> Specimen: {sp_name.upper()} ({sp_info.get('total_files')} files)")
+        if sp_name == "corrosion":
+            print(f"   [Task 2 Depth Sizing]  Defect-Only R²: {sp_info.get('defect_only_r2', 0.0):.4f} | Depth MAE: {sp_info.get('depth_mae_mm', 0.0):.4f} mm")
+        print(f"   [Task 1 Anomaly Det]   Linear Probe AUC: {sp_info.get('linear_probe_auc', 0.0):.4f} | AP: {sp_info.get('linear_probe_ap', 0.0):.4f} | CNR: {sp_info.get('contrast_ratio_cnr', 0.0):.2f}")
+        print(f"   [Pure Latent Geometry] Unsupervised Maha AUC: {sp_info.get('unsupervised_maha_auc', 0.0):.4f} | AP: {sp_info.get('unsupervised_maha_ap', 0.0):.4f}")
+        if sp_info.get("severity_macro_f1") is not None:
+            print(f"   [Task 3 Severity Clf]  Severity Macro F1: {sp_info.get('severity_macro_f1', 0.0):.4f}")
+
+    # 2. Global Unsupervised Latent Discrimination (All 57 scans, Zero Labels)
+    print("\n" + "-" * 78)
+    print("  2. GLOBAL INTRINSIC UNSUPERVISED LATENT DISCRIMINABILITY (ZERO LABELS)")
+    print("-" * 78)
+    if all_maha_aucs:
+        print(f"  Unsupervised Mahalanobis AUC: Mean = {np.mean(all_maha_aucs):.4f} +/- {np.std(all_maha_aucs):.4f} | AP = {np.mean(all_maha_aps):.4f}")
     if geom_summary.get("mean_total_3pc_variance") is not None:
-        print(f"Task 5 (Representation Geometry):       Top-3 PCs Explained Variance = {geom_summary['mean_total_3pc_variance']:.1%}")
+        print(f"  Top-3 Principal Components Variance: {geom_summary['mean_total_3pc_variance']:.1%}")
+    if liftoff_summary.get("mean_linear_cka") is not None:
+        print(f"  Lift-off Invariance (Linear CKA):   {liftoff_summary['mean_linear_cka']:.4f}")
+
+    # 3. Overall Supervised Probe Reference
+    print("\n" + "-" * 78)
+    print("  3. CONSOLIDATED PROBE METRICS REFERENCE (ALL FILES)")
+    print("-" * 78)
+    if all_aucs:
+        print(f"  Linear Probe Defect AUC: Mean = {np.mean(all_aucs):.4f} +/- {np.std(all_aucs):.4f} | AP = {np.mean(all_aps):.4f} | CNR = {np.mean(all_cnrs):.2f}")
+    if all_defect_r2s:
+        print(f"  Defect-Only Sizing R²:   Mean = {np.mean(all_defect_r2s):.4f} | Plate MAE = {np.mean(all_maes):.4f} mm")
+    if all_hurdle_r2s:
+        print(f"  Two-Stage Hurdle Plate R²: Mean = {np.mean(all_hurdle_r2s):.4f}")
 
     print(f"\nArtifacts organized into 5 modular task folders:")
     print(f"  - 1_Anomaly_Detection:       {os.path.join(args.output_dir, '1_Anomaly_Detection')}")

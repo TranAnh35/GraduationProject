@@ -134,11 +134,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Masker strategy: 'auto' (ContiguousCluster for 25 tok, CST for 100 tok, default), 'complementary_st', or 'contiguous_cluster'")
     p.add_argument("--num_temporal_stages", type=int, default=4,
                    help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
-    p.add_argument("--cst_mask_mode", type=str, default="surface_to_bulk", choices=["surface_to_bulk", "surface_to_depth", "causal", "random"],
-                   help="Masking partition mode: 'surface_to_bulk' (EXP-18, default), 'surface_to_depth', 'causal', or 'random'")
+    p.add_argument("--cst_mask_mode", type=str, default="cluster", choices=["cluster", "surface_to_bulk", "surface_to_depth", "causal", "random"],
+                   help="Masking partition mode: 'cluster' (EXP-19 symmetric dual-cluster, default), 'surface_to_bulk', 'surface_to_depth', 'causal', or 'random'")
     p.add_argument("--predictor_type", type=str, default="continuous_helmholtz",
                    choices=["continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
-                   help="Predictor architecture: 'continuous_helmholtz' (EXP-18: 3D Continuous Helmholtz Diffusion World Model, default), 'operator_diffusion', etc.")
+                   help="Predictor architecture: 'continuous_helmholtz' (EXP-18/19: 3D Continuous Helmholtz Diffusion World Model, default), 'operator_diffusion', etc.")
     p.add_argument("--use_target_ema", type=lambda v: v.lower() == "true", default=False,
                    help="Use EMA target encoder (default: False for Single Shared Encoder + Stop-Gradient Target)")
     p.add_argument("--adaptive_disturbance_weight", type=float, default=0.0,
@@ -151,6 +151,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Initial geometric dispersion scale alpha for Parabolic Green's attention bias (default: 0.5)")
     p.add_argument("--diffusion_beta_init", type=float, default=0.5,
                    help="Initial cross-scale vertical diffusion barrier beta for legacy operator diffusion (default: 0.5)")
+    p.add_argument("--diffusion_d_scale_init", type=float, default=1.5,
+                   help="Physical depth scale init in mm for continuous 3D Helmholtz kernel (default: 1.5)")
+    p.add_argument("--diffusion_d_scale_min", type=float, default=1.0,
+                   help="Physical depth scale lower bound in mm for continuous 3D Helmholtz kernel (default: 1.0)")
     p.add_argument("--fluct_weight", type=float, default=0.0,
                    help="Context-Referenced Fluctuation Loss weight (default: 0.0 for pure JEPA)")
     p.add_argument("--liftoff_invar_weight", type=float, default=0.0,
@@ -186,11 +190,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
-    p.add_argument("--exp_name", type=str, default="exp18_helmholtz_diffusion_jepa", help="Experiment run name")
+    p.add_argument("--exp_name", type=str, default="exp19_symmetric_helmholtz_jepa", help="Experiment run name")
     p.add_argument("--save_dir", type=str, default=None,
                    help="Directory to save model checkpoints (default: None -> auto-unified inside experiments/5x5/<exp_name>/checkpoints/)")
-    p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True,
-                   help="Append timestamp suffix to exp_name (default: True for isolated run logging)")
+    p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=False,
+                   help="Append timestamp suffix to exp_name (default: False for deterministic logging)")
     p.add_argument("--split_protocol", type=str, default="compound_ood",
                    choices=["compound_ood", "leave_liftoff", "leave_sensor", "leave_waveform", "leave_specimen", "random"],
                    help="Evaluation/training split protocol: compound_ood (Option A: hold out z3+TMR+Chirp simultaneously), leave_liftoff (LOLO), leave_sensor (LOSO), leave_waveform (LOWO), leave_specimen (LODO), random (default: compound_ood)")
@@ -301,6 +305,8 @@ def main():
         diffusion_gamma_init=args.diffusion_gamma_init,
         diffusion_alpha_init=args.diffusion_alpha_init,
         diffusion_beta_init=args.diffusion_beta_init,
+        diffusion_d_scale_init=args.diffusion_d_scale_init,
+        diffusion_d_scale_min=args.diffusion_d_scale_min,
         fluct_weight=args.fluct_weight,
         adaptive_disturbance_weight=args.adaptive_disturbance_weight,
         temporal_mono_weight=args.temporal_mono_weight,

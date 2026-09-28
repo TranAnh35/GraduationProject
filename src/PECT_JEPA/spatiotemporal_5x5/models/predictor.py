@@ -707,6 +707,7 @@ class ContinuousHelmholtzPredictor5x5(Predictor5x5):
         gamma_init: float = 1.0,
         alpha_init: float = 0.5,
         d_scale_init: float = 1.5,
+        d_scale_min: float = 1.0,
         spatial_topology: str = "concentric_star",
         star_radii: Tuple[int, int, int] = (1, 3, 7),
     ):
@@ -720,6 +721,7 @@ class ContinuousHelmholtzPredictor5x5(Predictor5x5):
         self.num_freq_bins = num_freq_bins
         self.spatial_topology = spatial_topology
         self.star_radii = star_radii
+        self.d_scale_min = d_scale_min
         self.op_embedding = DiffusionOperatorEmbedding(embed_dim=embed_dim)
 
         # Context propagation projection
@@ -729,7 +731,8 @@ class ContinuousHelmholtzPredictor5x5(Predictor5x5):
         # Learnable physical coupling parameters
         raw_gamma = math.log(math.exp(gamma_init) - 1.0) if gamma_init > 0 else 0.0
         raw_alpha = math.log(math.exp(alpha_init) - 1.0) if alpha_init > 0 else 0.0
-        raw_d_scale = math.log(math.exp(d_scale_init) - 1.0) if d_scale_init > 0 else 0.0
+        init_delta = max(d_scale_init - d_scale_min, 0.05)
+        raw_d_scale = math.log(math.exp(init_delta) - 1.0)
         self.raw_gamma = nn.Parameter(torch.tensor(raw_gamma, dtype=torch.float32))
         self.raw_alpha = nn.Parameter(torch.tensor(raw_alpha, dtype=torch.float32))
         self.raw_d_scale = nn.Parameter(torch.tensor(raw_d_scale, dtype=torch.float32))
@@ -831,7 +834,7 @@ class ContinuousHelmholtzPredictor5x5(Predictor5x5):
         # 2. Compute 3D Physical Helmholtz Propagator
         gamma = F.softplus(self.raw_gamma)
         alpha = F.softplus(self.raw_alpha)
-        d_scale = F.softplus(self.raw_d_scale)
+        d_scale = F.softplus(self.raw_d_scale) + self.d_scale_min
 
         if freq_condition is not None:
             if freq_condition.dtype in (torch.int32, torch.int64):
@@ -924,6 +927,7 @@ def build_predictor_5x5(config) -> nn.Module:
             gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
             alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
             d_scale_init=getattr(config, "diffusion_d_scale_init", 1.5),
+            d_scale_min=getattr(config, "diffusion_d_scale_min", 1.0),
             spatial_topology=spatial_topology,
             star_radii=star_radii,
         )
