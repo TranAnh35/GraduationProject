@@ -187,6 +187,8 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
         num_freq_bins: int = 14,
         gamma_init: float = 1.0,
         beta_init: float = 0.5,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
     ):
         super().__init__(
             embed_dim=embed_dim,
@@ -196,6 +198,8 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
             dropout=dropout,
         )
         self.num_freq_bins = num_freq_bins
+        self.spatial_topology = spatial_topology
+        self.star_radii = star_radii
         self.op_embedding = DiffusionOperatorEmbedding(embed_dim=embed_dim)
 
         # Learnable physical coupling parameters (strictly non-negative via softplus)
@@ -207,29 +211,35 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
         self._register_distance_tables()
 
     def _register_distance_tables(self):
+        if self.spatial_topology in ("concentric_star", "star", "octagram", "star_25"):
+            offsets = get_spatial_topology_offsets(
+                topology=self.spatial_topology,
+                star_radii=self.star_radii
+            )  # [25, 2] in physical mm
+        else:
+            offsets = np.array([(float(k // 5), float(k % 5)) for k in range(25)], dtype=np.float32)
+
         # 50 tokens: 25 spatial points * 2 diffusion scales (shallow=0, deep=1)
         coords_50 = []
         scales_50 = []
         for k in range(50):
             sp = k // 2
-            coords_50.append((float(sp % 5), float(sp // 5)))
+            coords_50.append((float(offsets[sp, 0]), float(offsets[sp, 1])))
             scales_50.append(float(k % 2))
 
-        coords_50_t = torch.tensor(coords_50, dtype=torch.float32)  # [50, 2]
+        coords_50_t = torch.tensor(coords_50, dtype=torch.float32)  # [50, 2] in mm
         scales_50_t = torch.tensor(scales_50, dtype=torch.float32)  # [50]
 
         diff_50 = coords_50_t.unsqueeze(1) - coords_50_t.unsqueeze(0)  # [50, 50, 2]
-        dist_50 = torch.norm(diff_50, p=2, dim=-1)  # [50, 50]
+        dist_50 = torch.norm(diff_50, p=2, dim=-1)  # [50, 50] physical distance in mm
         scale_diff_50 = torch.abs(scales_50_t.unsqueeze(1) - scales_50_t.unsqueeze(0))  # [50, 50]
 
         self.register_buffer("dist_table_50", dist_50, persistent=False)
         self.register_buffer("scale_diff_table_50", scale_diff_50, persistent=False)
 
         # 25 tokens: 25 spatial points * 1 scale
-        coords_25 = []
-        for k in range(25):
-            coords_25.append((float(k % 5), float(k // 5)))
-        coords_25_t = torch.tensor(coords_25, dtype=torch.float32)  # [25, 2]
+        coords_25 = [(float(offsets[k, 0]), float(offsets[k, 1])) for k in range(25)]
+        coords_25_t = torch.tensor(coords_25, dtype=torch.float32)  # [25, 2] in mm
         diff_25 = coords_25_t.unsqueeze(1) - coords_25_t.unsqueeze(0)
         dist_25 = torch.norm(diff_25, p=2, dim=-1)
         scale_diff_25 = torch.zeros(25, 25, dtype=torch.float32)
@@ -242,10 +252,10 @@ class OperatorDiffusionPredictor5x5(Predictor5x5):
         scales_100 = []
         for k in range(100):
             sp = k // 4
-            coords_100.append((float(sp % 5), float(sp // 5)))
+            coords_100.append((float(offsets[sp, 0]), float(offsets[sp, 1])))
             scales_100.append(float(k % 4))
 
-        coords_100_t = torch.tensor(coords_100, dtype=torch.float32)  # [100, 2]
+        coords_100_t = torch.tensor(coords_100, dtype=torch.float32)  # [100, 2] in mm
         scales_100_t = torch.tensor(scales_100, dtype=torch.float32)  # [100]
 
         diff_100 = coords_100_t.unsqueeze(1) - coords_100_t.unsqueeze(0)  # [100, 100, 2]
@@ -705,6 +715,8 @@ def build_predictor_5x5(config) -> nn.Module:
             num_freq_bins=getattr(config, "num_freq_bins", 14),
             gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
             beta_init=getattr(config, "diffusion_beta_init", 0.5),
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
         )
     elif predictor_type == "standard":
         return Predictor5x5(

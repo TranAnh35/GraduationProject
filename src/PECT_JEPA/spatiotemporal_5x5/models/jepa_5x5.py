@@ -93,6 +93,7 @@ class PECT_JEPA_5x5(nn.Module):
             cov_weight=getattr(config, "cov_weight", 1.0),
             var_gamma=getattr(config, "var_gamma", 1.0),
             use_centered_vicreg=getattr(config, "use_centered_vicreg", True),
+            use_intra_scan_vicreg=getattr(config, "use_intra_scan_vicreg", True),
             uniformity_weight=getattr(config, "uniformity_weight", 0.0),
             uniformity_t=getattr(config, "uniformity_t", 2.0),
             uniformity_subsample=getattr(config, "uniformity_subsample", 1024),
@@ -393,7 +394,7 @@ class PECT_JEPA_5x5(nn.Module):
         H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
 
         # Predict center target tokens from surrounding context
-        if hasattr(self.predictor, "residual_head"):
+        if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
             freq_cond = self.compute_characteristic_frequency(
                 x, num_bins=getattr(self.config, "num_freq_bins", 14)
             )
@@ -483,7 +484,7 @@ class PECT_JEPA_5x5(nn.Module):
         H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
 
         # Predict center target tokens from surrounding context
-        if hasattr(self.predictor, "residual_head"):
+        if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
             freq_cond = self.compute_characteristic_frequency(
                 x, num_bins=getattr(self.config, "num_freq_bins", 14)
             )
@@ -522,6 +523,12 @@ class PECT_JEPA_5x5(nn.Module):
             e_mid_deep = delta_H_tokens[:, 1, :].norm(dim=-1)  # Layer 2: Mid-deep (1.2 - 2.0 mm)
             e_deep = delta_H_tokens[:, 0, :].norm(dim=-1)      # Layer 3: Deepest (2.0 - 3.0 mm)
             V_depth = torch.stack([e_surf, e_mid_shal, e_mid_deep, e_deep], dim=-1)  # [B, 4]
+        elif N_total == 50:
+            # 50 tokens: 0: Shallow/Surface diffusion scale, 1: Deep penetration scale
+            e_surf = delta_H_tokens[:, 0, :].norm(dim=-1)  # Surface/near-surface
+            e_deep = delta_H_tokens[:, 1, :].norm(dim=-1)  # Subsurface/deep
+            e_mid = 0.5 * (e_surf + e_deep)
+            V_depth = torch.stack([e_surf, e_mid, e_mid, e_deep], dim=-1)  # [B, 4]
         else:
             e_mean = delta_H.norm(dim=-1)
             V_depth = e_mean.unsqueeze(-1).expand(-1, 4)

@@ -47,7 +47,7 @@ class Spatiotemporal5x5Config:
     mask_bank_size: int = 2048          # Precomputed mask pool size per configuration
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "dual_domain_attention" # 'dual_domain_attention' (EXP-16: strictly waveform-agnostic 25 continuous tokens, 1 per probe)
+    tokenizer_type: str = "dual_scale_diffusion" # 'dual_scale_diffusion' (EXP-17: 50 tokens, surface and deep diffusion modes) | 'dual_domain_attention'
     num_temporal_stages: int = 4        # Number of chronological diffusion stages (for CST backward compatibility)
     num_scales: int = 4                 # Number of physical skin-depth scales (for spatio_spectral)
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion
@@ -59,7 +59,7 @@ class Spatiotemporal5x5Config:
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "standard"    # 'standard' (Pure JEPA Transformer Cross-Attention) | 'residual_diffusion'
+    predictor_type: str = "operator_diffusion" # 'operator_diffusion' (EXP-17: 3D Spatio-Diffusion World Model) | 'standard'
     predictor_depth: int = 2
     predictor_heads: int = 4
     diffusion_gamma_init: float = 1.0   # Spatial diffusion attenuation rate gamma for Green's attention bias
@@ -86,6 +86,7 @@ class Spatiotemporal5x5Config:
     cov_weight: float = 1.0              # VICReg covariance decorrelation penalty weight (Bardes et al., ICLR 2022)
     var_gamma: float = 1.0               # VICReg target standard deviation threshold gamma (anchors coordinate scale)
     use_centered_vicreg: bool = True     # EXP-16: In-Scan Centered VICReg (centers latent tokens by file mean to eliminate inter-file drift)
+    use_intra_scan_vicreg: bool = True   # EXP-17: Intra-Scan VICReg (forces variance hinge >= 1.0 and covariance = 0 independently per scan, preventing orthogonal subspace segregation)
     uniformity_weight: float = 0.0       # Hypersphere Uniformity loss weight (0.0 to prevent artificial repulsion of sound metal)
     uniformity_t: float = 2.0            # Gaussian potential parameter t for hypersphere uniformity
     uniformity_subsample: int = 1024     # Subsample size for stable, memory-efficient pairwise similarity
@@ -106,7 +107,7 @@ class Spatiotemporal5x5Config:
     compile_model: bool = False          # Enable torch.compile for PyTorch 2.x kernel fusion
 
     # --------------------------------------------------- Experiment & Logging
-    exp_name: str = "exp16_centered_jepa"
+    exp_name: str = "exp17_spatio_diffusion_jepa"
     log_dir: str = "experiments/5x5"
     save_dir: Optional[str] = None       # If None/default, automatically unified into <log_dir>/<exp_name>/checkpoints
     add_timestamp: bool = True           # True appends timestamp for unique isolated experiment logging

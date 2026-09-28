@@ -32,6 +32,7 @@ class JEPALoss5x5(nn.Module):
         cov_weight: float = 1.0,
         var_gamma: float = 1.0,
         use_centered_vicreg: bool = True,
+        use_intra_scan_vicreg: bool = True,
         uniformity_weight: float = 0.0,
         uniformity_t: float = 2.0,
         uniformity_subsample: int = 1024,
@@ -51,6 +52,7 @@ class JEPALoss5x5(nn.Module):
         self.cov_weight = cov_weight
         self.var_gamma = var_gamma
         self.use_centered_vicreg = use_centered_vicreg
+        self.use_intra_scan_vicreg = use_intra_scan_vicreg
         self.uniformity_weight = uniformity_weight
         self.uniformity_t = uniformity_t
         self.uniformity_subsample = uniformity_subsample
@@ -284,6 +286,100 @@ class JEPALoss5x5(nn.Module):
         cov_penalty = (off_diag ** 2).sum() / D
         return torch.nan_to_num(cov_penalty, nan=0.0, posinf=10.0)
 
+    def intra_scan_variance_hinge(self, H_rep: torch.Tensor, file_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Intra-Scan VICReg Variance Hinge Loss (EXP-17):
+        Computes standard deviation independently for EACH file/scan present in the batch,
+        then averages the hinge loss across files:
+            L_var = (1/K) * sum_{k=1}^K [ (1/D) * sum_{d=1}^D max(0, gamma - std_{i in file_k}(z_{i, d})) ]
+        Guarantees that EVERY scan (whether Chirp, Square, or Gauss) MUST independently satisfy
+        the variance threshold (std >= gamma) across ALL D dimensions, strictly preventing
+        the encoder from segregating different waveforms into disjoint coordinate subspaces!
+        """
+        z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        B, N, D = z.shape
+        z_flat = z.reshape(B * N, D)
+
+        if file_ids is None or file_ids.numel() == 0:
+            safe_eps = max(self.eps, 1e-5)
+            var = torch.clamp(z_flat.var(dim=0, unbiased=False), min=0.0)
+            std = torch.sqrt(var + safe_eps)
+            return torch.mean(F.relu(self.var_gamma - std))
+
+        if file_ids.ndim == 1:
+            file_ids_expanded = file_ids.unsqueeze(1).expand(B, N).reshape(-1)
+        else:
+            file_ids_expanded = file_ids.reshape(-1)
+
+        unique_files, inverse_indices, counts = torch.unique(file_ids_expanded, return_inverse=True, return_counts=True)
+        safe_eps = max(self.eps, 1e-5)
+
+        # Center each file by its own scan mean
+        file_sums = torch.zeros(len(unique_files), D, device=z.device, dtype=z.dtype)
+        file_sums.scatter_add_(0, inverse_indices.unsqueeze(1).expand(-1, D), z_flat)
+        file_means = file_sums / counts.unsqueeze(1).clamp(min=1)
+        z_centered = z_flat - file_means[inverse_indices]
+
+        # Vectorized variance per file: (1/M_k) * sum_{i in file_k} (z_i - mu_k)^2
+        z_sq = z_centered ** 2
+        file_sq_sums = torch.zeros(len(unique_files), D, device=z.device, dtype=z.dtype)
+        file_sq_sums.scatter_add_(0, inverse_indices.unsqueeze(1).expand(-1, D), z_sq)
+        file_vars = torch.clamp(file_sq_sums / counts.unsqueeze(1).clamp(min=1), min=0.0)  # [K, D]
+
+        file_stds = torch.sqrt(file_vars + safe_eps)  # [K, D]
+        file_stds = torch.nan_to_num(file_stds, nan=0.0, posinf=self.var_gamma)
+
+        hinge_per_file = F.relu(self.var_gamma - file_stds)  # [K, D]
+        return torch.mean(hinge_per_file)
+
+    def intra_scan_covariance_penalty(self, H_rep: torch.Tensor, file_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Intra-Scan VICReg Covariance Penalty (EXP-17):
+        Computes covariance decorrelation independently within EACH file/scan manifold:
+            L_cov = (1/K) * sum_{k=1}^K [ (1/D) * sum_{i != j} [C_k]_{ij}^2 ]
+        Decorrelates dimensions within each scan's own coordinate space, eliminating dimensional collapse
+        without rewarding inter-domain coordinate segregation.
+        """
+        z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        B, N, D = z.shape
+        z_flat = z.reshape(B * N, D)
+
+        if file_ids is None or file_ids.numel() == 0:
+            z_eval = z_flat - z_flat.mean(dim=0, keepdim=True)
+            cov = (z_eval.T @ z_eval) / max(1, z_eval.shape[0] - 1)
+            off_diag = cov - torch.diag(torch.diag(cov))
+            cov_penalty = (off_diag ** 2).sum() / D
+            return torch.nan_to_num(cov_penalty, nan=0.0, posinf=10.0)
+
+        if file_ids.ndim == 1:
+            file_ids_expanded = file_ids.unsqueeze(1).expand(B, N).reshape(-1)
+        else:
+            file_ids_expanded = file_ids.reshape(-1)
+
+        unique_files, inverse_indices, counts = torch.unique(file_ids_expanded, return_inverse=True, return_counts=True)
+
+        # Center each file
+        file_sums = torch.zeros(len(unique_files), D, device=z.device, dtype=z.dtype)
+        file_sums.scatter_add_(0, inverse_indices.unsqueeze(1).expand(-1, D), z_flat)
+        file_means = file_sums / counts.unsqueeze(1).clamp(min=1)
+        z_centered = z_flat - file_means[inverse_indices]
+
+        cov_penalties = []
+        for k in range(len(unique_files)):
+            n_pts = int(counts[k].item())
+            if n_pts <= 2:
+                continue
+            zk = z_centered[inverse_indices == k]  # [n_pts, D]
+            cov_k = (zk.T @ zk) / max(1, n_pts - 1)  # [D, D]
+            off_diag_k = cov_k - torch.diag(torch.diag(cov_k))
+            cov_penalties.append((off_diag_k ** 2).sum() / D)
+
+        if len(cov_penalties) == 0:
+            return torch.tensor(0.0, device=z.device, dtype=torch.float32)
+
+        total_cov = torch.stack(cov_penalties).mean()
+        return torch.nan_to_num(total_cov, nan=0.0, posinf=10.0)
+
     def norm_floor_loss(self, H_rep: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Norm-Floor Barrier Loss:
@@ -423,14 +519,20 @@ class JEPALoss5x5(nn.Module):
         if self.uniformity_weight > 0.0 and rep_reg is not None:
             l_unif = self.hypersphere_uniformity_loss(rep_reg)
 
-        # VICReg Coordinate-Wise Variance & Covariance Penalties (In-Scan Centered if enabled)
+        # VICReg Coordinate-Wise Variance & Covariance Penalties (Intra-Scan or Centered)
         l_var = zero_loss
         l_cov = zero_loss
         if (self.var_weight > 0.0 or self.cov_weight > 0.0) and rep_reg is not None:
-            if self.var_weight > 0.0:
-                l_var = self.variance_hinge(rep_reg, file_ids=file_ids)
-            if self.cov_weight > 0.0:
-                l_cov = self.covariance_penalty(rep_reg, file_ids=file_ids)
+            if getattr(self, "use_intra_scan_vicreg", False) and file_ids is not None:
+                if self.var_weight > 0.0:
+                    l_var = self.intra_scan_variance_hinge(rep_reg, file_ids=file_ids)
+                if self.cov_weight > 0.0:
+                    l_cov = self.intra_scan_covariance_penalty(rep_reg, file_ids=file_ids)
+            else:
+                if self.var_weight > 0.0:
+                    l_var = self.variance_hinge(rep_reg, file_ids=file_ids)
+                if self.cov_weight > 0.0:
+                    l_cov = self.covariance_penalty(rep_reg, file_ids=file_ids)
 
         # Norm-Floor Barrier Loss (Anti Zero-Collapse)
         l_norm = zero_loss

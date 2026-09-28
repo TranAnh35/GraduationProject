@@ -25,6 +25,7 @@ This document permanently tracks all completed, rejected, and active research hy
 | **EXP-14** | Radial Dispersion JEPA (Continuous Green's Bias + Phase Curvature + 10 Ep) | `attention.py` + `tokenizer_5x5.py` + `jepa_5x5.py` + `downstream_benchmarks.py` | 10 ep | AUC: 89.98% ± 8.62% \| AP: 59.27% (+46.8% rel) \| CNR: 2.95 (+61.5%) \| Defect-Only R²: 0.6132 (Corrosion: 0.8566, Rivet: 0.5638) \| Rivet AP: 78.88% \| Rivet Block AP: 24.63% | **Accepted SOTA Benchmark** | Cleared 5-epoch warmup through 10-epoch cosine annealing (val_loss_pred dropped 90% to 0.0764). Combined Continuous Green's Radial Attention Bias, Harmonic Radial Phase Curvature ($\kappa_\theta$), center probe alignment, and 128D Dual-Perspective Unified Latents ($[H_{\text{ctx}};\Delta H]$). Historic performance leap: AP surged from 40.38% to 59.27% (+18.89% absolute), Rivet AP surged to 78.88%, Rivet CNR reached 4.88, Spatial Block AP reached 24.63%, and Defect-Only Sizing R² reached 0.6132 (0.8566 on Corrosion). |
 | **EXP-15** | File-Peak Normalization Repair & Diffensor-Compatible PECT-JEPA | `preprocessing.py`: `file_peak` + `dataset.py`: `_norm_v2_` + `tokenizer_5x5.py`: SNR-tapered phase | 10 ep | AUC: 88.86% ± 9.02% \| AP: 56.28% \| CNR: 2.80 \| Defect-Only R²: 0.6318 (New SOTA) \| Rivet AUC: 97.22% \| Rivet MAE: 0.0719 mm | **Accepted Benchmark** | Fixed per-sample normalization bug; scalar file-level peak preserves 100% spatial contrast ΔV and Diffensor bipolar SNR. Achieved highest Defect-Only Depth Regression R² (0.6318) and 71.9 micron depth precision on Rivet. Zero-shot cross-file transfer (AUC 52.84%) proved to be caused by inter-file sound-metal centroid shift (||μ_A - μ_B|| >> ||δ||), validating user's core insight on global baseline calibration in NDT. |
 | **EXP-16** | Pure In-Scan Centered JEPA (Zero Heuristics + Centered VICReg) | `jepa_loss.py`: In-Scan Centered VICReg + Standard Transformer Predictor | 10 ep | AUC: 88.94% ± 9.14% \| AP: 56.93% \| CNR: 2.74 \| Plate R²: 0.2291 (New SOTA) \| Defect-Only R²: 0.6106 \| MAE: 0.1085 mm | **Accepted Benchmark** | Completely eliminated speculative heuristic losses (fluct_weight=0, temporal_mono=0, adaptive_disturbance=0). Proved that removing heuristics increased overall plate depth regression R² from 0.1466 to 0.2291 (+56.3% relative) without degrading Anomaly Detection AUC (88.94%). Geometric autopsy on zero-shot cross-file transfer (AUC 53.29%) proved that defect separating normal vectors w_A and w_B across disparate sensors/waveforms/specimens are mutually near-orthogonal (mean off-diagonal cos = 0.0637), discovering the fundamental reason global linear probes fail across diverse NDT inspection domains. |
+| **EXP-17** | 3D Spatio-Diffusion PECT-JEPA (Intra-Scan VICReg + Operator Diffusion Predictor) | `tokenizer_5x5.py`: `DualScaleDiffusion` + `models/predictor.py`: `OperatorDiffusionPredictor5x5` + `jepa_loss.py`: Intra-Scan VICReg | 10 ep | AUC: 93.78% ± 6.38% \| AP: 71.56% \| CNR: 3.86 \| Plate R²: 0.3168 \| Defect-Only R²: 0.7493 \| MAE: 0.1051 mm \| Two-NN: 10.3D | **Accepted SOTA Benchmark** | Unified 3D Spatio-Diffusion World Model + Intra-Scan VICReg manifold anchoring. Historic milestone: broke 0.30 Plate R² threshold for the first time (0.3168, +38.3% relative vs EXP-16), surged AP from 56.93% to 71.56% (+14.63% absolute), and boosted CNR to 3.86 (+40.8%). Defect-only sizing R² reached 0.7493 across all 57 held-out scans (0.9489 on Corrosion, 0.7071 on Rivet with 63.3 μm MAE). Held-out TMR sensor AP reached 73.25% and held-out Chirp waveform AP reached 77.21%. |
 | **OPT-01** | High-Throughput Training Acceleration Engine (Mask Bank + Non-Blocking Metrics + TF32) | `masking/cluster_mask.py` + `trainer.py` + `dataset.py` + `tokenizer_5x5.py` + `jepa_5x5.py` | N/A | Epoch time: ~880s -> ~140-180s (4x-6x speedup) \| Zero mathematical / physical degradation | **Accepted Engine Optimization** | Precomputed GPU tensor mask bank eliminates 1.75M BFS traversals/ep (<0.05ms/batch). Asynchronous GPU metric tensor eliminates ~75,000 blocking `.item()` host-syncs. Reused cached FFT eliminates duplicate STFT computation. Vectorized tensor collation + TF32 acceleration. 100% mathematically equivalent representations. |
 
 ---
@@ -582,3 +583,55 @@ This document permanently tracks all completed, rejected, and active research hy
 
 
 
+
+
+---
+
+### EXP-17: 3D Spatio-Diffusion PECT-JEPA (Intra-Scan VICReg + Operator Diffusion Predictor)
+- **Run Directory**: `experiments/5x5/exp17_spatio_diffusion_jepa`
+- **Configuration**:
+  - `tokenizer_type`: `dual_scale_diffusion` (50 continuous tokens: 25 spatial probes $\times$ 2 skin-depth penetration modes, surface and deep).
+  - `predictor_type`: `operator_diffusion` (3D Spatio-Diffusion World Model with continuous frequency-conditioned Green's operator $\mathcal{G}(r, \omega)$ and depth-transition operator $\mathcal{T}_z$).
+  - `use_intra_scan_vicreg`: `True` ($\text{std}_{i \in \text{file}_k}(z_d) \ge 1.0$ enforced independently per scan, preventing cross-waveform orthogonal subspace segregation).
+  - `spatial_topology`: `concentric_star` ($r = 1, 3, 7\text{ mm}$, 25 probes spanning $14\times14\text{ mm}^2$).
+  - `normalization`: `file_peak` (true C-scan scalar peak, preserves 100% $\Delta V$ contrast and Diffensor compatibility).
+  - `epochs`: 10 (warmup: 5, cosine annealing), `loss_type`: `l1`, `var_weight`: 1.0, `cov_weight`: 1.0, all heuristic weights: 0.0.
+- **Validation Loss & Representation Geometry Trajectory**:
+  - Epoch 1: `train_loss = 1.1861`, `val_loss_pred = 0.3483`, `Two-NN = 7.1D`, `LiftOff-Sim = 0.86`
+  - Epoch 2: `train_loss = 0.5550`, `val_loss_pred = 0.1247`, `Two-NN = 11.6D`, `LiftOff-Sim = 1.00`
+  - Epoch 5: `train_loss = 0.0988`, `val_loss_pred = 0.0470`, `Two-NN = 11.9D`, `LiftOff-Sim = 1.00`
+  - Epoch 10: `train_loss = 0.0610`, `val_loss_pred = 0.0204` (-94.1% reduction), `Two-NN = 10.3D`, `LiftOff-Sim = 1.00`
+  - Monitored `val_loss_pred` achieved continuous monotonic decrease across all 10 epochs.
+- **Downstream Empirical Metrics Across ALL 57 Held-Out Compound OOD Test Scans**:
+  - **Task 1 (Anomaly Detection - Linear Probe)**:
+    - Overall Mean AUC-ROC: **93.78% ± 6.38%** (+4.84% abs / +5.4% rel vs EXP-16's 88.94%)
+    - Overall Mean Average Precision (AP): **71.56%** (+14.63% abs / +25.7% rel vs EXP-16's 56.93%)
+    - Overall Mean Contrast-to-Noise Ratio (CNR): **3.86** (+40.8% rel vs EXP-16's 2.74)
+    - Linear Probe F1: **61.08%** (+11.22% abs vs EXP-16's 49.86%)
+  - **Task 2 (Quantitative Depth Regression)**:
+    - Overall Plate Depth $R^2$: **0.3168** (**NEW ALL-TIME RECORD!** Broke the 0.30 barrier for the first time, +38.3% relative vs EXP-16's 0.2291, and +116% vs EXP-14's 0.1466)
+    - Overall Depth MAE: **0.1051 mm** (105.1 microns)
+    - Defect-Only $R^2$ ($y > 0$): **0.7493** (+13.87% abs / +22.7% rel vs EXP-16's 0.6106)
+  - **Task 3 (Severity Classification)**: Macro F1 = **0.5951** (+10.53% abs vs EXP-16's 0.4898)
+  - **Task 4 (Multi-Lift-Off Invariance)**: Mean Linear CKA = **0.4413**, Mean Cosine Similarity = **0.9999**
+  - **Task 5 (Representation Geometry)**: Top-3 PCs Explained Variance = **98.75%**
+- **Breakdown by Waveform**:
+  - **Chirp (Held-Out Waveform, N=27)**: AUC = **95.20%**, AP = **77.21%**, CNR = **4.61**, Plate $R^2 = \mathbf{0.3570}$, Defect-Only $R^2 = \mathbf{0.7976}$, MAE = **0.1028 mm**
+  - **Gaussian (N=15)**: AUC = **93.03%**, AP = **71.51%**, CNR = **3.53**, Plate $R^2 = \mathbf{0.3049}$, Defect-Only $R^2 = \mathbf{0.7081}$, MAE = **0.1064 mm**
+  - **Square (N=15)**: AUC = **91.98%**, AP = **61.43%**, CNR = **2.83**, Plate $R^2 = \mathbf{0.2564}$, Defect-Only $R^2 = \mathbf{0.7034}$, MAE = **0.1079 mm**
+- **Breakdown by Sensor Hardware**:
+  - **Hall Pot Core (N=15)**: AUC = **95.92%**, AP = **77.77%**, CNR = **4.13**, Plate $R^2 = \mathbf{0.3174}$, Defect-Only $R^2 = \mathbf{0.8317}$
+  - **TMR (Held-Out Sensor, N=27)**: AUC = **94.46%**, AP = **73.25%**, CNR = **3.87**, Plate $R^2 = \mathbf{0.3284}$, Defect-Only $R^2 = \mathbf{0.6890}$
+  - **Hall Air Core (N=15)**: AUC = **90.43%**, AP = **62.31%**, CNR = **3.58**, Plate $R^2 = \mathbf{0.2955}$, Defect-Only $R^2 = \mathbf{0.7753}$
+- **Breakdown by Lift-Off Distance**:
+  - **z1 (0.5 mm, N=15)**: AUC = **97.21%**, AP = **83.83%**, CNR = **5.10**, Plate $R^2 = \mathbf{0.3905}$, Defect-Only $R^2 = \mathbf{0.7653}$, MAE = **0.0989 mm**
+  - **z2 (1.5 mm, N=15)**: AUC = **95.07%**, AP = **75.66%**, CNR = **4.08**, Plate $R^2 = \mathbf{0.3432}$, Defect-Only $R^2 = \mathbf{0.7286}$, MAE = **0.1038 mm**
+  - **z3 (3.0 mm Held-Out Lift-Off, N=27)**: AUC = **91.16%**, AP = **62.46%**, CNR = **3.05**, Plate $R^2 = \mathbf{0.2613}$, Defect-Only $R^2 = \mathbf{0.7519}$, MAE = **0.1092 mm**
+- **Breakdown by Specimen**:
+  - **Rivet (N=19)**: AUC = **98.86%**, AP = **88.62%**, CNR = **6.16**, Plate $R^2 = \mathbf{0.4799}$, Defect-Only $R^2 = \mathbf{0.7071}$, MAE = **0.0633 mm** (63.3 microns precision)
+  - **Corrosion (N=19)**: AUC = **90.18%**, AP = **66.11%**, CNR = **2.99**, Plate $R^2 = \mathbf{0.1555}$, Defect-Only $R^2 = \mathbf{0.9489}$ (94.9% sizing precision)
+  - **Mixed Plate (N=19)**: AUC = **92.31%**, AP = **59.95%**, CNR = **2.43**, Plate $R^2 = \mathbf{0.3151}$, Defect-Only $R^2 = \mathbf{0.5919}$
+- **Key Scientific Conclusions**:
+  1. *3D Spatio-Diffusion World Model Unlocks Depth Regression*: Providing the Predictor with physical spatial offsets ($\Delta r$ in mm) and depth diffusion operator embeddings ($\mathcal{T}_z$) forces the JEPA objective to model continuous electromagnetic penetration. This directly resolves the depth sizing bottleneck, elevating Defect-Only $R^2$ to **0.7493** across all 57 test scans and breaking the 0.30 Plate $R^2$ ceiling to **0.3168**.
+  2. *Intra-Scan VICReg Eliminates Subspace Escapes*: By enforcing variance and decorrelation independently within each TDMS C-scan, the model cannot satisfy the regularization penalty by segregating waveforms into disjoint subsets of coordinates. Every waveform (Chirp, Gaussian, Square) is forced to utilize the representation manifold uniformly.
+  3. *Unprecedented Compound OOD Robustness*: Held-out TMR sensor achieved **94.46% AUC** and **73.25% AP**; held-out Chirp waveform achieved **95.20% AUC** and **77.21% AP**; and 3.0 mm lift-off achieved **91.16% AUC** and **62.46% AP**.
