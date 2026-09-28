@@ -263,8 +263,9 @@ class SpatiotemporalDiffusionMasker5x5:
     def __init__(
         self,
         grid_size: int = 5,
-        num_spatial_cluster: int = 8,
+        num_spatial_cluster: int = 10,
         num_cross_diffusion: int = 8,
+        mode: str = "surface_to_bulk",
         use_mask_bank: bool = True,
         bank_size: int = 2048,
     ):
@@ -273,8 +274,15 @@ class SpatiotemporalDiffusionMasker5x5:
         self.total_tokens = self.total_spatial * 2  # 50
         self.num_spatial_cluster = min(num_spatial_cluster, self.total_spatial - 2)
         self.num_cross_diffusion = min(num_cross_diffusion, self.total_spatial - self.num_spatial_cluster)
-        self.num_tgt = self.num_spatial_cluster * 2 + self.num_cross_diffusion
+        self.mode = mode
+
+        if self.mode == "surface_to_bulk":
+            # Target is strictly deep tokens of the spatial cluster
+            self.num_tgt = self.num_spatial_cluster
+        else:
+            self.num_tgt = self.num_spatial_cluster * 2 + self.num_cross_diffusion
         self.num_ctx = self.total_tokens - self.num_tgt
+
         self.use_mask_bank = use_mask_bank
         self.bank_size = bank_size
         self._banks: dict = {}
@@ -309,6 +317,16 @@ class SpatiotemporalDiffusionMasker5x5:
         while len(cluster) < self.num_spatial_cluster and remaining:
             p = remaining.pop(rng.randint(0, len(remaining) - 1))
             cluster.add(p)
+
+        if self.mode == "surface_to_bulk":
+            # Target tokens: ONLY deep tokens (sp_idx * 2 + 1) in the spatial cluster
+            tgt_tokens: List[int] = []
+            for (x, y) in cluster:
+                sp_idx = x * self.grid_size + y
+                tgt_tokens.append(sp_idx * 2 + 1)  # deep token only
+            tgt_set = set(tgt_tokens)
+            ctx_tokens = [i for i in range(self.total_tokens) if i not in tgt_set]
+            return sorted(ctx_tokens), sorted(tgt_tokens)
 
         # Target tokens from spatial cluster (both shallow and deep)
         tgt_tokens: List[int] = []
@@ -537,11 +555,12 @@ def build_masker_5x5(config):
             use_mask_bank=use_mask_bank,
             bank_size=bank_size,
         )
-    elif tokenizer_type in ("dual_scale_diffusion", "dual_scale") and masker_type != "contiguous_cluster":
+    elif tokenizer_type in ("dual_scale_diffusion", "dual_scale", "uncrushed_diffusion") and masker_type != "contiguous_cluster":
         return SpatiotemporalDiffusionMasker5x5(
             grid_size=config.grid_size,
-            num_spatial_cluster=getattr(config, "num_spatial_cluster", 8),
+            num_spatial_cluster=getattr(config, "num_spatial_cluster", 10),
             num_cross_diffusion=getattr(config, "num_cross_diffusion", 8),
+            mode=getattr(config, "cst_mask_mode", "surface_to_bulk"),
             use_mask_bank=use_mask_bank,
             bank_size=bank_size,
         )

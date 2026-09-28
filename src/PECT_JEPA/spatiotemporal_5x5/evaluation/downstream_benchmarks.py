@@ -433,9 +433,20 @@ class DownstreamBenchmarkSuite:
             y_pred_all = ridge_all.predict(X_te_s)
             standard_r2.append(float(r2_score(y_te, y_pred_all)))
             standard_mae.append(float(mean_absolute_error(y_te, y_pred_all)))
+            # Calibrate optimal gating threshold tau on train fold (maximizing Hurdle R^2)
+            p_tr = clf.predict_proba(X_tr_s)[:, 1]
+            d_pred_tr = np.maximum(0.0, ridge_def.predict(X_tr_s))
+            best_tau = 0.5
+            best_tr_r2 = -1e9
+            for candidate_tau in np.linspace(0.3, 0.95, 27):
+                y_h_tr = np.where(p_tr >= candidate_tau, d_pred_tr, 0.0)
+                tr_r2 = r2_score(y_tr, y_h_tr)
+                if tr_r2 > best_tr_r2:
+                    best_tr_r2 = tr_r2
+                    best_tau = float(candidate_tau)
 
-            # Compound Hurdle Prediction (tau = 0.5)
-            y_hurdle_te = np.where(p_te >= 0.5, d_pred_te, 0.0)
+            # Compound Hurdle Prediction with Calibrated Gating (zero test leakage)
+            y_hurdle_te = np.where(p_te >= best_tau, d_pred_te, 0.0)
             hurdle_r2.append(float(r2_score(y_te, y_hurdle_te)))
             hurdle_mae.append(float(mean_absolute_error(y_te, y_hurdle_te)))
 

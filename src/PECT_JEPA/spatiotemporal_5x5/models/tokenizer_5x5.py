@@ -498,6 +498,144 @@ class DualScaleDiffusionTokenizer5x5(nn.Module):
         pos_shallow = sp_pos + self.scale_shallow          # [B, 25, D]
         pos_deep = sp_pos + self.scale_deep                # [B, 25, D]
         pos = torch.stack([pos_shallow, pos_deep], dim=2).reshape(B, self.num_tokens, self.embed_dim)
+        return tokens, pos
+
+
+class UncrushedDiffusionTokenizer5x5(nn.Module):
+    """
+    Uncrushed Harmonic Dispersion Dual-Scale Diffusion Tokenizer for 5x5 PECT-JEPA.
+    
+    Resolves the 2D Spectral Crushing Bottleneck of EXP-17:
+    Instead of summing over harmonics into a single 2D scalar pair [phase_avg, log_mag_avg],
+    this tokenizer preserves the FULL harmonic dispersion vectors:
+      - Deep Diffusion Regime: low frequencies [0 .. split_bin] (uncrushed phase & log-magnitude).
+      - Shallow Diffusion Regime: high frequencies [split_bin .. K] (uncrushed phase & log-magnitude).
+    
+    Transforms the C-channel waveform at each of the 25 spatial coordinates into TWO
+    physically distinct tokens of dimension D:
+      Total tokens = 25 probes * 2 modes = 50 tokens.
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_tokens = self.num_spatial * 2    # 50
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+
+        # 1. Multi-scale 1D Temporal Conv Filterbank for transient dynamics
+        d_sub = embed_dim // 3
+        self.conv_short = nn.Conv1d(1, d_sub, kernel_size=5, stride=2, padding=2)
+        self.conv_med = nn.Conv1d(1, d_sub, kernel_size=15, stride=2, padding=7)
+        self.conv_long = nn.Conv1d(1, embed_dim - 2 * d_sub, kernel_size=31, stride=2, padding=15)
+        self.act_time = nn.GELU()
+        self.time_pool = nn.AdaptiveAvgPool1d(1)
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Uncrushed Spectral Dispersion Branch
+        self.split_bin = min(4, max(1, self.num_freq_bins // 2))  # typically 4
+        self.deep_dim = self.split_bin * 2                        # 4 bins * 2 = 8 dims
+        self.shallow_dim = (self.num_freq_bins - self.split_bin) * 2 # 10 bins * 2 = 20 dims
+
+        self.proj_deep = nn.Linear(self.deep_dim, embed_dim)
+        self.proj_shallow = nn.Linear(self.shallow_dim, embed_dim)
+        self.ln_deep = nn.LayerNorm(embed_dim)
+        self.ln_shallow = nn.LayerNorm(embed_dim)
+
+        # 3. Physics-Gated Dual-Domain Fusion
+        self.gate_shallow = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Sigmoid(),
+        )
+        self.gate_deep = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Sigmoid(),
+        )
+        self.fuse_shallow = nn.Linear(embed_dim, embed_dim)
+        self.fuse_deep = nn.Linear(embed_dim, embed_dim)
+        self.norm_shallow = nn.LayerNorm(embed_dim)
+        self.norm_deep = nn.LayerNorm(embed_dim)
+
+        # 4. Learnable Scale / Diffusion Regime Embeddings
+        self.scale_shallow = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.scale_deep = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.scale_shallow, std=0.02)
+        nn.init.trunc_normal_(self.scale_deep, std=0.02)
+
+        # 5. Spatial Positional Embedding (2D)
+        if pos_embed_type == "learnable_2d":
+            self.spatial_pos_embed = nn.Parameter(torch.zeros(1, self.num_spatial, embed_dim))
+            nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("spatial_pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_flat = x.reshape(B * self.num_spatial, C)
+
+        # 1. Multi-scale Temporal Features
+        x_1d = x_flat.unsqueeze(1)  # [B*25, 1, C]
+        h_s = self.conv_short(x_1d)
+        h_m = self.conv_med(x_1d)
+        h_l = self.conv_long(x_1d)
+        h_cat = self.act_time(torch.cat([h_s, h_m, h_l], dim=1))  # [B*25, D, C//2]
+        z_time = self.ln_time(self.time_pool(h_cat).squeeze(-1))   # [B*25, D]
+
+        # 2. Uncrushed Spectral Dispersion Features
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)[:, 1:self.num_freq_bins + 1]  # [B*25, K]
+        mags = torch.log1p(torch.abs(X_fft))
+        phases = torch.angle(X_fft) / torch.pi  # Normalized to [-1, 1]
+
+        # Deep bins: 0 .. split_bin (low-frequency penetration)
+        deep_phase = phases[:, :self.split_bin]
+        deep_mag = mags[:, :self.split_bin]
+        feat_deep = torch.cat([deep_phase, deep_mag], dim=-1).to(x_flat.dtype)  # [B*25, 2 * split_bin]
+        z_freq_deep = self.ln_deep(self.proj_deep(feat_deep))                   # [B*25, D]
+
+        # Shallow bins: split_bin .. K (high-frequency surface)
+        shallow_phase = phases[:, self.split_bin:]
+        shallow_mag = mags[:, self.split_bin:]
+        feat_shallow = torch.cat([shallow_phase, shallow_mag], dim=-1).to(x_flat.dtype)  # [B*25, 2 * (K - split_bin)]
+        z_freq_shallow = self.ln_shallow(self.proj_shallow(feat_shallow))               # [B*25, D]
+
+        # 3. Physics-Gated Dual-Domain Fusion
+        g_s = self.gate_shallow(torch.cat([z_time, z_freq_shallow], dim=-1))
+        t_shallow = self.norm_shallow(self.fuse_shallow(g_s * z_time + (1.0 - g_s) * z_freq_shallow))
+        t_shallow = t_shallow.reshape(B, self.num_spatial, self.embed_dim)
+
+        g_d = self.gate_deep(torch.cat([z_time, z_freq_deep], dim=-1))
+        t_deep = self.norm_deep(self.fuse_deep(g_d * z_time + (1.0 - g_d) * z_freq_deep))
+        t_deep = t_deep.reshape(B, self.num_spatial, self.embed_dim)
+
+        # 4. Interleave into 50 tokens: [shallow_0, deep_0, shallow_1, deep_1, ...]
+        tokens = torch.stack([t_shallow, t_deep], dim=2).reshape(B, self.num_tokens, self.embed_dim)
+        tokens = self.drop(tokens)
+
+        # 5. Positional Embeddings: Spatial Pos + Scale Embedding
+        sp_pos = self.spatial_pos_embed.expand(B, -1, -1)  # [B, 25, D]
+        pos_shallow = sp_pos + self.scale_shallow          # [B, 25, D]
+        pos_deep = sp_pos + self.scale_deep                # [B, 25, D]
+        pos = torch.stack([pos_shallow, pos_deep], dim=2).reshape(B, self.num_tokens, self.embed_dim)
 
         return tokens, pos
 
@@ -910,6 +1048,15 @@ def build_tokenizer_5x5(config) -> nn.Module:
         )
     elif tokenizer_type in ("continuous_stf", "continuous_filterbank"):
         return ContinuousSTFTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type in ("uncrushed_diffusion", "continuous_diffusion"):
+        return UncrushedDiffusionTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
             grid_size=config.grid_size,

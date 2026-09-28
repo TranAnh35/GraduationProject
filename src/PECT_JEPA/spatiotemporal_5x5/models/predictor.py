@@ -5,6 +5,7 @@ and context key/value representations (H_context). Zero information leakage.
 """
 
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -670,16 +671,263 @@ class ResidualDiffusionPredictor5x5(ParabolicDiffusionPredictor5x5):
         return H_pred
 
 
+class ContinuousHelmholtzPredictor5x5(Predictor5x5):
+    """
+    Continuous Green's Helmholtz Operator Predictor for 5x5 PECT-JEPA (EXP-18).
+    
+    Models 3D eddy current electromagnetic scattering governed by the vector Helmholtz equation:
+        nabla^2 B - k^2 B = 0, where k = (1 + j) / delta(omega)
+    
+    1. Continuous Helmholtz Propagator:
+       Propagates visible context representations H_context into target query locations via
+       analytical Green's function in 3D half-space:
+           G(Delta r, Delta z; omega) = exp(-(1+j) * sqrt(||Delta r||^2 + (Delta z * d_scale)^2) / delta(omega))
+                                       / (sqrt(||Delta r||^2 + (Delta z * d_scale)^2) + eps)
+       Physical baseline:
+           H_helmholtz_i = sum_j Softmax(log |G_ij|) * LayerNorm(W_prop * H_ctx_j)
+    
+    2. Dynamic Perturbation Residual Head:
+       Refines target queries through Transformer cross-attention blocks with Helmholtz log-bias:
+           M_ij^{diff} = - gamma * sqrt(omega) * R_ij - alpha * log(R_ij + eps)
+       and outputs the dynamic defect scattering perturbation:
+           Delta H_pred = MLP(q)
+           H_pred = H_helmholtz + Delta H_pred
+       
+       On sound metal: Delta H_pred -> 0 (pure Helmholtz propagation).
+       On flaws: Delta H_pred directly encodes flaw scattering, monotonic in flaw depth.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        depth: int = 2,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        num_freq_bins: int = 14,
+        gamma_init: float = 1.0,
+        alpha_init: float = 0.5,
+        d_scale_init: float = 1.5,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
+    ):
+        super().__init__(
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+        )
+        self.num_freq_bins = num_freq_bins
+        self.spatial_topology = spatial_topology
+        self.star_radii = star_radii
+        self.op_embedding = DiffusionOperatorEmbedding(embed_dim=embed_dim)
+
+        # Context propagation projection
+        self.w_prop = nn.Linear(embed_dim, embed_dim)
+        self.norm_prop = nn.LayerNorm(embed_dim)
+
+        # Learnable physical coupling parameters
+        raw_gamma = math.log(math.exp(gamma_init) - 1.0) if gamma_init > 0 else 0.0
+        raw_alpha = math.log(math.exp(alpha_init) - 1.0) if alpha_init > 0 else 0.0
+        raw_d_scale = math.log(math.exp(d_scale_init) - 1.0) if d_scale_init > 0 else 0.0
+        self.raw_gamma = nn.Parameter(torch.tensor(raw_gamma, dtype=torch.float32))
+        self.raw_alpha = nn.Parameter(torch.tensor(raw_alpha, dtype=torch.float32))
+        self.raw_d_scale = nn.Parameter(torch.tensor(raw_d_scale, dtype=torch.float32))
+
+        # Dynamic defect scattering perturbation head
+        self.residual_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        self.last_h_base: Optional[torch.Tensor] = None
+        self.last_delta_pred: Optional[torch.Tensor] = None
+
+        self._register_helmholtz_tables()
+
+    def _register_helmholtz_tables(self):
+        try:
+            offsets = get_spatial_topology_offsets(
+                topology=self.spatial_topology,
+                star_radii=self.star_radii
+            )
+        except Exception:
+            offsets = np.array([(float(k // 5), float(k % 5)) for k in range(25)], dtype=np.float32)
+
+        # 50 tokens: 25 spatial points * 2 diffusion scales (shallow=0.0, deep=1.0)
+        coords_xy_50 = []
+        depth_z_50 = []
+        for k in range(50):
+            sp = k // 2
+            coords_xy_50.append((float(offsets[sp, 0]), float(offsets[sp, 1])))
+            depth_z_50.append(float(k % 2))
+
+        coords_xy_50_t = torch.tensor(coords_xy_50, dtype=torch.float32)  # [50, 2] in mm
+        depth_z_50_t = torch.tensor(depth_z_50, dtype=torch.float32)      # [50]
+
+        diff_xy_50 = coords_xy_50_t.unsqueeze(1) - coords_xy_50_t.unsqueeze(0)  # [50, 50, 2]
+        dist_xy_sq_50 = torch.sum(diff_xy_50 ** 2, dim=-1)                      # [50, 50] mm^2
+        diff_z_50 = depth_z_50_t.unsqueeze(1) - depth_z_50_t.unsqueeze(0)       # [50, 50]
+        dz_sq_50 = diff_z_50 ** 2                                               # [50, 50]
+
+        self.register_buffer("dist_xy_sq_50", dist_xy_sq_50, persistent=False)
+        self.register_buffer("dz_sq_50", dz_sq_50, persistent=False)
+
+        # 25 tokens: 25 spatial points * 1 scale (z=0)
+        coords_25_t = torch.from_numpy(offsets).float()  # [25, 2]
+        diff_xy_25 = coords_25_t.unsqueeze(1) - coords_25_t.unsqueeze(0)
+        dist_xy_sq_25 = torch.sum(diff_xy_25 ** 2, dim=-1)
+        dz_sq_25 = torch.zeros(25, 25, dtype=torch.float32)
+
+        self.register_buffer("dist_xy_sq_25", dist_xy_sq_25, persistent=False)
+        self.register_buffer("dz_sq_25", dz_sq_25, persistent=False)
+
+        # 100 tokens: 25 spatial points * 4 temporal diffusion stages (z in {0, 1, 2, 3})
+        coords_xy_100 = []
+        depth_z_100 = []
+        for k in range(100):
+            sp = k // 4
+            coords_xy_100.append((float(offsets[sp, 0]), float(offsets[sp, 1])))
+            depth_z_100.append(float(k % 4) / 3.0)  # normalized 0.0 .. 1.0
+
+        coords_xy_100_t = torch.tensor(coords_xy_100, dtype=torch.float32)
+        depth_z_100_t = torch.tensor(depth_z_100, dtype=torch.float32)
+
+        diff_xy_100 = coords_xy_100_t.unsqueeze(1) - coords_xy_100_t.unsqueeze(0)
+        dist_xy_sq_100 = torch.sum(diff_xy_100 ** 2, dim=-1)
+        diff_z_100 = depth_z_100_t.unsqueeze(1) - depth_z_100_t.unsqueeze(0)
+        dz_sq_100 = diff_z_100 ** 2
+
+        self.register_buffer("dist_xy_sq_100", dist_xy_sq_100, persistent=False)
+        self.register_buffer("dz_sq_100", dz_sq_100, persistent=False)
+
+    def forward(
+        self,
+        H_context: torch.Tensor,
+        target_pos: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+        freq_condition: Optional[torch.Tensor] = None,
+        diffusion_operator: Optional[torch.Tensor] = None,
+        return_residual: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        B, N_tgt, D = target_pos.shape
+        device = target_pos.device
+
+        # 1. Operator Query Condition
+        if diffusion_operator is None:
+            if freq_condition is not None:
+                if freq_condition.dtype in (torch.int32, torch.int64):
+                    freq_norm = freq_condition.float() / float(self.num_freq_bins)
+                else:
+                    freq_norm = freq_condition.float()
+                op_cond = self.op_embedding(freq_norm)
+            else:
+                op_cond = self.op_embedding.default_op
+        else:
+            op_cond = diffusion_operator
+
+        # 2. Compute 3D Physical Helmholtz Propagator
+        gamma = F.softplus(self.raw_gamma)
+        alpha = F.softplus(self.raw_alpha)
+        d_scale = F.softplus(self.raw_d_scale)
+
+        if freq_condition is not None:
+            if freq_condition.dtype in (torch.int32, torch.int64):
+                f_val = freq_condition.float() / float(self.num_freq_bins)
+            else:
+                f_val = freq_condition.float()
+            sqrt_freq = torch.sqrt(f_val.clamp(min=1e-4)).view(B, 1, 1).to(device)
+        else:
+            sqrt_freq = torch.ones(B, 1, 1, device=device)
+
+        eff_gamma = gamma * sqrt_freq  # [B, 1, 1]
+
+        if context_indices is not None and target_indices is not None:
+            max_idx = max(int(target_indices.max().item()), int(context_indices.max().item()))
+            if max_idx >= 50:
+                dist_xy_sq = self.dist_xy_sq_100
+                dz_sq = self.dz_sq_100
+            elif max_idx >= 25:
+                dist_xy_sq = self.dist_xy_sq_50
+                dz_sq = self.dz_sq_50
+            else:
+                dist_xy_sq = self.dist_xy_sq_25
+                dz_sq = self.dz_sq_25
+
+            t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
+            c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
+
+            d_xy2 = dist_xy_sq[t_idx, c_idx]                 # [B, N_tgt, N_ctx]
+            d_z2 = dz_sq[t_idx, c_idx]                       # [B, N_tgt, N_ctx]
+            R_sq = d_xy2 + d_z2 * (d_scale ** 2)
+            R = torch.sqrt(R_sq + 1e-4)                      # [B, N_tgt, N_ctx]
+
+            # Continuous Green's Helmholtz Kernel
+            log_G = - eff_gamma * R - torch.log(R + 0.1)     # [B, N_tgt, N_ctx]
+            weights = F.softmax(log_G, dim=-1)                # [B, N_tgt, N_ctx]
+
+            # Context Propagation
+            H_ctx_proj = self.norm_prop(self.w_prop(H_context))  # [B, N_ctx, D]
+            H_helmholtz = torch.bmm(weights, H_ctx_proj)        # [B, N_tgt, D]
+
+            # Cross-Attention Attention Bias
+            M_diff = - eff_gamma * R - alpha * torch.log(R + 0.1)
+            attn_bias = M_diff.unsqueeze(1)                     # [B, 1, N_tgt, N_ctx]
+        else:
+            H_ctx_mean = H_context.mean(dim=1, keepdim=True).expand(-1, N_tgt, -1)
+            H_helmholtz = self.norm_prop(self.w_prop(H_ctx_mean))
+            attn_bias = None
+
+        # 3. Target Query Formulation
+        queries = H_helmholtz + self.mask_token.expand(B, N_tgt, -1) + target_pos
+        if op_cond is not None:
+            if op_cond.ndim == 2:
+                op_cond = op_cond.unsqueeze(1)
+            queries = queries + op_cond
+
+        # 4. Transformer Attention Refinement
+        q = queries
+        for blk in self.blocks:
+            q = blk(target_queries=q, H_context=H_context, attn_bias=attn_bias)
+
+        # 5. Dynamic Defect Scattering Perturbation Residual
+        delta_pred = self.residual_head(self.norm(q))           # [B, N_tgt, D]
+        H_pred = H_helmholtz + delta_pred                      # [B, N_tgt, D]
+
+        self.last_h_base = H_helmholtz
+        self.last_delta_pred = delta_pred
+
+        if return_residual:
+            return H_pred, delta_pred, H_helmholtz
+        return H_pred
+
+
 def build_predictor_5x5(config) -> nn.Module:
     """
     Factory function to construct Predictor based on config.
-    Defaults to ResidualDiffusionPredictor5x5 (Residual Diffusion Predictor).
+    Defaults to ContinuousHelmholtzPredictor5x5 or ResidualDiffusionPredictor5x5.
     """
-    predictor_type = getattr(config, "predictor_type", "residual_diffusion")
+    predictor_type = getattr(config, "predictor_type", "continuous_helmholtz")
     spatial_topology = getattr(config, "spatial_topology", "concentric_star")
     star_radii = getattr(config, "star_radii", (1, 3, 7))
 
-    if predictor_type in ("residual_diffusion", "residual", "auto", "default"):
+    if predictor_type in ("continuous_helmholtz", "helmholtz", "helmholtz_diffusion"):
+        return ContinuousHelmholtzPredictor5x5(
+            embed_dim=config.embed_dim,
+            depth=config.predictor_depth,
+            num_heads=config.predictor_heads,
+            mlp_ratio=config.mlp_ratio,
+            dropout=config.dropout,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
+            alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
+            d_scale_init=getattr(config, "diffusion_d_scale_init", 1.5),
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
+        )
+    elif predictor_type in ("residual_diffusion", "residual", "auto", "default"):
         return ResidualDiffusionPredictor5x5(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,

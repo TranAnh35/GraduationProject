@@ -124,9 +124,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Norm-floor barrier weight to prevent zero-vector collapse (default: 0.1)")
     p.add_argument("--norm_floor_target", type=float, default=1.0,
                    help="Minimum target L2 norm of representations (default: 1.0)")
-    p.add_argument("--tokenizer_type", type=str, default="dual_scale_diffusion",
-                   choices=["dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'dual_scale_diffusion' (EXP-17: 50 tokens, surface and deep diffusion modes, default), 'dual_domain_attention', etc.")
+    p.add_argument("--tokenizer_type", type=str, default="uncrushed_diffusion",
+                   choices=["uncrushed_diffusion", "dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'uncrushed_diffusion' (EXP-18: 50 tokens, uncrushed harmonic dispersion, default), 'dual_scale_diffusion', etc.")
     p.add_argument("--num_scales", type=int, default=4,
                    help="Number of physical skin-depth scales for spatio_spectral tokenizer (default: 4)")
     p.add_argument("--masker_type", type=str, default="auto",
@@ -134,11 +134,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Masker strategy: 'auto' (ContiguousCluster for 25 tok, CST for 100 tok, default), 'complementary_st', or 'contiguous_cluster'")
     p.add_argument("--num_temporal_stages", type=int, default=4,
                    help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
-    p.add_argument("--cst_mask_mode", type=str, default="surface_to_depth", choices=["surface_to_depth", "causal", "random"],
-                   help="CST masking temporal partition mode: 'surface_to_depth' (default), 'causal', or 'random'")
-    p.add_argument("--predictor_type", type=str, default="operator_diffusion",
-                   choices=["operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
-                   help="Predictor architecture: 'operator_diffusion' (EXP-17: 3D Spatio-Diffusion World Model, default), 'standard', etc.")
+    p.add_argument("--cst_mask_mode", type=str, default="surface_to_bulk", choices=["surface_to_bulk", "surface_to_depth", "causal", "random"],
+                   help="Masking partition mode: 'surface_to_bulk' (EXP-18, default), 'surface_to_depth', 'causal', or 'random'")
+    p.add_argument("--predictor_type", type=str, default="continuous_helmholtz",
+                   choices=["continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
+                   help="Predictor architecture: 'continuous_helmholtz' (EXP-18: 3D Continuous Helmholtz Diffusion World Model, default), 'operator_diffusion', etc.")
     p.add_argument("--use_target_ema", type=lambda v: v.lower() == "true", default=False,
                    help="Use EMA target encoder (default: False for Single Shared Encoder + Stop-Gradient Target)")
     p.add_argument("--adaptive_disturbance_weight", type=float, default=0.0,
@@ -186,7 +186,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
-    p.add_argument("--exp_name", type=str, default="exp17_spatio_diffusion_jepa", help="Experiment run name")
+    p.add_argument("--exp_name", type=str, default="exp18_helmholtz_diffusion_jepa", help="Experiment run name")
     p.add_argument("--save_dir", type=str, default=None,
                    help="Directory to save model checkpoints (default: None -> auto-unified inside experiments/5x5/<exp_name>/checkpoints/)")
     p.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True,

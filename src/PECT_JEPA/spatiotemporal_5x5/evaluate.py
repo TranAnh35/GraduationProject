@@ -302,8 +302,11 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     state_dict = ckpt.get("model_state_dict", ckpt)
 
     # If tokenizer_type was not specified in checkpoint config, infer from state_dict
+    # If tokenizer_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "tokenizer_type" in cfg_dict):
-        if "tokenizer.pos_scale" in state_dict or "tokenizer.gate_proj.0.weight" in state_dict:
+        if "tokenizer.scale_shallow" in state_dict:
+            config.tokenizer_type = "uncrushed_diffusion"
+        elif "tokenizer.pos_scale" in state_dict or "tokenizer.gate_proj.0.weight" in state_dict:
             config.tokenizer_type = "spatio_spectral"
         elif "tokenizer.chunk_proj.weight" in state_dict:
             config.tokenizer_type = "spatiotemporal_patch"
@@ -318,7 +321,9 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
 
     # If predictor_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "predictor_type" in cfg_dict):
-        if "predictor.gamma_raw" in state_dict:
+        if "predictor.raw_d_scale" in state_dict:
+            config.predictor_type = "continuous_helmholtz"
+        elif "predictor.gamma_raw" in state_dict:
             config.predictor_type = "residual_diffusion"
         elif "predictor.op_embedding.default_op" in state_dict:
             config.predictor_type = "operator_diffusion"
@@ -546,8 +551,34 @@ def evaluate_single_file(
             ridge = Ridge(alpha=1.0, random_state=42)
             ridge.fit(X_fit_s, y_fit)
 
-            pred_depth_flat = ridge.predict(scaler.transform(flat_feats))
-            pred_depth_map = np.clip(pred_depth_flat.reshape(min_Y, min_X), 0.0, None)
+            # Gated Two-Stage Hurdle Map Generation (sound metal -> strictly 0.00 mm, flaws -> calibrated sizing)
+            clf_gate = LogisticRegression(C=1.0, max_iter=500, class_weight="balanced", random_state=42)
+            y_bin_fit = (y_fit > 0.0).astype(int)
+            clf_gate.fit(X_fit_s, y_bin_fit)
+            p_all = clf_gate.predict_proba(scaler.transform(flat_feats))[:, 1]
+
+            def_fit_mask = (y_fit > 0.0)
+            if np.sum(def_fit_mask) >= 5:
+                ridge_cond = Ridge(alpha=1.0, random_state=42)
+                ridge_cond.fit(X_fit_s[def_fit_mask], y_fit[def_fit_mask])
+                d_cond_all = np.maximum(0.0, ridge_cond.predict(scaler.transform(flat_feats)))
+
+                # Calibrate optimal gating threshold tau on fit_idx
+                p_fit = clf_gate.predict_proba(X_fit_s)[:, 1]
+                d_fit_pred = np.maximum(0.0, ridge_cond.predict(X_fit_s))
+                best_tau = 0.5
+                best_score = -1e9
+                for c_tau in np.linspace(0.3, 0.95, 27):
+                    score = r2_score(y_fit, np.where(p_fit >= c_tau, d_fit_pred, 0.0))
+                    if score > best_score:
+                        best_score = score
+                        best_tau = float(c_tau)
+
+                pred_depth_flat = np.where(p_all >= best_tau, d_cond_all, 0.0)
+            else:
+                pred_depth_flat = np.clip(ridge.predict(scaler.transform(flat_feats)), 0.0, None)
+
+            pred_depth_map = pred_depth_flat.reshape(min_Y, min_X)
 
             lp_reg = reg_benchmark.get("linear_probe", {})
             mlp_reg = reg_benchmark.get("mlp_2layer", {})
@@ -555,15 +586,25 @@ def evaluate_single_file(
             mae_val = lp_reg.get("mae_mm", 0.0)
             rmse_val = lp_reg.get("rmse_mm", 0.0)
 
+            hurdle_r2_val = hurdle_benchmark.get("compound_hurdle", {}).get("plate_r2_score") if isinstance(hurdle_benchmark, dict) else None
+            defect_r2_val = hurdle_benchmark.get("conditional_defect_sizing", {}).get("r2_score") if isinstance(hurdle_benchmark, dict) else None
+            hurdle_mae_val = hurdle_benchmark.get("compound_hurdle", {}).get("plate_mae_mm") if isinstance(hurdle_benchmark, dict) else None
+
             pred_depth_map_path = os.path.join(task2_dir, f"{fname_base}_predicted_depth_map.png")
             depth_scatter_path = os.path.join(task2_dir, f"{fname_base}_depth_scatter.png")
+
+            plot_title = (
+                f"Quantitative Depth Sizing | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
+                f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')}"
+            )
+            if hurdle_r2_val is not None and defect_r2_val is not None:
+                plot_title += f" | Hurdle R²: {hurdle_r2_val:.3f} (Defect R²: {defect_r2_val:.3f})"
 
             plot_depth_regression_maps(
                 true_depth_map=sub_depth,
                 pred_depth_map=pred_depth_map,
                 save_path=pred_depth_map_path,
-                title=f"Quantitative Depth Sizing | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
-                      f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')}",
+                title=plot_title,
                 r2=r2_val,
                 mae=mae_val,
                 rmse=rmse_val,
@@ -585,6 +626,8 @@ def evaluate_single_file(
                 "representation_gap": reg_benchmark.get("representation_gap", {}),
                 "defects_only": reg_benchmark_def.get("linear_probe", {}),
                 "hurdle_depth_protocol": hurdle_benchmark,
+                "hurdle_plate_r2": hurdle_r2_val,
+                "defect_only_r2": defect_r2_val,
                 "pred_depth_map_path": pred_depth_map_path,
                 "depth_scatter_path": depth_scatter_path,
             }
@@ -693,6 +736,8 @@ def evaluate_single_file(
         "mlp_2layer_f1": t1_mlp.get("f1_score"),
         "delta_auc": task1_res.get("representation_gap", {}).get("delta_auc_roc"),
         "depth_r2": t2_lp.get("r2_score"),
+        "hurdle_plate_r2": task2_res.get("hurdle_plate_r2"),
+        "defect_only_r2": task2_res.get("defect_only_r2"),
         "depth_mae_mm": t2_lp.get("mae_mm"),
         "depth_rmse_mm": t2_lp.get("rmse_mm"),
         "severity_macro_f1": t3_lp.get("macro_f1"),
@@ -718,10 +763,18 @@ def evaluate_single_file(
                 export_graph_interactive_html,
             )
 
+            # Gated volume to eliminate sound-metal ghost noise
+            v_sub = volume_3d[:min_Y, :min_X].copy()
+            if "prob_map" in locals() and prob_map is not None:
+                p_gate = np.clip((prob_map - 0.20) / 0.30, 0.0, 1.0)
+                v_gated = v_sub * p_gate[:, :, np.newaxis]
+            else:
+                v_gated = v_sub
+
             # 1. Multi-slice Orthogonal Visualization
             ortho_path = os.path.join(task6_dir, f"{fname_base}_3d_ortho_slices.png")
             plot_3d_ortho_slices(
-                volume_3d=volume_3d[:min_Y, :min_X],
+                volume_3d=v_gated,
                 mask_2d=sub_gt,
                 save_path=ortho_path,
                 title=f"3D Tomography: {fname_base}",
@@ -731,13 +784,13 @@ def evaluate_single_file(
             # 2. Interactive 3D HTML
             html_3d_path = os.path.join(task6_dir, f"{fname_base}_3d_tomography.html")
             export_3d_interactive_html(
-                volume_3d=volume_3d[:min_Y, :min_X],
+                volume_3d=v_gated,
                 save_path=html_3d_path,
                 title=f"3D PECT-JEPA Volumetric Tomography: {fname_base}",
             )
 
             # 3. 3D Defect Graph Network
-            graph_data = build_defect_graph(volume_3d[:min_Y, :min_X], threshold_percentile=95.0)
+            graph_data = build_defect_graph(v_gated, threshold_percentile=95.0)
 
             # 4. Quantitative Metrics
             crack_metrics = None

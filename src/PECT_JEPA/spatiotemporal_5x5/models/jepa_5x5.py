@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from ..configs.config import Spatiotemporal5x5Config, get_default_config_5x5
 from .tokenizer_5x5 import (
     DualScaleDiffusionTokenizer5x5,
+    UncrushedDiffusionTokenizer5x5,
     SpatialGridTokenizer5x5,
     DualDomainGridTokenizer5x5,
     DualDomainAttentionTokenizer5x5,
@@ -19,7 +20,12 @@ from .tokenizer_5x5 import (
 )
 from .context_encoder import ContextEncoder5x5
 from .target_encoder import TargetEncoder5x5
-from .predictor import Predictor5x5, OperatorDiffusionPredictor5x5, build_predictor_5x5
+from .predictor import (
+    Predictor5x5,
+    OperatorDiffusionPredictor5x5,
+    ContinuousHelmholtzPredictor5x5,
+    build_predictor_5x5,
+)
 from ..masking.cluster_mask import (
     build_masker_5x5,
     ContiguousClusterMasker5x5,
@@ -527,8 +533,16 @@ class PECT_JEPA_5x5(nn.Module):
             # 50 tokens: 0: Shallow/Surface diffusion scale, 1: Deep penetration scale
             e_surf = delta_H_tokens[:, 0, :].norm(dim=-1)  # Surface/near-surface
             e_deep = delta_H_tokens[:, 1, :].norm(dim=-1)  # Subsurface/deep
-            e_mid = 0.5 * (e_surf + e_deep)
-            V_depth = torch.stack([e_surf, e_mid, e_mid, e_deep], dim=-1)  # [B, 4]
+            # Physical continuous 3D depth decay across 4 thickness slices:
+            # Layer 0 (Near-surface, 0.25mm): 90% surf + 10% deep
+            # Layer 1 (Mid-shallow, 0.90mm): 65% surf + 35% deep
+            # Layer 2 (Mid-deep, 1.80mm): 35% surf + 65% deep
+            # Layer 3 (Deepest back-wall, 2.70mm): 10% surf + 90% deep
+            l0 = 0.90 * e_surf + 0.10 * e_deep
+            l1 = 0.65 * e_surf + 0.35 * e_deep
+            l2 = 0.35 * e_surf + 0.65 * e_deep
+            l3 = 0.10 * e_surf + 0.90 * e_deep
+            V_depth = torch.stack([l0, l1, l2, l3], dim=-1)  # [B, 4]
         else:
             e_mean = delta_H.norm(dim=-1)
             V_depth = e_mean.unsqueeze(-1).expand(-1, 4)
