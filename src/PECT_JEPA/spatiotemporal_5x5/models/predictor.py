@@ -907,6 +907,242 @@ class ContinuousHelmholtzPredictor5x5(Predictor5x5):
         return H_pred
 
 
+class AnisotropicDiffusionPredictor5x5(Predictor5x5):
+    """
+    Anisotropic Spatio-Diffusion Operator Predictor for 5x5 PECT-JEPA (EXP-20).
+
+    Unifies:
+    1. Continuous 3D analytical Helmholtz diffusion with strictly bounded thickness scale d_scale >= 1.0 mm.
+    2. Learnable lateral spatial anisotropy (alpha_x, alpha_y) modeling directional coil sensitivities (Bx != By).
+    3. Directional dipole projection head providing directional attention bias.
+    4. Uncrushed 28D harmonic dispersion and physical baseline propagation.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        depth: int = 2,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        num_freq_bins: int = 14,
+        gamma_init: float = 1.0,
+        alpha_init: float = 0.5,
+        alpha_x_init: float = 1.0,
+        alpha_y_init: float = 1.0,
+        d_scale_init: float = 1.5,
+        d_scale_min: float = 1.0,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
+    ):
+        super().__init__(
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+        )
+        self.num_freq_bins = num_freq_bins
+        self.spatial_topology = spatial_topology
+        self.star_radii = star_radii
+        self.d_scale_min = d_scale_min
+        self.op_embedding = DiffusionOperatorEmbedding(embed_dim=embed_dim)
+
+        # Context propagation projection
+        self.w_prop = nn.Linear(embed_dim, embed_dim)
+        self.norm_prop = nn.LayerNorm(embed_dim)
+
+        # Learnable physical coupling parameters
+        raw_gamma = math.log(math.exp(gamma_init) - 1.0) if gamma_init > 0 else 0.0
+        raw_alpha = math.log(math.exp(alpha_init) - 1.0) if alpha_init > 0 else 0.0
+        raw_ax = math.log(math.exp(alpha_x_init) - 1.0) if alpha_x_init > 0 else 0.0
+        raw_ay = math.log(math.exp(alpha_y_init) - 1.0) if alpha_y_init > 0 else 0.0
+        init_delta = max(d_scale_init - d_scale_min, 0.05)
+        raw_d_scale = math.log(math.exp(init_delta) - 1.0)
+
+        self.raw_gamma = nn.Parameter(torch.tensor(raw_gamma, dtype=torch.float32))
+        self.raw_alpha = nn.Parameter(torch.tensor(raw_alpha, dtype=torch.float32))
+        self.raw_alpha_x = nn.Parameter(torch.tensor(raw_ax, dtype=torch.float32))
+        self.raw_alpha_y = nn.Parameter(torch.tensor(raw_ay, dtype=torch.float32))
+        self.raw_d_scale = nn.Parameter(torch.tensor(raw_d_scale, dtype=torch.float32))
+
+        # Directional dipole MLP: projects 2D normalized direction into attention bias
+        self.dir_mlp = nn.Sequential(
+            nn.Linear(2, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+
+        # Dynamic defect scattering perturbation head
+        self.residual_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        self.last_h_base: Optional[torch.Tensor] = None
+        self.last_delta_pred: Optional[torch.Tensor] = None
+
+        self._register_anisotropic_tables()
+
+    def _register_anisotropic_tables(self):
+        try:
+            offsets = get_spatial_topology_offsets(
+                topology=self.spatial_topology,
+                star_radii=self.star_radii
+            )
+        except Exception:
+            offsets = np.array([(float(k // 5), float(k % 5)) for k in range(25)], dtype=np.float32)
+
+        # 50 tokens: 25 spatial points * 2 diffusion scales
+        coords_xy_50 = []
+        depth_z_50 = []
+        for k in range(50):
+            sp = k // 2
+            coords_xy_50.append((float(offsets[sp, 0]), float(offsets[sp, 1])))
+            depth_z_50.append(float(k % 2))
+
+        coords_xy_50_t = torch.tensor(coords_xy_50, dtype=torch.float32)  # [50, 2] in mm
+        depth_z_50_t = torch.tensor(depth_z_50, dtype=torch.float32)      # [50]
+
+        diff_xy_50 = coords_xy_50_t.unsqueeze(1) - coords_xy_50_t.unsqueeze(0)  # [50, 50, 2]
+        dx_sq_50 = diff_xy_50[:, :, 0] ** 2                                      # [50, 50]
+        dy_sq_50 = diff_xy_50[:, :, 1] ** 2                                      # [50, 50]
+        diff_z_50 = depth_z_50_t.unsqueeze(1) - depth_z_50_t.unsqueeze(0)       # [50, 50]
+        dz_sq_50 = diff_z_50 ** 2                                               # [50, 50]
+
+        self.register_buffer("diff_xy_50", diff_xy_50, persistent=False)
+        self.register_buffer("dx_sq_50", dx_sq_50, persistent=False)
+        self.register_buffer("dy_sq_50", dy_sq_50, persistent=False)
+        self.register_buffer("dz_sq_50", dz_sq_50, persistent=False)
+
+        # 25 tokens: 25 spatial points * 1 scale (z=0)
+        coords_25_t = torch.from_numpy(offsets).float()  # [25, 2]
+        diff_xy_25 = coords_25_t.unsqueeze(1) - coords_25_t.unsqueeze(0)
+        dx_sq_25 = diff_xy_25[:, :, 0] ** 2
+        dy_sq_25 = diff_xy_25[:, :, 1] ** 2
+        dz_sq_25 = torch.zeros(25, 25, dtype=torch.float32)
+
+        self.register_buffer("diff_xy_25", diff_xy_25, persistent=False)
+        self.register_buffer("dx_sq_25", dx_sq_25, persistent=False)
+        self.register_buffer("dy_sq_25", dy_sq_25, persistent=False)
+        self.register_buffer("dz_sq_25", dz_sq_25, persistent=False)
+
+    def forward(
+        self,
+        H_context: torch.Tensor,
+        target_pos: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+        freq_condition: Optional[torch.Tensor] = None,
+        diffusion_operator: Optional[torch.Tensor] = None,
+        return_residual: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        B, N_tgt, D = target_pos.shape
+        device = target_pos.device
+
+        # 1. Operator Query Condition
+        if diffusion_operator is None:
+            if freq_condition is not None:
+                if freq_condition.dtype in (torch.int32, torch.int64):
+                    freq_norm = freq_condition.float() / float(self.num_freq_bins)
+                else:
+                    freq_norm = freq_condition.float()
+                op_cond = self.op_embedding(freq_norm)
+            else:
+                op_cond = self.op_embedding.default_op
+        else:
+            op_cond = diffusion_operator
+
+        # 2. Compute 3D Anisotropic Diffusion Propagator
+        gamma = F.softplus(self.raw_gamma)
+        alpha = F.softplus(self.raw_alpha)
+        alpha_x = F.softplus(self.raw_alpha_x) + 0.1
+        alpha_y = F.softplus(self.raw_alpha_y) + 0.1
+        d_scale = F.softplus(self.raw_d_scale) + self.d_scale_min
+
+        if freq_condition is not None:
+            if freq_condition.dtype in (torch.int32, torch.int64):
+                f_val = freq_condition.float() / float(self.num_freq_bins)
+            else:
+                f_val = freq_condition.float()
+            sqrt_freq = torch.sqrt(f_val.clamp(min=1e-4)).view(B, 1, 1).to(device)
+        else:
+            sqrt_freq = torch.ones(B, 1, 1, device=device)
+
+        eff_gamma = gamma * sqrt_freq  # [B, 1, 1]
+
+        if context_indices is not None and target_indices is not None:
+            max_idx = max(int(target_indices.max().item()), int(context_indices.max().item()))
+            if max_idx >= 25:
+                diff_xy = self.diff_xy_50
+                dx_sq = self.dx_sq_50
+                dy_sq = self.dy_sq_50
+                dz_sq = self.dz_sq_50
+            else:
+                diff_xy = self.diff_xy_25
+                dx_sq = self.dx_sq_25
+                dy_sq = self.dy_sq_25
+                dz_sq = self.dz_sq_25
+
+            t_idx = target_indices.to(device).unsqueeze(-1)  # [B, N_tgt, 1]
+            c_idx = context_indices.to(device).unsqueeze(1)   # [B, 1, N_ctx]
+
+            dx2 = dx_sq[t_idx, c_idx]                        # [B, N_tgt, N_ctx]
+            dy2 = dy_sq[t_idx, c_idx]                        # [B, N_tgt, N_ctx]
+            dz2 = dz_sq[t_idx, c_idx]                        # [B, N_tgt, N_ctx]
+            d_xy = diff_xy[t_idx, c_idx]                     # [B, N_tgt, N_ctx, 2]
+
+            # Anisotropic Distance Metric R_A
+            R_sq = alpha_x * dx2 + alpha_y * dy2 + dz2 * (d_scale ** 2)
+            R = torch.sqrt(R_sq + 1e-4)                      # [B, N_tgt, N_ctx]
+
+            # Continuous Green's Helmholtz Kernel
+            log_G = - eff_gamma * R - torch.log(R + 0.1)     # [B, N_tgt, N_ctx]
+            weights = F.softmax(log_G, dim=-1)                # [B, N_tgt, N_ctx]
+
+            # Context Propagation
+            H_ctx_proj = self.norm_prop(self.w_prop(H_context))  # [B, N_ctx, D]
+            H_base = torch.bmm(weights, H_ctx_proj)             # [B, N_tgt, D]
+
+            # Directional dipole attention bias
+            u_dir = torch.cat([
+                (torch.sqrt(alpha_x) * d_xy[..., 0:1]) / (R.unsqueeze(-1) + 1e-4),
+                (torch.sqrt(alpha_y) * d_xy[..., 1:2]) / (R.unsqueeze(-1) + 1e-4),
+            ], dim=-1)                                       # [B, N_tgt, N_ctx, 2]
+            M_dir = self.dir_mlp(u_dir).squeeze(-1)          # [B, N_tgt, N_ctx]
+
+            # Cross-Attention Attention Bias
+            M_diff = - eff_gamma * R - alpha * torch.log(R + 0.1) + M_dir
+            attn_bias = M_diff.unsqueeze(1)                  # [B, 1, N_tgt, N_ctx]
+        else:
+            H_ctx_mean = H_context.mean(dim=1, keepdim=True).expand(-1, N_tgt, -1)
+            H_base = self.norm_prop(self.w_prop(H_ctx_mean))
+            attn_bias = None
+
+        # 3. Target Query Formulation
+        queries = H_base + self.mask_token.expand(B, N_tgt, -1) + target_pos
+        if op_cond is not None:
+            if op_cond.ndim == 2:
+                op_cond = op_cond.unsqueeze(1)
+            queries = queries + op_cond
+
+        # 4. Predictor Transformer Layers
+        q = queries
+        for block in self.blocks:
+            q = block(target_queries=q, H_context=H_context, attn_bias=attn_bias)
+
+        # 5. Dynamic Perturbation Head
+        delta_pred = self.residual_head(q)                   # [B, N_tgt, D]
+        H_pred = H_base + delta_pred                         # [B, N_tgt, D]
+
+        self.last_h_base = H_base
+        self.last_delta_pred = delta_pred
+
+        if return_residual:
+            return H_pred, delta_pred, H_base
+        return H_pred
+
+
 def build_predictor_5x5(config) -> nn.Module:
     """
     Factory function to construct Predictor based on config.
@@ -916,7 +1152,24 @@ def build_predictor_5x5(config) -> nn.Module:
     spatial_topology = getattr(config, "spatial_topology", "concentric_star")
     star_radii = getattr(config, "star_radii", (1, 3, 7))
 
-    if predictor_type in ("continuous_helmholtz", "helmholtz", "helmholtz_diffusion"):
+    if predictor_type in ("anisotropic_diffusion", "anisotropic_helmholtz", "anisotropic"):
+        return AnisotropicDiffusionPredictor5x5(
+            embed_dim=config.embed_dim,
+            depth=config.predictor_depth,
+            num_heads=config.predictor_heads,
+            mlp_ratio=config.mlp_ratio,
+            dropout=config.dropout,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
+            alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
+            alpha_x_init=getattr(config, "diffusion_alpha_x_init", 1.0),
+            alpha_y_init=getattr(config, "diffusion_alpha_y_init", 1.0),
+            d_scale_init=getattr(config, "diffusion_d_scale_init", 1.5),
+            d_scale_min=getattr(config, "diffusion_d_scale_min", 1.0),
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
+        )
+    elif predictor_type in ("continuous_helmholtz", "helmholtz", "helmholtz_diffusion"):
         return ContinuousHelmholtzPredictor5x5(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,

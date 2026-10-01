@@ -65,6 +65,8 @@ class Spatiotemporal5x5Config:
     diffusion_gamma_init: float = 1.0   # Spatial diffusion attenuation rate gamma for Green's attention bias
     diffusion_alpha_init: float = 0.5   # Geometric dispersion scale alpha for Parabolic Green's attention bias
     diffusion_beta_init: float = 0.5    # Cross-scale depth barrier beta for legacy operator diffusion
+    diffusion_alpha_x_init: float = 1.0 # EXP-20: Lateral X anisotropy init
+    diffusion_alpha_y_init: float = 1.0 # EXP-20: Lateral Y anisotropy init
     diffusion_d_scale_init: float = 1.5 # EXP-18/19: Physical depth scale init in mm for continuous 3D Helmholtz kernel
     diffusion_d_scale_min: float = 1.0  # EXP-19: Physical depth scale lower bound in mm (prevents shortcut collapse)
     mlp_ratio: float = 4.0

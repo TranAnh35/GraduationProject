@@ -137,8 +137,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cst_mask_mode", type=str, default="cluster", choices=["cluster", "surface_to_bulk", "surface_to_depth", "causal", "random"],
                    help="Masking partition mode: 'cluster' (EXP-19 symmetric dual-cluster, default), 'surface_to_bulk', 'surface_to_depth', 'causal', or 'random'")
     p.add_argument("--predictor_type", type=str, default="continuous_helmholtz",
-                   choices=["continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
-                   help="Predictor architecture: 'continuous_helmholtz' (EXP-18/19: 3D Continuous Helmholtz Diffusion World Model, default), 'operator_diffusion', etc.")
+                   choices=["anisotropic_diffusion", "continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
+                   help="Predictor architecture: 'anisotropic_diffusion' (EXP-20: Anisotropic Spatio-Diffusion Operator JEPA), 'continuous_helmholtz', etc.")
     p.add_argument("--use_target_ema", type=lambda v: v.lower() == "true", default=False,
                    help="Use EMA target encoder (default: False for Single Shared Encoder + Stop-Gradient Target)")
     p.add_argument("--adaptive_disturbance_weight", type=float, default=0.0,
@@ -151,6 +151,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Initial geometric dispersion scale alpha for Parabolic Green's attention bias (default: 0.5)")
     p.add_argument("--diffusion_beta_init", type=float, default=0.5,
                    help="Initial cross-scale vertical diffusion barrier beta for legacy operator diffusion (default: 0.5)")
+    p.add_argument("--diffusion_alpha_x_init", type=float, default=1.0,
+                   help="Initial lateral X anisotropy coefficient alpha_x for Anisotropic Diffusion Predictor (EXP-20, default: 1.0)")
+    p.add_argument("--diffusion_alpha_y_init", type=float, default=1.0,
+                   help="Initial lateral Y anisotropy coefficient alpha_y for Anisotropic Diffusion Predictor (EXP-20, default: 1.0)")
     p.add_argument("--diffusion_d_scale_init", type=float, default=1.5,
                    help="Physical depth scale init in mm for continuous 3D Helmholtz kernel (default: 1.5)")
     p.add_argument("--diffusion_d_scale_min", type=float, default=1.0,
@@ -305,6 +309,8 @@ def main():
         diffusion_gamma_init=args.diffusion_gamma_init,
         diffusion_alpha_init=args.diffusion_alpha_init,
         diffusion_beta_init=args.diffusion_beta_init,
+        diffusion_alpha_x_init=args.diffusion_alpha_x_init,
+        diffusion_alpha_y_init=args.diffusion_alpha_y_init,
         diffusion_d_scale_init=args.diffusion_d_scale_init,
         diffusion_d_scale_min=args.diffusion_d_scale_min,
         fluct_weight=args.fluct_weight,
@@ -523,6 +529,13 @@ def main():
             best_ckpt = os.path.join(config.save_dir, "latest_model_5x5.pt")
 
         if os.path.isfile(best_ckpt):
+            # Clean up training objects to free RAM for evaluation
+            del trainer, model, train_loader, val_loader
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             from .evaluate import main as eval_main
             eval_out_dir = os.path.join(logger.run_dir, "evaluation_results")
             eval_args = [

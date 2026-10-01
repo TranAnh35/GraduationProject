@@ -33,7 +33,7 @@ def plot_probability_heatmap(
     save_path: str,
     title: str = "Defect Probability Heatmap",
     cbar_label: str = "Defect Probability P(Y=1 | z)",
-    cmap: str = "inferno",
+    cmap: str = "jet",
     dpi: int = 150,
 ) -> None:
     """
@@ -297,3 +297,94 @@ def plot_liftoff_cka_heatmap(
     fig.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_defect_contours_and_iou(
+    prob_map: np.ndarray,
+    gt_mask: np.ndarray,
+    save_path: str,
+    threshold: Optional[float] = None,
+    title: str = "Defect Segmentation Contours & IoU",
+    dpi: int = 150,
+) -> Dict[str, float]:
+    """
+    Plots C-scan with dual contour overlay:
+    - Green solid contour: Ground-truth CAD defect boundary
+    - Magenta dashed contour: Predicted defect boundary (at optimal threshold)
+    Calculates and returns IoU (Jaccard Index), Dice coefficient (F1), Precision, Recall.
+    """
+    from sklearn.metrics import jaccard_score, f1_score, precision_score, recall_score
+    from matplotlib.lines import Line2D
+
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    sY, sX = prob_map.shape
+    p_disp = np.clip(prob_map, 0.0, 1.0)
+
+    # Compute optimal threshold over F1 if not provided
+    valid = (gt_mask.reshape(-1) >= 0)
+    y_true = (gt_mask.reshape(-1)[valid] == 1).astype(int)
+    p_val = p_disp.reshape(-1)[valid]
+
+    if len(np.unique(y_true)) > 1:
+        if threshold is not None:
+            best_tau = float(threshold)
+        else:
+            best_dice = -1.0
+            best_tau = 0.5
+            for tau in np.linspace(0.2, 0.95, 31):
+                d = f1_score(y_true, (p_val >= tau).astype(int), zero_division=0)
+                if d > best_dice:
+                    best_dice = d
+                    best_tau = float(tau)
+
+        y_pred = (p_val >= best_tau).astype(int)
+        iou = float(jaccard_score(y_true, y_pred, zero_division=0))
+        dice = float(f1_score(y_true, y_pred, zero_division=0))
+        prec = float(precision_score(y_true, y_pred, zero_division=0))
+        rec = float(recall_score(y_true, y_pred, zero_division=0))
+    else:
+        best_tau = 0.5
+        iou, dice, prec, rec = 0.0, 0.0, 0.0, 0.0
+
+    pred_bin_map = (p_disp >= best_tau).astype(int)
+    gt_core_map = (gt_mask == 1).astype(int)
+
+    fig, ax = plt.subplots(figsize=(7, 6), dpi=dpi)
+    im = ax.imshow(p_disp, cmap="jet", aspect="equal", origin="lower", vmin=0.0, vmax=1.0)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Defect Probability P(Y=1 | z)", fontsize=10)
+
+    # 1. Overlay CAD true contour (Green solid line)
+    if np.sum(gt_core_map) > 0:
+        ax.contour(gt_core_map, levels=[0.5], colors=["#00ff00"], linewidths=2.0)
+
+    # 2. Overlay Predicted defect contour (Magenta dashed line)
+    if np.sum(pred_bin_map) > 0:
+        ax.contour(pred_bin_map, levels=[0.5], colors=["#ff0055"], linewidths=2.0, linestyles="--")
+
+    # Legend
+    legend_elements = [
+        Line2D([0], [0], color="#00ff00", lw=2, label="CAD Ground-Truth Contour"),
+        Line2D([0], [0], color="#ff0055", lw=2, linestyle="--", label=f"Predicted Contour (tau={best_tau:.2f})"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right", fontsize=8, framealpha=0.85)
+
+    full_title = f"{title}\nIoU: {iou*100:.1f}% | Dice (F1): {dice*100:.1f}% | Prec: {prec*100:.1f}% | Rec: {rec*100:.1f}%"
+    ax.set_title(full_title, fontsize=10, fontweight="bold", pad=10)
+    ax.set_xlabel("Scan X (pixels)", fontsize=9)
+    ax.set_ylabel("Scan Y (pixels)", fontsize=9)
+    fig.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "iou": iou,
+        "dice": dice,
+        "precision": prec,
+        "recall": rec,
+        "optimal_threshold": best_tau,
+        "contour_plot_path": save_path,
+    }
+

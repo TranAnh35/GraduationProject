@@ -424,6 +424,40 @@ class GroundTruthManager:
         cr = self.default_crop["crop_right"]
         return depth_nominal[ct : 300 - cb, cl : 300 - cr].copy()
 
+    def generate_size_map(
+        self,
+        specimen: str,
+        mode: str = "diameter",
+    ) -> np.ndarray:
+        """
+        Generates continuous physical defect flaw size map [270, 270].
+        Mode:
+          - 'diameter': flaw diameter in mm (3.0 - 14.0 mm). Sound metal = 0.0 mm.
+          - 'area': flaw cross-sectional area in mm^2 (pi * (d/2)^2). Sound metal = 0.0 mm^2.
+        Valid and physically well-posed across all three specimens (Corrosion, Rivet, Mixed).
+        """
+        spec_key = self.canonical_specimen_key(specimen)
+        sY, sX = 300, 300
+        size_nominal = np.zeros((sY, sX), dtype=np.float32)
+        Y, X = np.ogrid[:sY, :sX]
+
+        features = self.cad_specs.get(spec_key, {}).get("features", [])
+        for feat in features:
+            diam = feat.get("diameter")
+            if diam is not None and feat.get("kind") != "rivet only":
+                cx = feat.get("corrosionX") if feat.get("corrosionX") is not None else feat.get("x")
+                cy = feat.get("corrosionY") if feat.get("corrosionY") is not None else feat.get("y")
+                if cx is not None and cy is not None:
+                    r = diam / 2.0
+                    val = float(diam) if mode == "diameter" else float(np.pi * (r ** 2))
+                    size_nominal[(X - cx) ** 2 + (Y - cy) ** 2 <= r ** 2] = val
+
+        ct = self.default_crop["crop_top"]
+        cb = self.default_crop["crop_bottom"]
+        cl = self.default_crop["crop_left"]
+        cr = self.default_crop["crop_right"]
+        return size_nominal[ct : 300 - cb, cl : 300 - cr].copy()
+
     def generate_severity_mask(
         self,
         specimen: str,

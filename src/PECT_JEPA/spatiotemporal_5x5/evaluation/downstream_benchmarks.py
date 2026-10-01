@@ -32,6 +32,9 @@ from sklearn.metrics import (
     r2_score,
     mean_absolute_error,
     mean_squared_error,
+    jaccard_score,
+    precision_score,
+    recall_score,
 )
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
@@ -165,6 +168,66 @@ class DownstreamBenchmarkSuite:
                 "delta_average_precision": round(float(m_ap_m - l_ap_m), 4),
                 "delta_f1": round(float(m_f1_m - l_f1_m), 4),
             },
+        }
+
+    # =========================================================================
+    # Task 1b: Defect Segmentation Boundary Contours & IoU (Jaccard Index)
+    # =========================================================================
+    def benchmark_segmentation_iou(
+        self,
+        prob_map: np.ndarray,   # [sY, sX]
+        gt_mask: np.ndarray,    # [sY, sX] (1 = defect, 0 = sound, -1 = ignore)
+        threshold: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Calculates Intersection over Union (IoU / Jaccard Index) and Dice coefficient
+        between the thresholded defect probability map and the CAD ground truth mask.
+        Optimizes threshold over F1 if threshold is None.
+        """
+        flat_p = prob_map.reshape(-1)
+        flat_gt = gt_mask.reshape(-1)
+        valid = (flat_gt >= 0)
+
+        y_true = (flat_gt[valid] == 1).astype(int)
+        p_val = flat_p[valid]
+
+        if len(np.unique(y_true)) < 2:
+            return {
+                "iou": 0.0,
+                "dice": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "optimal_threshold": 0.5,
+            }
+
+        if threshold is not None:
+            best_tau = float(threshold)
+            y_pred = (p_val >= best_tau).astype(int)
+            best_iou = float(jaccard_score(y_true, y_pred, zero_division=0))
+            best_dice = float(f1_score(y_true, y_pred, zero_division=0))
+            prec = float(precision_score(y_true, y_pred, zero_division=0))
+            rec = float(recall_score(y_true, y_pred, zero_division=0))
+        else:
+            best_dice = -1.0
+            best_iou = 0.0
+            best_tau = 0.5
+            prec, rec = 0.0, 0.0
+            for tau in np.linspace(0.2, 0.95, 31):
+                c_pred = (p_val >= tau).astype(int)
+                d = f1_score(y_true, c_pred, zero_division=0)
+                if d > best_dice:
+                    best_dice = float(d)
+                    best_tau = float(tau)
+                    best_iou = float(jaccard_score(y_true, c_pred, zero_division=0))
+                    prec = float(precision_score(y_true, c_pred, zero_division=0))
+                    rec = float(recall_score(y_true, c_pred, zero_division=0))
+
+        return {
+            "iou": round(best_iou, 4),
+            "dice": round(best_dice, 4),
+            "precision": round(prec, 4),
+            "recall": round(rec, 4),
+            "optimal_threshold": round(best_tau, 4),
         }
 
     # =========================================================================
