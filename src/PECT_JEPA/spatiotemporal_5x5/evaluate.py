@@ -620,7 +620,10 @@ def evaluate_single_file(
                             best_score = score
                             best_tau = float(c_tau)
 
-                    pred_depth_flat = np.where(p_all >= best_tau, d_cond_all, 0.0)
+                    from src.PECT_JEPA.spatiotemporal_5x5.evaluation.visualizations import apply_spatial_coherence_filter
+                    p_gate_bin = (p_all >= best_tau).reshape(min_Y, min_X).astype(int)
+                    p_gate_clean = apply_spatial_coherence_filter(p_gate_bin, min_area=8)
+                    pred_depth_flat = np.where(p_gate_clean.reshape(-1) == 1, d_cond_all, 0.0)
                 else:
                     pred_depth_flat = np.clip(ridge.predict(scaler.transform(flat_feats)), 0.0, None)
 

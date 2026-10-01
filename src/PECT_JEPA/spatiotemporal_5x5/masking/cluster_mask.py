@@ -555,7 +555,7 @@ def build_masker_5x5(config):
             use_mask_bank=use_mask_bank,
             bank_size=bank_size,
         )
-    elif tokenizer_type in ("dual_scale_diffusion", "dual_scale", "uncrushed_diffusion") and masker_type != "contiguous_cluster":
+    elif tokenizer_type in ("dual_scale_diffusion", "dual_scale", "uncrushed_diffusion", "snr_tapered_diffusion") and masker_type != "contiguous_cluster":
         return SpatiotemporalDiffusionMasker5x5(
             grid_size=config.grid_size,
             num_spatial_cluster=getattr(config, "num_spatial_cluster", 10),

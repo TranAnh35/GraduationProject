@@ -523,6 +523,8 @@ class UncrushedDiffusionTokenizer5x5(nn.Module):
         num_freq_bins: int = 14,
         pos_embed_type: str = "learnable_2d",
         dropout: float = 0.0,
+        use_snr_tapering: bool = True,
+        phase_noise_floor: float = 0.02,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -531,6 +533,8 @@ class UncrushedDiffusionTokenizer5x5(nn.Module):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+        self.use_snr_tapering = use_snr_tapering
+        self.phase_noise_floor = phase_noise_floor
 
         # 1. Multi-scale 1D Temporal Conv Filterbank for transient dynamics
         d_sub = embed_dim // 3
@@ -603,8 +607,17 @@ class UncrushedDiffusionTokenizer5x5(nn.Module):
         # 2. Uncrushed Spectral Dispersion Features
         x_fp32 = x_flat.float()
         X_fft = torch.fft.rfft(x_fp32, dim=-1)[:, 1:self.num_freq_bins + 1]  # [B*25, K]
-        mags = torch.log1p(torch.abs(X_fft))
-        phases = torch.angle(X_fft) / torch.pi  # Normalized to [-1, 1]
+        X_abs = torch.abs(X_fft)
+        mags = torch.log1p(X_abs)
+        phases_raw = torch.angle(X_fft) / torch.pi  # Normalized to [-1, 1]
+
+        if getattr(self, "use_snr_tapering", True):
+            # Dynamic magnitude-aware SNR gate: suppresses undefined phase noise in low-energy frequency bins
+            peak_mag = torch.amax(X_abs, dim=-1, keepdim=True).clamp(min=1e-6)
+            snr_gate = torch.tanh(X_abs / (getattr(self, "phase_noise_floor", 0.02) * peak_mag))
+            phases = phases_raw * snr_gate
+        else:
+            phases = phases_raw
 
         # Deep bins: 0 .. split_bin (low-frequency penetration)
         deep_phase = phases[:, :self.split_bin]
@@ -1055,7 +1068,7 @@ def build_tokenizer_5x5(config) -> nn.Module:
             pos_embed_type=config.pos_embed_type,
             dropout=config.dropout,
         )
-    elif tokenizer_type in ("uncrushed_diffusion", "continuous_diffusion"):
+    elif tokenizer_type in ("uncrushed_diffusion", "continuous_diffusion", "snr_tapered_diffusion"):
         return UncrushedDiffusionTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
@@ -1063,6 +1076,8 @@ def build_tokenizer_5x5(config) -> nn.Module:
             num_freq_bins=getattr(config, "num_freq_bins", 14),
             pos_embed_type=config.pos_embed_type,
             dropout=config.dropout,
+            use_snr_tapering=getattr(config, "use_snr_tapering", True),
+            phase_noise_floor=getattr(config, "phase_noise_floor", 0.02),
         )
     elif tokenizer_type in ("dual_scale_diffusion", "dual_scale"):
         return DualScaleDiffusionTokenizer5x5(

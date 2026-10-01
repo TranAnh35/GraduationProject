@@ -125,8 +125,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--norm_floor_target", type=float, default=1.0,
                    help="Minimum target L2 norm of representations (default: 1.0)")
     p.add_argument("--tokenizer_type", type=str, default="uncrushed_diffusion",
-                   choices=["uncrushed_diffusion", "dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'uncrushed_diffusion' (EXP-18: 50 tokens, uncrushed harmonic dispersion, default), 'dual_scale_diffusion', etc.")
+                   choices=["uncrushed_diffusion", "snr_tapered_diffusion", "dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'uncrushed_diffusion' (EXP-18: 50 tokens, uncrushed harmonic dispersion, default), 'snr_tapered_diffusion' (EXP-21), 'dual_scale_diffusion', etc.")
     p.add_argument("--num_scales", type=int, default=4,
                    help="Number of physical skin-depth scales for spatio_spectral tokenizer (default: 4)")
     p.add_argument("--masker_type", type=str, default="auto",

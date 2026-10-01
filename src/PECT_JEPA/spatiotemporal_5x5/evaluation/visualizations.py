@@ -299,19 +299,42 @@ def plot_liftoff_cka_heatmap(
     plt.close(fig)
 
 
+def apply_spatial_coherence_filter(bin_map: np.ndarray, min_area: int = 8) -> np.ndarray:
+    """
+    Applies spatial physical coherence filtering:
+    1. Morphological closing (3x3 kernel) to bridge coil footprint penumbra gaps.
+    2. Connected-component labeling to remove isolated noise spikes (< min_area pixels).
+    """
+    if np.sum(bin_map) == 0 or min_area <= 1:
+        return bin_map
+    import scipy.ndimage as ndi
+    closed = ndi.binary_closing(bin_map, structure=np.ones((3, 3)))
+    labeled, num_features = ndi.label(closed)
+    if num_features == 0:
+        return np.zeros_like(bin_map)
+    sizes = ndi.sum(closed, labeled, range(1, num_features + 1))
+    cleaned = np.zeros_like(bin_map)
+    for i, s in enumerate(sizes, 1):
+        if s >= min_area:
+            cleaned[labeled == i] = 1
+    return cleaned
+
+
 def plot_defect_contours_and_iou(
     prob_map: np.ndarray,
     gt_mask: np.ndarray,
     save_path: str,
     threshold: Optional[float] = None,
+    min_defect_area: int = 8,
     title: str = "Defect Segmentation Contours & IoU",
     dpi: int = 150,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """
     Plots C-scan with dual contour overlay:
     - Green solid contour: Ground-truth CAD defect boundary
-    - Magenta dashed contour: Predicted defect boundary (at optimal threshold)
-    Calculates and returns IoU (Jaccard Index), Dice coefficient (F1), Precision, Recall.
+    - Magenta dashed contour: Spatially coherent predicted defect boundary
+    - Thin cyan dotted contour: Raw per-pixel thresholded boundary (if noise present)
+    Calculates and returns both raw point-wise and physically filtered IoU, Dice, Precision, Recall.
     """
     from sklearn.metrics import jaccard_score, f1_score, precision_score, recall_score
     from matplotlib.lines import Line2D
@@ -339,16 +362,36 @@ def plot_defect_contours_and_iou(
                     best_dice = d
                     best_tau = float(tau)
 
-        y_pred = (p_val >= best_tau).astype(int)
-        iou = float(jaccard_score(y_true, y_pred, zero_division=0))
-        dice = float(f1_score(y_true, y_pred, zero_division=0))
-        prec = float(precision_score(y_true, y_pred, zero_division=0))
-        rec = float(recall_score(y_true, y_pred, zero_division=0))
+        # Raw point-wise predictions
+        y_pred_raw = (p_val >= best_tau).astype(int)
+        raw_iou = float(jaccard_score(y_true, y_pred_raw, zero_division=0))
+        raw_dice = float(f1_score(y_true, y_pred_raw, zero_division=0))
+        raw_prec = float(precision_score(y_true, y_pred_raw, zero_division=0))
+        raw_rec = float(recall_score(y_true, y_pred_raw, zero_division=0))
+
+        # Full 2D map for spatial filtering
+        raw_bin_map = (p_disp >= best_tau).astype(int)
+        clean_bin_map = apply_spatial_coherence_filter(raw_bin_map, min_area=min_defect_area)
+
+        # Clean predictions evaluated on valid pixels
+        y_pred_clean = clean_bin_map.reshape(-1)[valid]
+        clean_iou = float(jaccard_score(y_true, y_pred_clean, zero_division=0))
+        clean_dice = float(f1_score(y_true, y_pred_clean, zero_division=0))
+        clean_prec = float(precision_score(y_true, y_pred_clean, zero_division=0))
+        clean_rec = float(recall_score(y_true, y_pred_clean, zero_division=0))
+
+        # Sound metal false positive rate
+        sound_mask = (y_true == 0)
+        sound_fpr_raw = float(np.mean(y_pred_raw[sound_mask])) if np.sum(sound_mask) > 0 else 0.0
+        sound_fpr_clean = float(np.mean(y_pred_clean[sound_mask])) if np.sum(sound_mask) > 0 else 0.0
     else:
         best_tau = 0.5
-        iou, dice, prec, rec = 0.0, 0.0, 0.0, 0.0
+        raw_iou, raw_dice, raw_prec, raw_rec = 0.0, 0.0, 0.0, 0.0
+        clean_iou, clean_dice, clean_prec, clean_rec = 0.0, 0.0, 0.0, 0.0
+        sound_fpr_raw, sound_fpr_clean = 0.0, 0.0
+        raw_bin_map = np.zeros_like(p_disp, dtype=int)
+        clean_bin_map = np.zeros_like(p_disp, dtype=int)
 
-    pred_bin_map = (p_disp >= best_tau).astype(int)
     gt_core_map = (gt_mask == 1).astype(int)
 
     fig, ax = plt.subplots(figsize=(7, 6), dpi=dpi)
@@ -360,18 +403,23 @@ def plot_defect_contours_and_iou(
     if np.sum(gt_core_map) > 0:
         ax.contour(gt_core_map, levels=[0.5], colors=["#00ff00"], linewidths=2.0)
 
-    # 2. Overlay Predicted defect contour (Magenta dashed line)
-    if np.sum(pred_bin_map) > 0:
-        ax.contour(pred_bin_map, levels=[0.5], colors=["#ff0055"], linewidths=2.0, linestyles="--")
+    # 2. Overlay Clean Predicted defect contour (Magenta dashed line)
+    if np.sum(clean_bin_map) > 0:
+        ax.contour(clean_bin_map, levels=[0.5], colors=["#ff0055"], linewidths=2.0, linestyles="--")
 
     # Legend
     legend_elements = [
         Line2D([0], [0], color="#00ff00", lw=2, label="CAD Ground-Truth Contour"),
-        Line2D([0], [0], color="#ff0055", lw=2, linestyle="--", label=f"Predicted Contour (tau={best_tau:.2f})"),
+        Line2D([0], [0], color="#ff0055", lw=2, linestyle="--", label=f"Predicted Coherent Contour (tau={best_tau:.2f})"),
     ]
     ax.legend(handles=legend_elements, loc="upper right", fontsize=8, framealpha=0.85)
 
-    full_title = f"{title}\nIoU: {iou*100:.1f}% | Dice (F1): {dice*100:.1f}% | Prec: {prec*100:.1f}% | Rec: {rec*100:.1f}%"
+    full_title = (
+        f"{title}\n"
+        f"IoU: Clean={clean_iou*100:.1f}% (Raw={raw_iou*100:.1f}%) | "
+        f"Prec: Clean={clean_prec*100:.1f}% (Raw={raw_prec*100:.1f}%) | "
+        f"Rec: {clean_rec*100:.1f}%"
+    )
     ax.set_title(full_title, fontsize=10, fontweight="bold", pad=10)
     ax.set_xlabel("Scan X (pixels)", fontsize=9)
     ax.set_ylabel("Scan Y (pixels)", fontsize=9)
@@ -380,11 +428,19 @@ def plot_defect_contours_and_iou(
     plt.close(fig)
 
     return {
-        "iou": iou,
-        "dice": dice,
-        "precision": prec,
-        "recall": rec,
+        "iou": clean_iou,
+        "dice": clean_dice,
+        "precision": clean_prec,
+        "recall": clean_rec,
+        "raw_iou": raw_iou,
+        "raw_dice": raw_dice,
+        "raw_precision": raw_prec,
+        "raw_recall": raw_rec,
+        "sound_metal_fpr_raw": sound_fpr_raw,
+        "sound_metal_fpr_clean": sound_fpr_clean,
         "optimal_threshold": best_tau,
+        "min_defect_area": min_defect_area,
         "contour_plot_path": save_path,
     }
+
 
