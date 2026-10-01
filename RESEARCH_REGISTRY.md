@@ -661,3 +661,52 @@ This document permanently tracks all completed, rejected, and active research hy
   2. *Two-Stage Hurdle Zero-Inflation Sensitivity*: On true defects ($y > 0$), conditional sizing achieved $R^2 = 0.9384$ and $61.1\,\mu\text{m}$ MAE. However, in compound hurdle decoding $y_{\text{hurdle}} = \mathbb{I}(p \ge \tau) \hat{y}$, an $85\%$ AUC gate misclassifies $\approx 1.5\%$ of 8,000 sound pixels ($120$ false positives). Assigning each false positive an average flaw depth ($0.5\text{ mm}$) adds $120 \times 0.25 = 30.0$ to the squared error, completely exceeding the plate variance $\text{Var}(y) \approx 0.02$, proving why single-stage probes outperform hard hurdle gating on noisy OOD plates.
   3. *Actionable Guideline for EXP-19*: Symmetric dual-cluster masking (masking both shallow and deep on clusters) must be restored to eliminate the co-located copying shortcut while incorporating uncrushed dispersion and bounded $d_{\text{scale}} \ge 1.0\text{ mm}$.
 
+---
+
+### EXP-19: Symmetric Uncrushed Helmholtz Diffusion PECT-JEPA
+- **Run Directory**: `experiments/5x5/exp19_symmetric_helmholtz_jepa`
+- **Configuration**:
+  - `tokenizer_type`: `uncrushed_diffusion` (50 continuous tokens: 25 spatial probes $\times$ 2 skin-depth modes, preserving full 28D uncrushed harmonic dispersion vectors: phase + log-magnitude).
+  - `predictor_type`: `continuous_helmholtz` (Analytical Green's Helmholtz integral operator $\mathcal{G}(\Delta r, \Delta z; \omega)$ with physically lower-bounded depth scale $d_{\text{scale}} = \text{softplus}(\text{raw\_d\_scale}) + 1.0\text{ mm}$, Green's target initialization, and dynamic perturbation residual head).
+  - `cst_mask_mode`: `cluster` (Symmetric dual-cluster masking: 8 cluster probes $\times$ 2 tokens + 8 cross-diffusion probes $\times$ 1 token = 24 target tokens, 26 context tokens).
+  - `use_intra_scan_vicreg`: `True`, `var_weight`: 1.0, `cov_weight`: 1.0, `epochs`: 10, `batch_size`: 256.
+- **Validation Loss & Representation Geometry Trajectory**:
+  - Epoch 1: `train_loss = 1.4564`, `val_loss_pred = 0.7374`, `Two-NN = 11.15D`
+  - Epoch 5: `train_loss = 0.1248`, `val_loss_pred = 0.0718`, `Two-NN = 13.43D`
+  - Epoch 10: `train_loss = 0.0691`, `val_loss_pred = 0.0273` (-96.3% reduction), `Two-NN = 14.53D`
+- **Learned Physical Parameter**:
+  - $d_{\text{scale}} = \mathbf{1.0092\text{ mm}}$ (bounded via $d_{\text{scale}} \ge 1.0\text{ mm}$, completely eliminating the $0.15\text{ mm}$ collapse observed in EXP-18).
+- **Downstream Empirical Metrics Across ALL 57 Held-Out Compound OOD Test Scans**:
+  - **Task 1 (Anomaly Detection - Linear Probe)**:
+    - Mean AUC-ROC: **84.83% ± 10.37%** (Rivet: **90.97%**, Mixed: **83.84%**, Corrosion: **79.68%**)
+    - Mean Average Precision (AP): **46.35%** (Rivet: **58.76%**, Corrosion: **41.27%**, Mixed: **39.00%**)
+    - Mean Contrast-to-Noise Ratio (CNR): **2.22** (Rivet: **3.40**, Corrosion: **1.63**, Mixed: **1.62**)
+    - Linear Probe F1: **42.19%**
+  - **Task 2 (Quantitative Depth Regression)**:
+    - Overall Defect-Only $R^2$ ($y > 0$): **0.5923**
+    - **Corrosion Specimen Sizing Precision**: Defect-Only $R^2 = \mathbf{0.8686}$ (86.9% sizing precision), Depth MAE = $\mathbf{0.0963\text{ mm}}$ ($96.3\,\mu\text{m}$)
+    - Overall Plate MAE: **0.1133 mm** (113.3 microns)
+    - Overall Plate Linear $R^2$: **0.1528**
+    - Two-Stage Hurdle Plate $R^2$: **0.0533**
+  - **Task 3 (Severity Classification)**: Macro F1 = **0.4522** (Rivet: **0.4679**, Mixed: **0.4494**, Corrosion: **0.4395**)
+  - **Task 4 (Multi-Lift-Off Invariance)**: Mean Linear CKA = **0.4175**, Mean Cosine Similarity = **0.9999**
+  - **Task 5 (Representation Geometry)**: Top-3 PCs Explained Variance = **97.33%**
+- **Breakdown by Waveform**:
+  - **Chirp (Held-Out Waveform, N=27)**: AUC = **90.15%**, AP = **60.71%**, CNR = **3.01**, Defect-Only $R^2 = \mathbf{0.6988}$, Plate MAE = **0.1110 mm**
+  - **Square (N=15)**: AUC = **85.73%**, AP = **42.88%**, CNR = **1.92**, Defect-Only $R^2 = \mathbf{0.5278}$, Plate MAE = **0.1139 mm**
+  - **Gaussian (N=15)**: AUC = **74.35%**, AP = **23.95%**, CNR = **1.11**, Defect-Only $R^2 = \mathbf{0.4653}$, Plate MAE = **0.1169 mm**
+- **Breakdown by Sensor Hardware**:
+  - **Hall Pot Core (N=15)**: AUC = **86.99%**, AP = **51.42%**, CNR = **2.13**, Defect-Only $R^2 = \mathbf{0.6896}$
+  - **TMR (Held-Out Sensor, N=27)**: AUC = **84.39%**, AP = **43.70%**, CNR = **2.13**, Defect-Only $R^2 = \mathbf{0.4966}$
+  - **Hall Air Core (N=15)**: AUC = **83.47%**, AP = **46.03%**, CNR = **2.48**, Defect-Only $R^2 = \mathbf{0.6674}$
+- **Breakdown by Lift-Off Distance**:
+  - **z1 (0.5 mm, N=15)**: AUC = **91.66%**, AP = **63.38%**, CNR = **3.21**, Defect-Only $R^2 = \mathbf{0.5922}$
+  - **z2 (1.5 mm, N=15)**: AUC = **85.90%**, AP = **49.52%**, CNR = **2.44**, Defect-Only $R^2 = \mathbf{0.5853}$
+  - **z3 (3.0 mm Held-Out, N=27)**: AUC = **80.44%**, AP = **35.12%**, CNR = **1.55**, Defect-Only $R^2 = \mathbf{0.5963}$
+- **Key Scientific Conclusions**:
+  1. *Physical Thickness Constraint Works*: Enforcing $d_{\text{scale}} \ge 1.0\text{ mm}$ alongside symmetric cluster masking stabilized $d_{\text{scale}}$ at $1.0092\text{ mm}$ (eliminating the $0.15\text{ mm}$ collapse observed in EXP-18).
+  2. *Corrosion Sizing Confirmed*: On actual continuous corrosion pits, the model achieves $R^2_{\text{defect}} = \mathbf{0.8686}$ and MAE = $\mathbf{0.0963\text{ mm}}$, verifying that the uncrushed Fourier harmonic dispersion vectors encode high-precision depth information.
+  3. *Why Rivet Has Stronger Flaw Contrast*: The rivet fastener structure ($\varnothing 3.95\text{ mm}$) produces huge localized electromagnetic boundary variations (CNR 3.40, AUC 90.97%), whereas corrosion pits ($1.24\%$ plate area) are prone to confusion with subtle mechanical scanner tilt on sound metal (AUC 79.68%, CNR 1.63).
+  4. *Analytical Green's vs Learned Operator Tradeoff*: An analytical scalar Green's function $\frac{1}{R} e^{-\kappa R}$ assumes isotropic radial diffusion. However, physical PECT sensor coils (especially TMR and Pot Core) emit directional dipole fields. Learned transformation matrices with explicit spatial offsets (EXP-17) capture these anisotropic geometric dynamics more flexibly than the rigid scalar Green's kernel, resulting in higher overall detection metrics (EXP-17: 93.78% AUC vs EXP-19: 84.83% AUC).
+
+
