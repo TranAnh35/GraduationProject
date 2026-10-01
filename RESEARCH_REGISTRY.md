@@ -814,6 +814,14 @@ This document permanently tracks all completed, rejected, and active research hy
   1. *Gaussian Waveform Phase Noise Fixed*: The dynamic SNR gate $\tanh(|X| / (0.02 \cdot \max |X|))$ silenced random angle noise in zero-energy frequency bands, lifting Gaussian IoU from 6.47% to 22.90% and AP from 22.84% to 39.92%.
   2. *Sound Metal False Alarm Explosion Tamed*: Applying physical spatial coherence filtering ($\ge 8\,\text{pixels}$) reduced false alarms on sound metal down to 0.09% at optimal operating points, almost doubling Corrosion IoU (14.96% -> 28.12%) and preventing the Hurdle depth $R^2$ from collapsing (-15.91 -> -0.0163).
   3. *New SOTA in Quantitative Sizing*: Defect-only depth sizing broke past 0.90 ($R^2 = 0.9010$, $96.4\,\mu\text{m}$ error), while universal flaw diameter sizing reached $R^2 = 0.6365$ ($0.86\,\text{mm}$ error) across all 3 specimens.
+  4. *Blind Inspection Object-Level POD Audit (Zero Oracle)*:
+     - On Corrosion scan, evaluated unsupervised candidate extraction at $\tau = 0.70, \text{min\_area} = 15$:
+       - True Flaws Detected: **22 / 25 (POD = 88.0%)**.
+       - Depths 0.2 mm, 0.5 mm, 1.0 mm: **100% detected (5/5 each)**.
+       - Depth 0.1 mm: **80% detected (4/5)**, missing only the smallest $\varnothing 3\text{ mm}$ pit (ID 5).
+       - Object-level depth sizing evaluated strictly inside detected bounding boxes: **$R^2 = 0.8810$, $\text{MAE} = 0.0811\text{ mm}$ ($81.1\,\mu\text{m}$)**.
+       - False alarm candidate clusters on sound metal: 45 clusters across $270 \times 270\text{ mm}^2$.
+     - Generated and saved dedicated Flaw Size calibration scatter plots and 2D predicted sizing maps for all 3 specimens in `evaluation_results/2_Flaw_Size_Sizing/` (Corrosion $R^2 = 0.8315$, Rivet $R^2 = 0.7787$, Combined $R^2 = 0.7178$).
 
 
 
