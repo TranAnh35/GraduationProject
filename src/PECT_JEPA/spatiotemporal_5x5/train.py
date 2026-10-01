@@ -124,9 +124,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Norm-floor barrier weight to prevent zero-vector collapse (default: 0.1)")
     p.add_argument("--norm_floor_target", type=float, default=1.0,
                    help="Minimum target L2 norm of representations (default: 1.0)")
-    p.add_argument("--tokenizer_type", type=str, default="uncrushed_diffusion",
-                   choices=["uncrushed_diffusion", "snr_tapered_diffusion", "dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'uncrushed_diffusion' (EXP-18: 50 tokens, uncrushed harmonic dispersion, default), 'snr_tapered_diffusion' (EXP-21), 'dual_scale_diffusion', etc.")
+    p.add_argument("--subspace_perturbation_weight", type=float, default=1.0,
+                   help="Latent Subspace Residual Perturbation Loss weight (EXP-22, default: 1.0)")
+    p.add_argument("--tokenizer_type", type=str, default="continuous_field",
+                   choices=["continuous_field", "waveform_agnostic_field", "uncrushed_diffusion", "snr_tapered_diffusion", "dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
+                   help="Tokenizer architecture: 'continuous_field' (EXP-22: continuous 25 tokens, default), 'uncrushed_diffusion', 'snr_tapered_diffusion', etc.")
     p.add_argument("--num_scales", type=int, default=4,
                    help="Number of physical skin-depth scales for spatio_spectral tokenizer (default: 4)")
     p.add_argument("--masker_type", type=str, default="auto",
@@ -136,9 +138,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
     p.add_argument("--cst_mask_mode", type=str, default="cluster", choices=["cluster", "surface_to_bulk", "surface_to_depth", "causal", "random"],
                    help="Masking partition mode: 'cluster' (EXP-19 symmetric dual-cluster, default), 'surface_to_bulk', 'surface_to_depth', 'causal', or 'random'")
-    p.add_argument("--predictor_type", type=str, default="continuous_helmholtz",
-                   choices=["anisotropic_diffusion", "continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
-                   help="Predictor architecture: 'anisotropic_diffusion' (EXP-20: Anisotropic Spatio-Diffusion Operator JEPA), 'continuous_helmholtz', etc.")
+    p.add_argument("--predictor_type", type=str, default="neural_field_subspace",
+                   choices=["neural_field_subspace", "subspace_field_operator", "anisotropic_diffusion", "continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
+                   help="Predictor architecture: 'neural_field_subspace' (EXP-22: Neural Field Operator with Subspace Decomposition, default), 'anisotropic_diffusion', etc.")
     p.add_argument("--use_target_ema", type=lambda v: v.lower() == "true", default=False,
                    help="Use EMA target encoder (default: False for Single Shared Encoder + Stop-Gradient Target)")
     p.add_argument("--adaptive_disturbance_weight", type=float, default=0.0,
@@ -267,6 +269,7 @@ def main():
         normalization=args.normalization,
         learning_rate=args.learning_rate,
         loss_type=args.loss_type,
+        subspace_perturbation_weight=args.subspace_perturbation_weight,
         liftoff_invar_weight=args.liftoff_invar_weight,
         phase_align_weight=args.phase_align_weight,
         var_weight=args.var_weight,

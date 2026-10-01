@@ -81,6 +81,7 @@ class Spatiotemporal5x5Config:
 
     # ------------------------------------------------------------------- Loss
     loss_type: str = "l1"                # Base prediction norm ('l1' | 'smooth_l1')
+    subspace_perturbation_weight: float = 1.0 # EXP-22: Latent Subspace Residual Perturbation Loss weight
     fluct_weight: float = 0.0            # 0.0 for pure JEPA
     adaptive_disturbance_weight: float = 0.0 # 0.0 for pure JEPA
     temporal_mono_weight: float = 0.0    # 0.0 for pure JEPA
@@ -162,3 +163,39 @@ class Spatiotemporal5x5Config:
 
 def get_default_config_5x5() -> Spatiotemporal5x5Config:
     return Spatiotemporal5x5Config()
+
+
+def get_exp22_config_5x5() -> Spatiotemporal5x5Config:
+    """
+    Configuration for EXP-22:
+    Continuous Waveform-Agnostic 25-Token Field Topology with Data-Driven
+    Neural Field Operator Predictor and Latent Subspace Perturbation Decomposition.
+    """
+    return Spatiotemporal5x5Config(
+        exp_name="pect_jepa_exp22_continuous_field",
+        tokenizer_type="continuous_field",
+        predictor_type="neural_field_subspace",
+        spatial_topology="concentric_star",
+        star_radii=(1, 3, 7),
+        embed_dim=64,
+        encoder_depth=4,
+        encoder_heads=4,
+        predictor_depth=2,
+        predictor_heads=4,
+        normalization="file_peak",
+        loss_type="l1",
+        var_weight=1.0,
+        cov_weight=1.0,
+        subspace_perturbation_weight=1.0,
+        use_centered_vicreg=True,
+        use_intra_scan_vicreg=True,
+        use_radial_attention_bias=True,
+        phase_snr_tapering=True,
+        masker_type="auto",
+        min_masked=8,
+        max_masked=10,
+        batch_size=256,
+        epochs=10,
+        warmup_epochs=2,
+        learning_rate=2e-4,
+    )

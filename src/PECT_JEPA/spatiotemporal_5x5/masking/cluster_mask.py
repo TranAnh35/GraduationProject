@@ -547,7 +547,7 @@ def build_masker_5x5(config):
     use_mask_bank = getattr(config, "use_mask_bank", True)
     bank_size = getattr(config, "mask_bank_size", 2048)
 
-    if tokenizer_type in ("continuous_stf", "continuous_filterbank", "spatial_grid", "time_only", "dual_domain_attention", "dual_domain"):
+    if tokenizer_type in ("continuous_field", "waveform_agnostic_field", "continuous_dual_domain", "continuous_stf", "continuous_filterbank", "spatial_grid", "time_only", "dual_domain_attention", "dual_domain"):
         return ContiguousClusterMasker5x5(
             min_masked=config.min_masked,
             max_masked=config.max_masked,

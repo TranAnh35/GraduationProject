@@ -132,6 +132,8 @@ class PECT_JEPA_5x5(nn.Module):
             # Compute FFT along temporal dimension
             X_fft_sub = torch.fft.rfft(x_flat, dim=-1)[:, :, 1:num_bins + 1]  # [B, 25, K], exclude DC
         else:
+            if X_fft.ndim == 2:
+                X_fft = X_fft.reshape(B, H * W, -1)
             if X_fft.ndim == 3 and X_fft.shape[1] == H * W and X_fft.shape[-1] > num_bins:
                 X_fft_sub = X_fft[:, :, 1:num_bins + 1]
             elif X_fft.ndim == 4:

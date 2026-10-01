@@ -38,6 +38,7 @@ class JEPALoss5x5(nn.Module):
         uniformity_subsample: int = 1024,
         norm_floor_weight: float = 0.0,
         norm_floor_target: float = 1.0,
+        subspace_perturbation_weight: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -58,6 +59,7 @@ class JEPALoss5x5(nn.Module):
         self.uniformity_subsample = uniformity_subsample
         self.norm_floor_weight = norm_floor_weight
         self.norm_floor_target = norm_floor_target
+        self.subspace_perturbation_weight = subspace_perturbation_weight
 
     def compute_disturbance_weights(self, x_raw: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
@@ -540,8 +542,16 @@ class JEPALoss5x5(nn.Module):
         if self.norm_floor_weight > 0.0 and rep_reg is not None:
             l_norm, mean_norm = self.norm_floor_loss(rep_reg)
 
+        # Subspace Residual Perturbation Loss (EXP-22)
+        l_pert = zero_loss
+        if self.subspace_perturbation_weight > 0.0 and delta_pred is not None and H_ctx is not None:
+            h_ctx_mean = H_ctx.mean(dim=1, keepdim=True)
+            delta_target = H_target - h_ctx_mean.expand_as(H_target)
+            l_pert = F.l1_loss(delta_pred, delta_target)
+
         total = (
             l_pred
+            + self.subspace_perturbation_weight * l_pert
             + self.temporal_mono_weight * l_mono
             + self.liftoff_invar_weight * l_liftoff
             + self.phase_align_weight * l_phase
@@ -554,6 +564,7 @@ class JEPALoss5x5(nn.Module):
         return {
             "loss": total,
             "loss_pred": l_pred.detach(),
+            "loss_pert": l_pert.detach(),
             "loss_fluct": l_fluct.detach(),
             "loss_mono": l_mono.detach(),
             "loss_liftoff": l_liftoff.detach(),

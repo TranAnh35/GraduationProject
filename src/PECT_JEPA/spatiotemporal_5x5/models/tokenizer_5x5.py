@@ -1032,12 +1032,134 @@ class SpatioSpectralTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class ContinuousFieldTokenizer5x5(nn.Module):
+    """
+    Continuous Dual-Domain Field Tokenizer for 5x5 PECT-JEPA (EXP-22).
+    
+    Waveform-Agnostic, Continuous 25-Token Architecture:
+      - Strictly 1 continuous token per spatial probe on the Concentric Star or 5x5 grid (25 tokens total).
+      - Zero temporal slicing (tau_0..tau_3) and zero depth thresholding (shallow/deep at 1.0mm).
+      - Multi-scale 1D Conv filterbank for continuous transient dynamics (arrival time t_p, rise slope).
+      - Full uncrushed 14-harmonic Fourier dispersion (phase & log-magnitude).
+      - Dodd-Deeds lift-off invariance via Fourier phase with magnitude-weighted SNR tapering.
+      - Physics-gated cross-domain dynamic fusion with residual highway from time branch.
+      - 2D spatial positional embedding.
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+        use_snr_tapering: bool = True,
+        phase_noise_floor: float = 0.02,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_tokens = self.num_spatial        # Exactly 25 tokens
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+        self.use_snr_tapering = use_snr_tapering
+        self.phase_noise_floor = phase_noise_floor
+
+        # 1. Multi-scale 1D Temporal Conv Filterbank for transient dynamics
+        d_sub = embed_dim // 3
+        self.conv_short = nn.Conv1d(1, d_sub, kernel_size=5, stride=2, padding=2)
+        self.conv_med = nn.Conv1d(1, d_sub, kernel_size=15, stride=2, padding=7)
+        self.conv_long = nn.Conv1d(1, embed_dim - 2 * d_sub, kernel_size=31, stride=2, padding=15)
+        self.act_time = nn.GELU()
+        self.time_pool = nn.AdaptiveAvgPool1d(1)
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Uncrushed Spectral Dispersion Branch (14 frequency bins: phase + log-mag)
+        self.spectral_dim = self.num_freq_bins * 2
+        self.proj_freq = nn.Linear(self.spectral_dim, embed_dim)
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Physics-Gated Dual-Domain Dynamic Fusion
+        self.gate_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Sigmoid(),
+        )
+        self.fuse_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+
+        # 4. Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_flat = x.reshape(B * self.num_tokens, C)
+
+        # 1. Multi-scale Temporal Features
+        x_1d = x_flat.unsqueeze(1)  # [B*25, 1, C]
+        h_short = self.time_pool(self.act_time(self.conv_short(x_1d))).squeeze(-1)
+        h_med = self.time_pool(self.act_time(self.conv_med(x_1d))).squeeze(-1)
+        h_long = self.time_pool(self.act_time(self.conv_long(x_1d))).squeeze(-1)
+        h_time = torch.cat([h_short, h_med, h_long], dim=-1)  # [B*25, D]
+        z_time = self.ln_time(h_time)
+
+        # 2. Uncrushed Spectral Dispersion
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)
+        self._last_fft = X_fft
+        X_sub = X_fft[:, 1:self.num_freq_bins + 1]  # Exclude DC
+
+        phase = torch.angle(X_sub) / torch.pi
+        mag_linear = torch.abs(X_sub)
+        mag = torch.log1p(mag_linear)
+
+        if self.use_snr_tapering:
+            snr_weight = torch.tanh(mag_linear / self.phase_noise_floor)
+            phase = phase * snr_weight
+
+        spectral_feat = torch.cat([phase, mag], dim=-1).to(x.dtype)  # [B*25, 2*num_freq_bins]
+        z_freq = self.ln_freq(self.proj_freq(spectral_feat))        # [B*25, D]
+
+        # 3. Physics-Gated Dual-Domain Fusion
+        gate = self.gate_proj(torch.cat([z_time, z_freq], dim=-1))   # [B*25, D]
+        z_fused = self.fuse_proj(z_time * gate + z_freq * (1.0 - gate)) + z_time  # [B*25, D]
+        tokens = self.drop(self.norm_out(z_fused)).reshape(B, self.num_tokens, self.embed_dim)
+
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "spatio_spectral")
-    if tokenizer_type in ("spatio_spectral", "skin_depth"):
+    tokenizer_type = getattr(config, "tokenizer_type", "continuous_field")
+    if tokenizer_type in ("continuous_field", "waveform_agnostic_field", "continuous_dual_domain"):
+        return ContinuousFieldTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+            use_snr_tapering=getattr(config, "phase_snr_tapering", True),
+            phase_noise_floor=getattr(config, "phase_noise_floor", 0.02),
+        )
+    elif tokenizer_type in ("spatio_spectral", "skin_depth"):
         return SpatioSpectralTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,

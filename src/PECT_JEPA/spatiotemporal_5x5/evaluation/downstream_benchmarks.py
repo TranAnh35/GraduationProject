@@ -710,3 +710,107 @@ class DownstreamBenchmarkSuite:
             y_te = labels_2d[:, test_x_min:].reshape(-1)
 
         return self.benchmark_cross_file_ood(X_tr, y_tr, X_te, y_te)
+
+    # =========================================================================
+    # Task 5: Universal Flaw Sizing Benchmark (All Specimens: Corrosion, Rivet, Mixed)
+    # =========================================================================
+    def benchmark_universal_flaw_sizing(
+        self,
+        predicted_binary_mask: np.ndarray, # [H, W] binary mask of detected flaws
+        ground_truth_mask: np.ndarray,     # [H, W] binary mask of ground-truth flaws
+        pixel_pitch_mm: float = 1.0,       # Scan grid step size in mm
+        min_cluster_size: int = 4,         # Minimum connected component size in pixels
+    ) -> Dict[str, Any]:
+        """
+        Universal Flaw Sizing Benchmark across all specimens (Corrosion, Rivet_v1, Mixed).
+        Extracts connected defect clusters, computes predicted area and equivalent diameter,
+        and benchmarks against CAD ground truth.
+        Eliminates the restriction of depth labels, providing a physically valid sizing metric for all plates.
+        """
+        try:
+            from scipy.ndimage import label, center_of_mass
+        except ImportError:
+            return {"error": "scipy required for universal flaw sizing"}
+
+        # Extract connected components from ground truth
+        gt_labeled, n_gt = label(ground_truth_mask > 0)
+        # Extract connected components from predicted mask
+        pred_labeled, n_pred = label(predicted_binary_mask > 0)
+
+        if n_gt == 0:
+            return {"error": "No ground truth defects found"}
+
+        # Measure ground-truth flaws
+        gt_features = []
+        for i in range(1, n_gt + 1):
+            mask_i = (gt_labeled == i)
+            area_px = int(np.sum(mask_i))
+            if area_px < min_cluster_size:
+                continue
+            cy, cx = center_of_mass(mask_i)
+            area_mm2 = area_px * (pixel_pitch_mm ** 2)
+            d_equiv_mm = 2.0 * np.sqrt(area_mm2 / np.pi)
+            gt_features.append({"id": i, "cx": cx, "cy": cy, "area_mm2": area_mm2, "d_equiv_mm": d_equiv_mm, "mask": mask_i})
+
+        if not gt_features:
+            return {"error": "No ground truth defects larger than min_cluster_size"}
+
+        # Measure predicted flaws
+        pred_features = []
+        for j in range(1, n_pred + 1):
+            mask_j = (pred_labeled == j)
+            area_px = int(np.sum(mask_j))
+            if area_px < min_cluster_size:
+                continue
+            cy, cx = center_of_mass(mask_j)
+            area_mm2 = area_px * (pixel_pitch_mm ** 2)
+            d_equiv_mm = 2.0 * np.sqrt(area_mm2 / np.pi)
+            pred_features.append({"id": j, "cx": cx, "cy": cy, "area_mm2": area_mm2, "d_equiv_mm": d_equiv_mm, "mask": mask_j})
+
+        # Match predicted clusters to ground truth clusters based on centroid proximity
+        matched_gt_d, matched_pred_d = [], []
+        matched_gt_a, matched_pred_a = [], []
+
+        for gt_f in gt_features:
+            best_match = None
+            best_dist = 15.0  # max tolerance 15mm
+            for p_f in pred_features:
+                dist = np.hypot(gt_f["cx"] - p_f["cx"], gt_f["cy"] - p_f["cy"]) * pixel_pitch_mm
+                if dist < best_dist:
+                    best_dist = dist
+                    best_match = p_f
+
+            if best_match is not None:
+                matched_gt_d.append(gt_f["d_equiv_mm"])
+                matched_pred_d.append(best_match["d_equiv_mm"])
+                matched_gt_a.append(gt_f["area_mm2"])
+                matched_pred_a.append(best_match["area_mm2"])
+            else:
+                matched_gt_d.append(gt_f["d_equiv_mm"])
+                matched_pred_d.append(0.0)
+                matched_gt_a.append(gt_f["area_mm2"])
+                matched_pred_a.append(0.0)
+
+        matched_gt_d = np.array(matched_gt_d)
+        matched_pred_d = np.array(matched_pred_d)
+        matched_gt_a = np.array(matched_gt_a)
+        matched_pred_a = np.array(matched_pred_a)
+
+        d_r2 = float(r2_score(matched_gt_d, matched_pred_d)) if len(matched_gt_d) >= 2 else 0.0
+        d_mae = float(mean_absolute_error(matched_gt_d, matched_pred_d))
+        a_r2 = float(r2_score(matched_gt_a, matched_pred_a)) if len(matched_gt_a) >= 2 else 0.0
+        a_mae = float(mean_absolute_error(matched_gt_a, matched_pred_a))
+
+        return {
+            "num_ground_truth_flaws": len(gt_features),
+            "num_detected_flaws": len(pred_features),
+            "num_matched_flaws": int(np.sum(matched_pred_d > 0.0)),
+            "diameter_sizing": {
+                "r2_score": round(d_r2, 4),
+                "mae_mm": round(d_mae, 4),
+            },
+            "area_sizing": {
+                "r2_score": round(a_r2, 4),
+                "mae_mm2": round(a_mae, 4),
+            },
+        }
