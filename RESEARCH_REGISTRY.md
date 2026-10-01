@@ -30,7 +30,7 @@ This document permanently tracks all completed, rejected, and active research hy
 | **OPT-01** | High-Throughput Training Acceleration Engine (Mask Bank + Non-Blocking Metrics + TF32) | `masking/cluster_mask.py` + `trainer.py` + `dataset.py` + `tokenizer_5x5.py` + `jepa_5x5.py` | N/A | Epoch time: ~880s -> ~140-180s (4x-6x speedup) \| Zero mathematical / physical degradation | **Accepted Engine Optimization** | Precomputed GPU tensor mask bank eliminates 1.75M BFS traversals/ep (<0.05ms/batch). Asynchronous GPU metric tensor eliminates ~75,000 blocking `.item()` host-syncs. Reused cached FFT eliminates duplicate STFT computation. Vectorized tensor collation + TF32 acceleration. 100% mathematically equivalent representations. |
 | **EXP-19** | Symmetric Dual-Cluster Helmholtz PECT-JEPA | `models/predictor.py`: `ContinuousHelmholtzPredictor5x5` + Bounded $d_{\text{scale}} \ge 1.0\,\text{mm}$ | 10 ep | AUC: 84.83% ± 10.74% \| AP: 48.06% \| CNR: 2.29 \| Corrosion Defect R²: 0.8686 \| Rivet CNR: 3.40 | **Evaluated / Baseline** | Stabilized $d_{\text{scale}} = 1.0092\,\text{mm}$, eliminating EXP-18 surface copy shortcut. Confirmed that analytical isotropic Green's kernel underperforms learned anisotropic dipole operators. |
 | **EXP-20** | Anisotropic Spatio-Diffusion Operator JEPA | `tokenizer_5x5.py`: `UncrushedDiffusion` + `models/predictor.py`: `AnisotropicDiffusionPredictor5x5` | 10 ep | Val Pred Loss: 0.04118 (SOTA) \| AUC: 84.71% \| AP: 46.80% \| Corrosion Defect R²: 0.8730 \| Flaw Size R²: 0.5971 \| Boundary IoU: 18.85% | **Evaluated / Autopsied** | Achieved lowest validation prediction loss (0.04118) and discovered raster anisotropy ($\alpha_y / \alpha_x = 1.87$). However, forensic autopsy revealed high false alarms on sound metal (17.3%), sub-30% IoU, and Gaussian waveform phase noise collapse (IoU 6.47%). |
-| **EXP-21** | Magnitude-Aware SNR Phase Tapering & Spatial Coherence Gated JEPA | `tokenizer_5x5.py`: SNR-tapered phase + `eval/visualizations.py`: Spatial Coherence Filter ($\ge 8\,\text{px}$) | 10 ep | Training in progress (Task task-3088) | **In-Progress** | Implements dynamic magnitude-aware Fourier phase SNR tapering to eliminate Gaussian phase noise collapse; integrates spatial physical coherence filtering and Hurdle clamping to defeat the sound-metal false alarm avalanche. |
+| **EXP-21** | Magnitude-Aware SNR Phase Tapering & Spatial Coherence Gated JEPA | `tokenizer_5x5.py`: SNR-tapered phase + `eval/visualizations.py`: Spatial Coherence Filter ($\ge 8\,\text{px}$) | 10 ep | AUC: 87.40% ± 8.70% \| AP: 51.49% \| CNR: 2.44 \| Corrosion Defect R²: 0.9010 \| Flaw Size R²: 0.6365 \| Rivet IoU: 32.86% \| Corrosion IoU: 28.12% \| Two-NN: 16.11D | **Accepted SOTA Benchmark** | Fully cured Gaussian phase noise collapse (Gaussian AP surged from 22.84% to 39.92%, IoU surged from 6.47% to 22.90%). Spatial physical coherence filtering clamped sound-metal false alarms from 17.3% down to 0.09% at tau=0.925, driving Corrosion IoU from 14.96% to 28.12% (+88% rel), Corrosion Defect R² past 0.90 (0.9010), and Hurdle Plate R² from -15.91 to -0.0163. |
 
 ---
 
@@ -776,7 +776,45 @@ This document permanently tracks all completed, rejected, and active research hy
   - `predictor_type`: `anisotropic_diffusion` (`AnisotropicDiffusionPredictor5x5`, directional diffusion $\alpha_x, \alpha_y$).
   - `cst_mask_mode`: `cluster` (Symmetric dual-cluster masking: 24 target tokens, 26 context tokens).
   - `epochs`: 10, `batch_size`: 256, `device`: `cuda`.
-- **Status**: Training actively running on GPU (`task-3088`). Initial unit test verification passed (`tests/test_exp21_snr_tapered_diffusion.py`).
+- **Validation Loss & Representation Geometry Trajectory**:
+  - Epoch 1: `train_loss = 1.4399`, `val_loss = 0.8139`, `val_loss_pred = 0.7659`, `Two-NN = 10.73D`
+  - Epoch 2: `train_loss = 0.5096`, `val_loss = 0.2404`, `val_loss_pred = 0.2092`, `Two-NN = 12.24D`
+  - Epoch 10: `train_loss = 0.0856`, `val_loss = 0.0639`, `val_loss_pred = 0.0425`, `Two-NN = 16.11D` (Richest manifold dimensionality in project history)
+- **Downstream Empirical Metrics Across ALL 57 Held-Out Compound OOD Test Scans**:
+  - **Task 1 (Anomaly Detection - Linear Probe)**:
+    - Mean AUC-ROC: **87.40% ± 8.70%** (vs 84.71% in EXP-20, **+2.69%**)
+    - Mean Average Precision (AP): **51.49%** (vs 46.80% in EXP-20, **+4.69% absolute improvement**, breaking 50% barrier)
+    - Mean Contrast-to-Noise Ratio (CNR): **2.44** (vs 2.26 in EXP-20)
+    - Specimen Breakdown:
+      - **Rivet Plate**: AUC = **93.88%**, AP = **65.67%**, CNR = **3.81**
+      - **Corrosion Plate**: AUC = **83.46%** (+4.12%), AP = **49.01%** (+7.85%), CNR = **1.88**
+      - **Mixed Plate**: AUC = **84.86%**, AP = **39.80%**, CNR = **1.64**
+  - **Task 1b (Boundary Contours & Segmentation IoU / Dice)**:
+    - Overall Mean Clean IoU: **26.58%** (vs 18.85% in EXP-20, **+41.0% relative increase**)
+    - **Rivet Plate IoU**: **32.86%** (Dice: **47.38%**, Prec: **38.80%**, Rec: **63.85%**)
+    - **Corrosion Plate IoU**: **28.12%** (Dice: **41.07%**, Prec: **33.69%**, Rec: **57.77%** — **almost doubled** from 14.96% in EXP-20)
+    - **Mixed Plate IoU**: **18.75%** (Dice: **30.80%**)
+    - At Lift-Off z1 (0.5 mm): AUC = **93.56%**, AP = **69.58%**, Clean IoU = **38.70%**, Clean Prec = **51.30%**, Rec = **68.24%**
+  - **Task 2 (Quantitative Depth Sizing - Evaluated Exclusively on Corrosion)**:
+    - **Corrosion Defect-Only $R^2$**: **`0.9010`** (Breaking 90% sizing accuracy for the first time, up from 0.8730)
+    - **Corrosion Depth MAE**: **`0.0964 mm`** ($96.4\,\mu\text{m}$)
+    - **Two-Stage Hurdle Plate $R^2$**: **`-0.0163`** (Massive recovery from -15.91 in EXP-20; clamping sound-metal false alarms prevented whole-plate collapse)
+  - **Task 2b (Flaw Size / Diameter Sizing - Across All 3 Specimens)**:
+    - Overall Defect-Only Flaw Size $R^2$: **`0.6365`** (vs 0.5971 in EXP-20, **+3.94% absolute**)
+    - Overall Flaw Size MAE: **`0.8671 mm`** (vs 0.9236 mm in EXP-20)
+    - Specimen Breakdown:
+      - **Mixed Plate**: Defect-Only Size $R^2 = \mathbf{0.7275}$, Size MAE $= \mathbf{0.9931\text{ mm}}$
+      - **Corrosion Plate**: Defect-Only Size $R^2 = \mathbf{0.6872}$, Size MAE $= \mathbf{0.9180\text{ mm}}$
+      - **Rivet Plate**: Defect-Only Size $R^2 = \mathbf{0.4947}$, Size MAE $= \mathbf{0.6902\text{ mm}}$
+  - **Breakdown by Waveform (Proof of Gaussian Recovery)**:
+    - **Chirp (N=27)**: AUC = **89.56%**, AP = **59.13%**, CNR = **2.98**, Clean IoU = **30.43%**, Clean Dice = **44.10%**
+    - **Square (N=15)**: AUC = **87.82%**, AP = **49.31%**, CNR = **2.25**, Clean IoU = **23.32%**, Clean Dice = **36.43%**
+    - **Gaussian (N=15)**: AUC = **83.10%** (+9.81% vs EXP-20), AP = **39.92%** (+17.08% absolute, +74.8% relative), CNR = **1.66** (+55.1%), Clean IoU = **22.90%** (**surged 3.5x** from 6.47% in EXP-20!), Clean Dice = **35.25%**
+- **Key Scientific Conclusions**:
+  1. *Gaussian Waveform Phase Noise Fixed*: The dynamic SNR gate $\tanh(|X| / (0.02 \cdot \max |X|))$ silenced random angle noise in zero-energy frequency bands, lifting Gaussian IoU from 6.47% to 22.90% and AP from 22.84% to 39.92%.
+  2. *Sound Metal False Alarm Explosion Tamed*: Applying physical spatial coherence filtering ($\ge 8\,\text{pixels}$) reduced false alarms on sound metal down to 0.09% at optimal operating points, almost doubling Corrosion IoU (14.96% -> 28.12%) and preventing the Hurdle depth $R^2$ from collapsing (-15.91 -> -0.0163).
+  3. *New SOTA in Quantitative Sizing*: Defect-only depth sizing broke past 0.90 ($R^2 = 0.9010$, $96.4\,\mu\text{m}$ error), while universal flaw diameter sizing reached $R^2 = 0.6365$ ($0.86\,\text{mm}$ error) across all 3 specimens.
+
 
 
 
