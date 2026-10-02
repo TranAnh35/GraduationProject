@@ -873,5 +873,15 @@ This document permanently tracks all completed, rejected, and active research hy
      - **Deprecated Task Pruning**: Completely excised deprecated `3_Severity_Classification`, `4_Liftoff_Invariance`, and `5_Representation_Geometry` from code, summaries, CSV, and output directories.
      - **3D Volumetric Tomography (Task 3)**: Generated 4-layer skin-depth volumetric reconstructions, multi-slice ortho B-scans (`_3d_ortho_slices.png`), interactive 3D isosurfaces (`_3d_tomography.html`), and 3D defect graph representations (`_defect_graph_3d.png`, `_defect_graph_3d.html`) in `3D_Tomography/`.
      - **High-Dimensional Latent Forensics (Task 4)**: Added Fisher Discriminant Ratio sensitivity spectrum ($S_k$) and cross-morphology cosine separation matrices in `Latent_Diagnostics/`.
+  5. *EXP-22 Comprehensive Latent Representation Audit*:
+     - **Domain Predictability Verified (Preserved Acquisition Reality)**: Sensor (100.0%), Waveform (100.0%), Lift-off (99.59%) are perfectly preserved in latent coordinates on sound metal, verifying that PECT-JEPA acts as a physical foundation representation rather than an artificially collapsed anomaly filter.
+     - **Subspace Orthogonality Confirmed (Domain vs Defect)**: The defect vector $w_{\text{defect}}$ has only **0.48%** energy overlap with the Top-10 domain subspace ($\cos \theta \le 0.017$), proving domain information does NOT crush or entangle defect features.
+     - **Root Cause of Cross-File Zero-Shot Failure**: Mean shift hypothesis was empirically disproved (Local standardization $z' = (z - \mu_{\text{loc}})/\sigma_{\text{loc}}$ yields AUC 0.5421). The true root cause is **Disjoint Coordinate Allocation & Subspace Rotation across Sensor Hardware**:
+       - Hall Air Core defects fire in coordinates: `[116, 83, 9, 39, 45]`
+       - Hall Pot Core defects fire in coordinates: `[100, 59, 19, 62, 21]`
+       - TMR defects fire in coordinates: `[76, 110, 69, 56, 35]` (0% coordinate overlap).
+       - Mean cross-sensor normal vector cosine alignment is **0.0963**, meaning defect hyperplanes are mutually orthogonal across sensors.
+       - A fixed linear probe trained on Hall is deaf to TMR defect channels. However, within each domain, the representation is exceptional (In-Scan AUC reaches **0.9809** on TMR Chirp).
+
 
 
