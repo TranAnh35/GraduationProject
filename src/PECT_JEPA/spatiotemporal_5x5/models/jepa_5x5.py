@@ -542,8 +542,29 @@ class PECT_JEPA_5x5(nn.Module):
             l3 = 0.10 * e_surf + 0.90 * e_deep
             V_depth = torch.stack([l0, l1, l2, l3], dim=-1)  # [B, 4]
         else:
-            e_mean = delta_H.norm(dim=-1)
-            V_depth = e_mean.unsqueeze(-1).expand(-1, 4)
+            # 25 continuous spatial tokens:
+            # Derive 4 physical depth layers from frequency-penetration dispersion:
+            # Skin depth delta(f) = 1 / sqrt(pi * f * mu * sigma)
+            # High f (Bins 10..13, 2000-2800 Hz) -> Layer 0: Near-surface (0.0 - 0.5 mm)
+            # Mid-high f (Bins 6..9, 1200-1800 Hz) -> Layer 1: Mid-shallow (0.5 - 1.2 mm)
+            # Mid-low f (Bins 2..5, 400-1000 Hz) -> Layer 2: Mid-deep (1.2 - 2.0 mm)
+            # Low f (Bins 0..1, 0-400 Hz) -> Layer 3: Deepest back-wall (2.0 - 3.0 mm)
+            center_x = x[:, self.config.grid_size // 2, self.config.grid_size // 2, :]  # [B, C]
+            fft_mag = torch.abs(torch.fft.rfft(center_x, dim=-1))[:, :14]  # [B, 14]
+            
+            e_surf = fft_mag[:, 10:14].mean(dim=-1)
+            e_mid_shal = fft_mag[:, 6:10].mean(dim=-1)
+            e_mid_deep = fft_mag[:, 2:6].mean(dim=-1)
+            e_deep = fft_mag[:, 0:2].mean(dim=-1)
+
+            e_mean = delta_H.norm(dim=-1)  # [B] flaw discrepancy magnitude
+            
+            # Combine latent flaw anomaly magnitude with depth-band spectral weighting:
+            v0 = e_mean * (e_surf / (e_surf.mean() + 1e-6))
+            v1 = e_mean * (e_mid_shal / (e_mid_shal.mean() + 1e-6))
+            v2 = e_mean * (e_mid_deep / (e_mid_deep.mean() + 1e-6))
+            v3 = e_mean * (e_deep / (e_deep.mean() + 1e-6))
+            V_depth = torch.stack([v0, v1, v2, v3], dim=-1)  # [B, 4]
 
         return Z_unified, V_depth
 

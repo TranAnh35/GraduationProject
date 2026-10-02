@@ -48,7 +48,9 @@ from typing import List, Dict, Any, Optional, Tuple
 # Force unbuffered streaming output so background logs update immediately
 try:
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(line_buffering=True)
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
 
@@ -98,18 +100,23 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.anomaly_detection import (
 )
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.linear_probe import LinearProbeEvaluator
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
-from src.PECT_JEPA.spatiotemporal_5x5.evaluation.liftoff_invariance import (
-    compute_linear_cka,
-    compute_feature_similarity_matrix,
-)
 from src.PECT_JEPA.spatiotemporal_5x5.evaluation.visualizations import (
     plot_probability_heatmap,
     plot_roc_pr_curves,
     plot_depth_regression_maps,
     plot_depth_calibration_scatter,
-    plot_severity_confusion_matrix,
-    plot_liftoff_cka_heatmap,
     plot_defect_contours_and_iou,
+    plot_flaw_size_maps,
+    plot_flaw_size_calibration_scatter,
+)
+from src.PECT_JEPA.spatiotemporal_5x5.evaluation.morphology_classifier import (
+    DefectMorphologyClassifier,
+    build_morphology_labels_from_scan,
+)
+from src.PECT_JEPA.spatiotemporal_5x5.evaluation.latent_diagnostics import (
+    compute_channel_sensitivity_spectrum,
+    compute_morphology_subspace_separation,
+    audit_subspace_clutter_decomposition,
 )
 
 
@@ -176,14 +183,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--holdout_sensor", type=str, default="TMR", help="Sensor hardware held out for compound_ood")
     p.add_argument("--holdout_waveform", type=str, default="Chirp", help="Waveform shape held out for compound_ood")
     p.add_argument("--output_dir", type=str, default=None, help="Directory to save evaluation artifacts")
-    p.add_argument("--eval_liftoff", action="store_true", default=True, help="Compute Linear CKA across lift-off variations")
-    p.add_argument("--no_eval_liftoff", dest="eval_liftoff", action="store_false", help="Skip lift-off invariance analysis")
     p.add_argument("--save_features", action="store_true", default=False, help="Save extracted .npy feature maps to disk")
     p.add_argument("--crop_border", type=int, default=15, help="Outer boundary pixels cropped to remove air/edge effect")
     p.add_argument("--batch_size", type=int, default=512, help="Batch size for sliding window feature extraction")
     p.add_argument("--device", type=str, default="cuda", help="Target device: 'cuda' or 'cpu'")
     p.add_argument("--max_eval_files", type=int, default=None, help="Optional limit on number of test files to evaluate")
-    p.add_argument("--eval_3d", action="store_true", default=False, help="Extract 3D volumetric slices and topological defect graphs")
+    p.add_argument("--eval_3d", type=lambda v: v.lower() == "true", default=True, help="Extract 3D volumetric slices and topological defect graphs (default: True)")
+    p.add_argument("--eval_diagnostics", type=lambda v: v.lower() == "true", default=True, help="Run high-dimensional latent forensics suite (default: True)")
     return p
 
 
@@ -358,15 +364,17 @@ def evaluate_single_file(
     device: str = "cuda",
     save_features: bool = False,
     crop_border: int = 15,
-    eval_3d: bool = False,
+    eval_3d: bool = True,
+    eval_diagnostics: bool = True,
+    morphology_clf: Optional[DefectMorphologyClassifier] = None,
 ) -> Dict[str, Any]:
     """
-    Runs full C-scan feature extraction and executes the 4 single-file downstream benchmark tasks:
+    Runs full C-scan feature extraction and executes the streamlined NDT benchmark tasks:
     - Task 1: Anomaly Detection (1_Anomaly_Detection/<specimen>/)
-    - Task 2: Quantitative Depth Regression (2_Depth_Regression/<specimen>/)
-    - Task 3: Defect Severity Classification (3_Severity_Classification/<specimen>/)
-    - Task 5: Representation Geometry (5_Representation_Geometry/<specimen>/)
-    - Task 6 (Optional): 3D Defect Tomography & Topological Graph (6_3D_Tomography_and_Graph/<specimen>/)
+    - Task 2: Quantitative Depth Regression on Surface Flaws (2_Depth_Regression/<specimen>/)
+    - Task 2b: Universal Flaw Size Regression (2b_Size_Regression/<specimen>/)
+    - Task 4: 3D Defect Tomography & Volumetric Slicing (3D_Tomography/<specimen>/)
+    - Task 5: High-Dimensional Latent Diagnostics (Latent_Diagnostics/<specimen>/)
     """
     fname_base = os.path.splitext(os.path.basename(file_path))[0]
     meta = extract_file_metadata(file_path)
@@ -376,13 +384,16 @@ def evaluate_single_file(
     # 1. Modular Directory Paths
     task1_dir = to_safe_path(os.path.join(output_dir, "1_Anomaly_Detection", specimen_key))
     task2_dir = to_safe_path(os.path.join(output_dir, "2_Depth_Regression", specimen_key))
-    task3_dir = to_safe_path(os.path.join(output_dir, "3_Severity_Classification", specimen_key))
-    task5_dir = to_safe_path(os.path.join(output_dir, "5_Representation_Geometry", specimen_key))
-    task6_dir = to_safe_path(os.path.join(output_dir, "6_3D_Tomography_and_Graph", specimen_key))
-    for d in [task1_dir, task2_dir, task3_dir, task5_dir]:
+    task2b_dir = to_safe_path(os.path.join(output_dir, "2b_Size_Regression", specimen_key))
+    task3d_dir = to_safe_path(os.path.join(output_dir, "3D_Tomography", specimen_key))
+    task_diag_dir = to_safe_path(os.path.join(output_dir, "Latent_Diagnostics", specimen_key))
+
+    for d in [task1_dir, task2_dir, task2b_dir]:
         os.makedirs(d, exist_ok=True)
     if eval_3d:
-        os.makedirs(task6_dir, exist_ok=True)
+        os.makedirs(task3d_dir, exist_ok=True)
+    if eval_diagnostics:
+        os.makedirs(task_diag_dir, exist_ok=True)
 
     print(f"\n--- Extracting C-Scan Features: {os.path.basename(file_path)} ---")
     grid_3d = load_cscan_from_tdms(
@@ -557,283 +568,264 @@ def evaluate_single_file(
             task1_res = {"error": str(e)}
 
     # =========================================================================
-    # Task 2: Quantitative Depth Regression (Linear Ridge vs MLP Regressor)
+    # Task 2: Defect Morphology Routing & Quantitative Depth Regression (Surface Flaws)
     # =========================================================================
     task2_res: Dict[str, Any] = {}
     pred_depth_map_path = None
     depth_scatter_path = None
 
-    if has_gt and sub_depth is not None:
-        if specimen_key == "corrosion":
-            print("    -> [Task 2/5] Quantitative Depth Sizing (Corrosion)...", flush=True)
+    # Step A: Defect Morphology Classification (Sound vs Surface vs Subsurface vs Fastener)
+    morph_preds = None
+    if morphology_clf is not None and getattr(morphology_clf, "is_fitted", False):
+        try:
+            morph_preds = morphology_clf.predict(sub_feat)
+        except Exception as e:
+            print(f"    [Morphology Warning] Classifier predict failed: {e}")
+
+    if morph_preds is None:
+        # Fallback to scan metadata if classifier uninitialized
+        morph_preds = build_morphology_labels_from_scan(specimen_key, sub_gt, sub_depth)
+
+    # Class 1: Surface Defect (Lộ thiên) - depth physically quantifiable
+    surface_flaw_detected = bool(np.sum(morph_preds == 1) >= 10)
+    has_depth_labels = (has_gt and sub_depth is not None and np.sum(sub_depth > 0.0) >= 5)
+
+    if surface_flaw_detected and has_depth_labels:
+        print("    -> [Task 2] Quantitative Depth Sizing (Surface Flaws / Lo thien)...", flush=True)
+        try:
+            bench = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
+            reg_benchmark = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=False)
             try:
-                bench = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
-                reg_benchmark = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=False)
-                try:
-                    reg_benchmark_def = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=True)
-                except Exception:
-                    reg_benchmark_def = {}
-                try:
-                    hurdle_benchmark = bench.benchmark_hurdle_depth_regression(sub_feat, sub_depth)
-                except Exception as e:
-                    hurdle_benchmark = {"error": str(e)}
+                reg_benchmark_def = bench.benchmark_depth_regression(sub_feat, sub_depth, focus_defects_only=True)
+            except Exception:
+                reg_benchmark_def = {}
+            try:
+                hurdle_benchmark = bench.benchmark_hurdle_depth_regression(sub_feat, sub_depth)
+            except Exception as e:
+                hurdle_benchmark = {"error": str(e)}
 
-                flat_feats = sub_feat.reshape(-1, sub_feat.shape[-1]).astype(np.float32)
-                flat_depth = sub_depth.reshape(-1).astype(np.float32)
+            flat_feats = sub_feat.reshape(-1, sub_feat.shape[-1]).astype(np.float32)
+            flat_depth = sub_depth.reshape(-1).astype(np.float32)
 
-                def_idx = np.where(flat_depth > 0.0)[0]
-                snd_idx = np.where(flat_depth == 0.0)[0]
-                if len(snd_idx) > 8000:
-                    rng = np.random.RandomState(42)
-                    sub_snd = rng.choice(snd_idx, size=8000, replace=False)
-                    fit_idx = np.concatenate([def_idx, sub_snd])
-                else:
-                    fit_idx = np.arange(len(flat_depth))
+            def_idx = np.where(flat_depth > 0.0)[0]
+            snd_idx = np.where(flat_depth == 0.0)[0]
+            if len(snd_idx) > 8000:
+                rng = np.random.RandomState(42)
+                sub_snd = rng.choice(snd_idx, size=8000, replace=False)
+                fit_idx = np.concatenate([def_idx, sub_snd])
+            else:
+                fit_idx = np.arange(len(flat_depth))
 
-                scaler = StandardScaler()
-                X_fit_s = scaler.fit_transform(flat_feats[fit_idx])
-                y_fit = flat_depth[fit_idx]
+            scaler = StandardScaler()
+            X_fit_s = scaler.fit_transform(flat_feats[fit_idx])
+            y_fit = flat_depth[fit_idx]
 
-                ridge = Ridge(alpha=1.0, random_state=42)
-                ridge.fit(X_fit_s, y_fit)
+            ridge = Ridge(alpha=1.0, random_state=42)
+            ridge.fit(X_fit_s, y_fit)
 
-                # Gated Two-Stage Hurdle Map Generation (sound metal -> strictly 0.00 mm, flaws -> calibrated sizing)
-                clf_gate = LogisticRegression(C=1.0, max_iter=500, class_weight="balanced", random_state=42)
-                y_bin_fit = (y_fit > 0.0).astype(int)
+            # Gated Two-Stage Hurdle Map Generation (sound metal -> strictly 0.00 mm, flaws -> calibrated sizing)
+            clf_gate = LogisticRegression(C=1.0, max_iter=500, class_weight="balanced", random_state=42)
+            y_bin_fit = (y_fit > 0.0).astype(int)
+            def_fit_mask = (y_fit > 0.0)
+
+            if len(np.unique(y_bin_fit)) >= 2 and np.sum(def_fit_mask) >= 5:
                 clf_gate.fit(X_fit_s, y_bin_fit)
                 p_all = clf_gate.predict_proba(scaler.transform(flat_feats))[:, 1]
 
-                def_fit_mask = (y_fit > 0.0)
-                if np.sum(def_fit_mask) >= 5:
-                    ridge_cond = Ridge(alpha=1.0, random_state=42)
-                    ridge_cond.fit(X_fit_s[def_fit_mask], y_fit[def_fit_mask])
-                    d_cond_all = np.maximum(0.0, ridge_cond.predict(scaler.transform(flat_feats)))
+                ridge_cond = Ridge(alpha=1.0, random_state=42)
+                ridge_cond.fit(X_fit_s[def_fit_mask], y_fit[def_fit_mask])
+                d_cond_all = np.maximum(0.0, ridge_cond.predict(scaler.transform(flat_feats)))
 
-                    # Calibrate optimal gating threshold tau on fit_idx
-                    p_fit = clf_gate.predict_proba(X_fit_s)[:, 1]
-                    d_fit_pred = np.maximum(0.0, ridge_cond.predict(X_fit_s))
-                    best_tau = 0.5
-                    best_score = -1e9
-                    for c_tau in np.linspace(0.3, 0.95, 27):
-                        score = r2_score(y_fit, np.where(p_fit >= c_tau, d_fit_pred, 0.0))
-                        if score > best_score:
-                            best_score = score
-                            best_tau = float(c_tau)
+                # Calibrate optimal gating threshold tau on fit_idx
+                p_fit = clf_gate.predict_proba(X_fit_s)[:, 1]
+                d_fit_pred = np.maximum(0.0, ridge_cond.predict(X_fit_s))
+                best_tau = 0.5
+                best_score = -1e9
+                for c_tau in np.linspace(0.3, 0.95, 27):
+                    score = r2_score(y_fit, np.where(p_fit >= c_tau, d_fit_pred, 0.0))
+                    if score > best_score:
+                        best_score = score
+                        best_tau = float(c_tau)
 
-                    from src.PECT_JEPA.spatiotemporal_5x5.evaluation.visualizations import apply_spatial_coherence_filter
-                    p_gate_bin = (p_all >= best_tau).reshape(min_Y, min_X).astype(int)
-                    p_gate_clean = apply_spatial_coherence_filter(p_gate_bin, min_area=8)
-                    pred_depth_flat = np.where(p_gate_clean.reshape(-1) == 1, d_cond_all, 0.0)
-                else:
-                    pred_depth_flat = np.clip(ridge.predict(scaler.transform(flat_feats)), 0.0, None)
+                from src.PECT_JEPA.spatiotemporal_5x5.evaluation.visualizations import apply_spatial_coherence_filter
+                p_gate_bin = (p_all >= best_tau).reshape(min_Y, min_X).astype(int)
+                p_gate_clean = apply_spatial_coherence_filter(p_gate_bin, min_area=8)
+                pred_depth_flat = np.where(p_gate_clean.reshape(-1) == 1, d_cond_all, 0.0)
+            else:
+                pred_depth_flat = np.clip(ridge.predict(scaler.transform(flat_feats)), 0.0, None)
 
-                pred_depth_map = pred_depth_flat.reshape(min_Y, min_X)
+            pred_depth_map = pred_depth_flat.reshape(min_Y, min_X)
 
-                lp_reg = reg_benchmark.get("linear_probe", {})
-                mlp_reg = reg_benchmark.get("mlp_2layer", {})
-                r2_val = lp_reg.get("r2_score", 0.0)
-                mae_val = lp_reg.get("mae_mm", 0.0)
-                rmse_val = lp_reg.get("rmse_mm", 0.0)
+            lp_reg = reg_benchmark.get("linear_probe", {})
+            mlp_reg = reg_benchmark.get("mlp_2layer", {})
+            r2_val = lp_reg.get("r2_score", 0.0)
+            mae_val = lp_reg.get("mae_mm", 0.0)
+            rmse_val = lp_reg.get("rmse_mm", 0.0)
 
-                hurdle_r2_val = hurdle_benchmark.get("compound_hurdle", {}).get("plate_r2_score") if isinstance(hurdle_benchmark, dict) else None
-                defect_r2_val = hurdle_benchmark.get("conditional_defect_sizing", {}).get("r2_score") if isinstance(hurdle_benchmark, dict) else None
-                hurdle_mae_val = hurdle_benchmark.get("compound_hurdle", {}).get("plate_mae_mm") if isinstance(hurdle_benchmark, dict) else None
+            hurdle_r2_val = hurdle_benchmark.get("compound_hurdle", {}).get("plate_r2_score") if isinstance(hurdle_benchmark, dict) else None
+            defect_r2_val = hurdle_benchmark.get("conditional_defect_sizing", {}).get("r2_score") if isinstance(hurdle_benchmark, dict) else None
+            hurdle_mae_val = hurdle_benchmark.get("compound_hurdle", {}).get("plate_mae_mm") if isinstance(hurdle_benchmark, dict) else None
 
-                pred_depth_map_path = os.path.join(task2_dir, f"{fname_base}_predicted_depth_map.png")
-                depth_scatter_path = os.path.join(task2_dir, f"{fname_base}_depth_scatter.png")
+            pred_depth_map_path = os.path.join(task2_dir, f"{fname_base}_predicted_depth_map.png")
+            depth_scatter_path = os.path.join(task2_dir, f"{fname_base}_depth_scatter.png")
 
-                plot_title = (
-                    f"Quantitative Depth Sizing | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
-                    f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')}"
-                )
-                if hurdle_r2_val is not None and defect_r2_val is not None:
-                    plot_title += f" | Hurdle R²: {hurdle_r2_val:.3f} (Defect R²: {defect_r2_val:.3f})"
+            plot_title = (
+                f"Quantitative Depth Sizing | {meta.get('specimen', '')} - {meta.get('sensor', '')}\n"
+                f"Waveform: {meta.get('waveform', '')} | Lift-off: {meta.get('liftoff', '')}"
+            )
+            if hurdle_r2_val is not None and defect_r2_val is not None:
+                plot_title += f" | Hurdle R²: {hurdle_r2_val:.3f} (Defect R²: {defect_r2_val:.3f})"
 
-                plot_depth_regression_maps(
-                    true_depth_map=sub_depth,
-                    pred_depth_map=pred_depth_map,
-                    save_path=pred_depth_map_path,
-                    title=plot_title,
-                    r2=r2_val,
-                    mae=mae_val,
-                    rmse=rmse_val,
-                )
+            plot_depth_regression_maps(
+                true_depth_map=sub_depth,
+                pred_depth_map=pred_depth_map,
+                save_path=pred_depth_map_path,
+                title=plot_title,
+                r2=r2_val,
+                mae=mae_val,
+                rmse=rmse_val,
+            )
 
-                plot_depth_calibration_scatter(
-                    true_depth=flat_depth[fit_idx],
-                    pred_depth=pred_depth_flat[fit_idx],
-                    save_path=depth_scatter_path,
-                    title=f"Depth Calibration Scatter | {fname_base}",
-                    r2=r2_val,
-                    mae=mae_val,
-                    rmse=rmse_val,
-                )
+            plot_depth_calibration_scatter(
+                true_depth=flat_depth[fit_idx],
+                pred_depth=pred_depth_flat[fit_idx],
+                save_path=depth_scatter_path,
+                title=f"Depth Calibration Scatter | {fname_base}",
+                r2=r2_val,
+                mae=mae_val,
+                rmse=rmse_val,
+            )
 
-                task2_res = {
-                    "linear_probe": lp_reg,
-                    "mlp_2layer": mlp_reg,
-                    "representation_gap": reg_benchmark.get("representation_gap", {}),
-                    "defects_only": reg_benchmark_def.get("linear_probe", {}),
-                    "hurdle_depth_protocol": hurdle_benchmark,
-                    "hurdle_plate_r2": hurdle_r2_val,
-                    "defect_only_r2": defect_r2_val,
-                    "pred_depth_map_path": pred_depth_map_path,
-                    "depth_scatter_path": depth_scatter_path,
-                }
-            except Exception as e:
-                print(f"    [Task 2 Warning] Depth regression failed: {e}")
-                task2_res = {"error": str(e)}
-        else:
             task2_res = {
-                "notice": "Fastener plate: rivets penetrate entire thickness; surface depth sizing is physically ill-posed; flaw size evaluated in Task 2b",
-                "linear_probe": {},
-                "defects_only": {},
-                "defect_only_r2": None,
-                "hurdle_plate_r2": None,
+                "linear_probe": lp_reg,
+                "mlp_2layer": mlp_reg,
+                "representation_gap": reg_benchmark.get("representation_gap", {}),
+                "defects_only": reg_benchmark_def.get("linear_probe", {}),
+                "hurdle_depth_protocol": hurdle_benchmark,
+                "hurdle_plate_r2": hurdle_r2_val,
+                "defect_only_r2": defect_r2_val,
+                "pred_depth_map_path": pred_depth_map_path,
+                "depth_scatter_path": depth_scatter_path,
+                "morphology_routing": "Surface-breaking defect (Lo thien) -> Quantitative Depth Regression executed",
             }
+        except Exception as e:
+            print(f"    [Task 2 Warning] Depth regression failed: {e}")
+            task2_res = {"error": str(e)}
+    else:
+        task2_res = {
+            "notice": "Subsurface defect / fastener structure; 1D surface depth is physically ill-posed; routed to Task 2b Universal Flaw Sizing",
+            "morphology_routing": "Subsurface defect / Fastener -> Task 2b Flaw Sizing",
+            "linear_probe": {},
+            "defects_only": {},
+            "defect_only_r2": None,
+            "hurdle_plate_r2": None,
+        }
 
     # =========================================================================
-    # Task 2b: Quantitative Flaw Size / Diameter Sizing (Valid Across All 3 Plates)
+    # Task 2b: Universal Flaw Size / Diameter Sizing (Valid Across All 3 Plates)
     # =========================================================================
     task2b_res: Dict[str, Any] = {}
-    if has_gt and sub_size is not None:
-        print("    -> [Task 2b/5] Flaw Size Diameter Sizing...", flush=True)
+    pred_size_map_path = None
+    size_scatter_path = None
+
+    if has_gt and sub_size is not None and np.sum(sub_size > 0.0) >= 5:
+        print("    -> [Task 2b] Universal Flaw Size Sizing (Diameter mm)...", flush=True)
         try:
             bench_size = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
             hurdle_size_res = bench_size.benchmark_hurdle_depth_regression(sub_feat, sub_size)
+
+            flat_feats = sub_feat.reshape(-1, sub_feat.shape[-1]).astype(np.float32)
+            flat_size = sub_size.reshape(-1).astype(np.float32)
+
+            def_idx = np.where(flat_size > 0.0)[0]
+            snd_idx = np.where(flat_size == 0.0)[0]
+            if len(snd_idx) > 8000:
+                rng = np.random.RandomState(42)
+                sub_snd = rng.choice(snd_idx, size=8000, replace=False)
+                fit_idx = np.concatenate([def_idx, sub_snd])
+            else:
+                fit_idx = np.arange(len(flat_size))
+
+            scaler = StandardScaler()
+            X_fit_s = scaler.fit_transform(flat_feats[fit_idx])
+            y_fit = flat_size[fit_idx]
+
+            clf_gate = LogisticRegression(C=1.0, max_iter=500, class_weight="balanced", random_state=42)
+            y_bin_fit = (y_fit > 0.0).astype(int)
+            def_fit_mask = (y_fit > 0.0)
+
+            if len(np.unique(y_bin_fit)) >= 2 and np.sum(def_fit_mask) >= 5:
+                clf_gate.fit(X_fit_s, y_bin_fit)
+                p_all = clf_gate.predict_proba(scaler.transform(flat_feats))[:, 1]
+
+                ridge_cond = Ridge(alpha=1.0, random_state=42)
+                ridge_cond.fit(X_fit_s[def_fit_mask], y_fit[def_fit_mask])
+                s_cond_all = np.maximum(0.0, ridge_cond.predict(scaler.transform(flat_feats)))
+
+                # Calibrate optimal gating threshold tau on fit_idx
+                p_fit = clf_gate.predict_proba(X_fit_s)[:, 1]
+                s_fit_pred = np.maximum(0.0, ridge_cond.predict(X_fit_s))
+                best_tau = 0.5
+                best_score = -1e9
+                for c_tau in np.linspace(0.3, 0.95, 27):
+                    score = r2_score(y_fit, np.where(p_fit >= c_tau, s_fit_pred, 0.0))
+                    if score > best_score:
+                        best_score = score
+                        best_tau = float(c_tau)
+
+                from src.PECT_JEPA.spatiotemporal_5x5.evaluation.visualizations import apply_spatial_coherence_filter
+                p_gate_bin = (p_all >= best_tau).reshape(min_Y, min_X).astype(int)
+                p_gate_clean = apply_spatial_coherence_filter(p_gate_bin, min_area=8)
+                pred_size_flat = np.where(p_gate_clean.reshape(-1) == 1, s_cond_all, 0.0)
+            else:
+                ridge = Ridge(alpha=1.0, random_state=42)
+                ridge.fit(X_fit_s, y_fit)
+                pred_size_flat = np.clip(ridge.predict(scaler.transform(flat_feats)), 0.0, None)
+
+            pred_size_map = pred_size_flat.reshape(min_Y, min_X)
+
+            size_hurdle_r2 = hurdle_size_res.get("compound_hurdle", {}).get("plate_r2_score")
+            size_defect_r2 = hurdle_size_res.get("conditional_defect_sizing", {}).get("r2_score")
+            size_defect_mae = hurdle_size_res.get("conditional_defect_sizing", {}).get("mae_mm")
+
+            pred_size_map_path = os.path.join(task2b_dir, f"{fname_base}_predicted_size_map.png")
+            size_scatter_path = os.path.join(task2b_dir, f"{fname_base}_flaw_size_scatter.png")
+
+            plot_flaw_size_maps(
+                true_size_map=sub_size,
+                pred_size_map=pred_size_map,
+                save_path=pred_size_map_path,
+                title=f"Universal Flaw Sizing Map | {meta.get('specimen', '')} - {meta.get('sensor', '')} ({meta.get('waveform', '')})",
+            )
+
+            plot_flaw_size_calibration_scatter(
+                true_sizes=flat_size[fit_idx],
+                pred_sizes=pred_size_flat[fit_idx],
+                save_path=size_scatter_path,
+                title=f"Flaw Size Calibration Scatter | {fname_base}",
+                r2=size_defect_r2,
+                mae=size_defect_mae,
+                unit="mm",
+            )
+
             task2b_res = {
-                "flaw_size_hurdle_r2": hurdle_size_res.get("compound_hurdle", {}).get("plate_r2_score"),
-                "flaw_size_defect_r2": hurdle_size_res.get("conditional_defect_sizing", {}).get("r2_score"),
-                "flaw_size_defect_mae_mm": hurdle_size_res.get("conditional_defect_sizing", {}).get("mae_mm"),
+                "flaw_size_hurdle_r2": size_hurdle_r2,
+                "flaw_size_defect_r2": size_defect_r2,
+                "flaw_size_defect_mae_mm": size_defect_mae,
+                "pred_size_map_path": pred_size_map_path,
+                "size_scatter_path": size_scatter_path,
+                "size_pairs": (flat_size[fit_idx].copy(), pred_size_flat[fit_idx].copy()),
             }
         except Exception as e:
+            print(f"    [Task 2b Warning] Flaw size regression failed: {e}")
             task2b_res = {"error": str(e)}
 
     # =========================================================================
-    # Task 3: Defect Severity Classification (4-Class Depth Bins)
+    # Task 3: 3D Defect Tomography & Topological Graph Representation
     # =========================================================================
-    task3_res: Dict[str, Any] = {}
-    cm_path = None
-
-    if has_gt and sub_sev is not None:
-        print("    -> [Task 3/5] Defect Severity Classification...", flush=True)
-        try:
-            bench = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
-            sev_benchmark = bench.benchmark_severity_classification(sub_feat, sub_sev)
-
-            valid_idx = np.where(sub_sev.reshape(-1) >= 0)[0]
-            X_v = sub_feat.reshape(-1, sub_feat.shape[-1])[valid_idx].astype(np.float32)
-            y_v = sub_sev.reshape(-1)[valid_idx].astype(np.int64)
-
-            c0 = np.where(y_v == 0)[0]
-            c_other = np.where(y_v > 0)[0]
-            if len(c0) > 8000:
-                rng = np.random.RandomState(42)
-                sub_c0 = rng.choice(c0, size=8000, replace=False)
-                eval_idx = np.concatenate([c_other, sub_c0])
-                X_v = X_v[eval_idx]
-                y_v = y_v[eval_idx]
-
-            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-            y_true_all, y_pred_all = [], []
-            for tr, te in skf.split(X_v, y_v):
-                sc = StandardScaler()
-                X_tr_s = sc.fit_transform(X_v[tr])
-                X_te_s = sc.transform(X_v[te])
-                lr = LogisticRegression(C=1.0, class_weight="balanced", max_iter=500, tol=1e-3, random_state=42, solver="lbfgs")
-                lr.fit(X_tr_s, y_v[tr])
-                preds = lr.predict(X_te_s)
-                y_true_all.append(y_v[te])
-                y_pred_all.append(preds)
-
-            cm_y_true = np.concatenate(y_true_all)
-            cm_y_pred = np.concatenate(y_pred_all)
-
-            cm_path = os.path.join(task3_dir, f"{fname_base}_confusion_matrix.png")
-            lp_sev = sev_benchmark.get("linear_probe", {})
-            mlp_sev = sev_benchmark.get("mlp_2layer", {})
-            lp_f1 = lp_sev.get("macro_f1", 0.0)
-            lp_acc = lp_sev.get("accuracy", 0.0)
-
-            plot_severity_confusion_matrix(
-                y_true=cm_y_true,
-                y_pred=cm_y_pred,
-                save_path=cm_path,
-                title=f"Severity Classification | {meta.get('specimen', '')} - {meta.get('sensor', '')}",
-                macro_f1=lp_f1,
-                accuracy=lp_acc,
-            )
-
-            task3_res = {
-                "linear_probe": lp_sev,
-                "mlp_2layer": mlp_sev,
-                "representation_gap": sev_benchmark.get("representation_gap", {}),
-                "confusion_matrix_path": cm_path,
-            }
-        except Exception as e:
-            print(f"    [Task 3 Warning] Severity classification failed: {e}")
-            task3_res = {"error": str(e)}
-
-    # =========================================================================
-    # Task 5: Representation Geometry (PCA-RGB + Angular Distance + CAD Overlay)
-    # =========================================================================
-    print("    -> [Task 5/5] Representation Geometry Analysis...", flush=True)
-    latent_geom_path = os.path.join(task5_dir, f"{fname_base}_latent_geometry.png")
-    lq_dict = plot_latent_representation_quality(
-        feature_map=feature_map,
-        gt_mask=gt_mask,
-        save_path=latent_geom_path,
-        title_prefix=f"{meta.get('specimen', '')} - {meta.get('sensor', '')} ({meta.get('liftoff', '')})",
-        close_fig=True,
-    )
-
-    if save_features:
-        feat_path = to_safe_path(os.path.join(output_dir, f"{fname_base}_features_5x5.npy"))
-        np.save(feat_path, feature_map)
-
-    # Consolidated flat metrics for summary tables & CSV
-    t1_lp = task1_res.get("linear_probe", {})
-    t1_mlp = task1_res.get("mlp_2layer", {})
-    t2_lp = task2_res.get("linear_probe", {})
-    t3_lp = task3_res.get("linear_probe", {})
-
-    metrics_flat: Dict[str, Any] = {
-        "has_ground_truth": has_gt,
-        "contrast_ratio_cnr": task1_res.get("contrast_ratio_cnr"),
-        "peak_contrast_ratio": task1_res.get("peak_contrast_ratio"),
-        "auc_roc": t1_lp.get("auc_roc"),
-        "average_precision": t1_lp.get("average_precision"),
-        "best_f1": t1_lp.get("f1_score"),
-        "linear_probe_auc_roc": t1_lp.get("auc_roc"),
-        "linear_probe_average_precision": t1_lp.get("average_precision"),
-        "linear_probe_f1": t1_lp.get("f1_score"),
-        "mlp_2layer_auc_roc": t1_mlp.get("auc_roc"),
-        "mlp_2layer_ap": t1_mlp.get("average_precision"),
-        "mlp_2layer_f1": t1_mlp.get("f1_score"),
-        "delta_auc": task1_res.get("representation_gap", {}).get("delta_auc_roc"),
-        "depth_r2": t2_lp.get("r2_score"),
-        "hurdle_plate_r2": task2_res.get("hurdle_plate_r2"),
-        "defect_only_r2": task2_res.get("defect_only_r2"),
-        "depth_mae_mm": t2_lp.get("mae_mm"),
-        "depth_rmse_mm": t2_lp.get("rmse_mm"),
-        "severity_macro_f1": t3_lp.get("macro_f1"),
-        "severity_accuracy": t3_lp.get("accuracy"),
-        "knn_5_accuracy": task1_res.get("knn_5_accuracy"),
-        "unsupervised_maha_auc": task1_res.get("unsupervised_mahalanobis", {}).get("auc_roc"),
-        "unsupervised_maha_ap": task1_res.get("unsupervised_mahalanobis", {}).get("average_precision"),
-        "unsupervised_maha_cnr": task1_res.get("unsupervised_mahalanobis", {}).get("contrast_ratio_cnr"),
-        "defect_iou_jaccard": task1_res.get("segmentation_iou", {}).get("iou"),
-        "defect_dice_f1": task1_res.get("segmentation_iou", {}).get("dice"),
-        "flaw_size_defect_r2": task2b_res.get("flaw_size_defect_r2"),
-        "flaw_size_defect_mae_mm": task2b_res.get("flaw_size_defect_mae_mm"),
-        "flaw_size_plate_r2": task2b_res.get("flaw_size_hurdle_r2"),
-    }
-
-    # =========================================================================
-    # Task 6: 3D Defect Tomography & Topological Graph Representation
-    # =========================================================================
-    task6_res: Dict[str, Any] = {}
-    if volume_3d is not None:
+    task3d_res: Dict[str, Any] = {}
+    if eval_3d and volume_3d is not None:
+        print("    -> [Task 3] 3D Volumetric Tomography & Topological Graph...", flush=True)
         try:
             from .evaluation.tomography_3d import (
                 plot_3d_ortho_slices,
@@ -856,7 +848,7 @@ def evaluate_single_file(
                 v_gated = v_sub
 
             # 1. Multi-slice Orthogonal Visualization
-            ortho_path = os.path.join(task6_dir, f"{fname_base}_3d_ortho_slices.png")
+            ortho_path = os.path.join(task3d_dir, f"{fname_base}_3d_ortho_slices.png")
             plot_3d_ortho_slices(
                 volume_3d=v_gated,
                 mask_2d=sub_gt,
@@ -866,7 +858,7 @@ def evaluate_single_file(
             )
 
             # 2. Interactive 3D HTML
-            html_3d_path = os.path.join(task6_dir, f"{fname_base}_3d_tomography.html")
+            html_3d_path = os.path.join(task3d_dir, f"{fname_base}_3d_tomography.html")
             export_3d_interactive_html(
                 volume_3d=v_gated,
                 save_path=html_3d_path,
@@ -888,7 +880,7 @@ def evaluate_single_file(
                 corrosion_metrics = compute_corrosion_volume(graph_data)
 
             # 5. Graph Plots
-            graph_png_path = os.path.join(task6_dir, f"{fname_base}_defect_graph_3d.png")
+            graph_png_path = os.path.join(task3d_dir, f"{fname_base}_defect_graph_3d.png")
             plot_defect_graph_3d(
                 graph_data=graph_data,
                 crack_metrics=crack_metrics,
@@ -896,7 +888,7 @@ def evaluate_single_file(
                 title=f"3D Defect Graph Network: {fname_base}",
             )
 
-            graph_html_path = os.path.join(task6_dir, f"{fname_base}_defect_graph_3d.html")
+            graph_html_path = os.path.join(task3d_dir, f"{fname_base}_defect_graph_3d.html")
             export_graph_interactive_html(
                 graph_data=graph_data,
                 crack_metrics=crack_metrics,
@@ -904,7 +896,7 @@ def evaluate_single_file(
                 title=f"Interactive 3D Defect Graph: {fname_base}",
             )
 
-            task6_res = {
+            task3d_res = {
                 "ortho_slices_path": ortho_path,
                 "interactive_3d_html": html_3d_path,
                 "graph_plot_path": graph_png_path,
@@ -915,11 +907,89 @@ def evaluate_single_file(
                 "corrosion_metrics": corrosion_metrics,
             }
             if crack_metrics and "crack_length_mm" in crack_metrics:
-                print(f"    --> [3D Graph NDT] Crack Length L={crack_metrics['crack_length_mm']:.2f} mm | Morphology: {crack_metrics.get('morphology')}")
+                print(f"       [3D Graph NDT] Crack Length L={crack_metrics['crack_length_mm']:.2f} mm | Morphology: {crack_metrics.get('morphology')}")
             elif corrosion_metrics and "volumetric_metal_loss_mm3" in corrosion_metrics:
-                print(f"    --> [3D Graph NDT] Metal Loss V={corrosion_metrics['volumetric_metal_loss_mm3']:.2f} mm³ | Area: {corrosion_metrics.get('surface_area_mm2')} mm²")
+                print(f"       [3D Graph NDT] Metal Loss V={corrosion_metrics['volumetric_metal_loss_mm3']:.2f} mm³ | Area: {corrosion_metrics.get('surface_area_mm2')} mm²")
         except Exception as e:
-            print(f"  [Task 6 Notice] 3D Tomography & Graph failed: {e}")
+            print(f"    [Task 3 Warning] 3D Tomography & Graph failed: {e}")
+            task3d_res = {"error": str(e)}
+
+    # =========================================================================
+    # Task 4: High-Dimensional Latent Diagnostics (Fisher Spectrum & Subspace Separation)
+    # =========================================================================
+    task_diag_res: Dict[str, Any] = {}
+    if eval_diagnostics and has_gt and sub_gt is not None:
+        print("    -> [Task 4] High-Dimensional Latent Forensics...", flush=True)
+        try:
+            sens_path = os.path.join(task_diag_dir, f"{fname_base}_channel_sensitivity.png")
+            sens_res = compute_channel_sensitivity_spectrum(
+                features=sub_feat,
+                gt_labels=sub_gt,
+                save_path=sens_path,
+                title=f"Latent Coordinate Defect Sensitivity Spectrum | {fname_base}",
+            )
+
+            morph_path = os.path.join(task_diag_dir, f"{fname_base}_morphology_separation.png")
+            morph_labels = build_morphology_labels_from_scan(specimen_key, sub_gt, sub_depth)
+            sep_res = compute_morphology_subspace_separation(
+                features=sub_feat,
+                morphology_labels=morph_labels,
+                save_path=morph_path,
+                title=f"Defect Morphology Subspace Separation Matrix | {fname_base}",
+            )
+
+            task_diag_res = {
+                "mean_channel_sensitivity": sens_res.get("mean_sensitivity"),
+                "max_channel_sensitivity": sens_res.get("max_sensitivity"),
+                "top_active_channels": sens_res.get("top_channels"),
+                "channel_sensitivity_path": sens_path,
+                "morphology_separation_path": morph_path,
+                "cosine_distance_matrix": sep_res.get("cosine_distance_matrix"),
+            }
+        except Exception as e:
+            print(f"    [Task 4 Warning] Latent diagnostics failed: {e}")
+            task_diag_res = {"error": str(e)}
+
+    if save_features:
+        feat_path = to_safe_path(os.path.join(output_dir, f"{fname_base}_features_5x5.npy"))
+        np.save(feat_path, feature_map)
+
+    # Consolidated flat metrics for summary tables & CSV
+    t1_lp = task1_res.get("linear_probe", {})
+    t1_mlp = task1_res.get("mlp_2layer", {})
+    t2_lp = task2_res.get("linear_probe", {})
+
+    metrics_flat: Dict[str, Any] = {
+        "has_ground_truth": has_gt,
+        "contrast_ratio_cnr": task1_res.get("contrast_ratio_cnr"),
+        "peak_contrast_ratio": task1_res.get("peak_contrast_ratio"),
+        "auc_roc": t1_lp.get("auc_roc"),
+        "average_precision": t1_lp.get("average_precision"),
+        "best_f1": t1_lp.get("f1_score"),
+        "linear_probe_auc_roc": t1_lp.get("auc_roc"),
+        "linear_probe_average_precision": t1_lp.get("average_precision"),
+        "linear_probe_f1": t1_lp.get("f1_score"),
+        "mlp_2layer_auc_roc": t1_mlp.get("auc_roc"),
+        "mlp_2layer_ap": t1_mlp.get("average_precision"),
+        "mlp_2layer_f1": t1_mlp.get("f1_score"),
+        "delta_auc": task1_res.get("representation_gap", {}).get("delta_auc_roc"),
+        "depth_r2": t2_lp.get("r2_score"),
+        "hurdle_plate_r2": task2_res.get("hurdle_plate_r2"),
+        "defect_only_r2": task2_res.get("defect_only_r2"),
+        "depth_mae_mm": t2_lp.get("mae_mm"),
+        "depth_rmse_mm": t2_lp.get("rmse_mm"),
+        "knn_5_accuracy": task1_res.get("knn_5_accuracy"),
+        "unsupervised_maha_auc": task1_res.get("unsupervised_mahalanobis", {}).get("auc_roc"),
+        "unsupervised_maha_ap": task1_res.get("unsupervised_mahalanobis", {}).get("average_precision"),
+        "unsupervised_maha_cnr": task1_res.get("unsupervised_mahalanobis", {}).get("contrast_ratio_cnr"),
+        "defect_iou_jaccard": task1_res.get("segmentation_iou", {}).get("iou"),
+        "defect_dice_f1": task1_res.get("segmentation_iou", {}).get("dice"),
+        "flaw_size_defect_r2": task2b_res.get("flaw_size_defect_r2"),
+        "flaw_size_defect_mae_mm": task2b_res.get("flaw_size_defect_mae_mm"),
+        "flaw_size_plate_r2": task2b_res.get("flaw_size_hurdle_r2"),
+        "mean_latent_sensitivity": task_diag_res.get("mean_channel_sensitivity"),
+        "max_latent_sensitivity": task_diag_res.get("max_channel_sensitivity"),
+    }
 
     eval_sample = None
     if has_gt and sub_gt is not None:
@@ -937,21 +1007,17 @@ def evaluate_single_file(
         "task1_anomaly_detection": task1_res,
         "task2_depth_regression": task2_res,
         "task2b_flaw_size_sizing": task2b_res,
-        "task3_severity_classification": task3_res,
-        "task5_representation_geometry": {
-            "latent_quality": lq_dict,
-            "latent_geometry_path": latent_geom_path,
-        },
-        "task6_3d_tomography_and_graph": task6_res,
+        "task3_3d_tomography": task3d_res,
+        "task4_latent_diagnostics": task_diag_res,
         "_eval_sample": eval_sample,
     }
 
     auc_str = f" | AUC: {metrics_flat['auc_roc']:.4f} | AP: {metrics_flat['average_precision']:.4f}" if metrics_flat.get("auc_roc") is not None else ""
     cnr_str = f" | CNR: {metrics_flat['contrast_ratio_cnr']:.2f}" if metrics_flat.get("contrast_ratio_cnr") is not None else ""
-    r2_str = f" | R²: {metrics_flat['depth_r2']:.3f}" if metrics_flat.get("depth_r2") is not None else ""
-    f1_str = f" | Sev-F1: {metrics_flat['severity_macro_f1']:.3f}" if metrics_flat.get("severity_macro_f1") is not None else ""
+    r2_str = f" | Depth-R²: {metrics_flat['defect_only_r2']:.3f}" if metrics_flat.get("defect_only_r2") is not None else ""
+    sz_str = f" | Size-R²: {metrics_flat['flaw_size_defect_r2']:.3f}" if metrics_flat.get("flaw_size_defect_r2") is not None else ""
     iou_str = f" | IoU: {metrics_flat['defect_iou_jaccard']:.3f}" if metrics_flat.get("defect_iou_jaccard") is not None else ""
-    print(f"  [Result]{cnr_str}{auc_str}{r2_str}{f1_str}{iou_str}", flush=True)
+    print(f"  [Result]{cnr_str}{auc_str}{r2_str}{sz_str}{iou_str}", flush=True)
     import matplotlib.pyplot as plt
     plt.close('all')
     import gc
@@ -1126,132 +1192,97 @@ def run_cross_file_ood_benchmark(
 
     return ood_summary
 
-
-def evaluate_liftoff_invariance(
-    file_paths: List[str],
+def train_base_morphology_classifier(
     model: PECT_JEPA_5x5,
-    output_dir: str,
+    train_files: List[str],
+    data_dir: str = "data",
     batch_size: int = 512,
     device: str = "cuda",
     crop_border: int = 15,
-) -> Dict[str, Any]:
+    max_train_files: int = 12,
+    pts_per_class: int = 3000,
+) -> Optional[DefectMorphologyClassifier]:
     """
-    Computes Linear CKA and Cosine Similarity across lift-off variations (z1 vs z2 vs z3)
-    and plots the lift-off CKA matrix in 4_Liftoff_Invariance/.
+    Fits DefectMorphologyClassifier on base training representations across
+    different specimen plates (Corrosion, Rivet, Mixed) to dynamically classify:
+      0: Sound Metal
+      1: Surface Defect (Lộ thiên)
+      2: Subsurface Defect (Trong lòng)
+      3: Fastener Structure
     """
-    print("\n" + "=" * 70)
-    print("  RUNNING MULTI-LIFT-OFF INVARIANCE ANALYSIS (Linear CKA & Cosine Sim)")
-    print("=" * 70)
+    gt_mgr = get_ground_truth_manager(data_dir=data_dir)
+    by_specimen: Dict[str, List[str]] = {}
+    for fp in train_files:
+        sp = gt_mgr.canonical_specimen_key(fp)
+        by_specimen.setdefault(sp, []).append(fp)
 
-    task4_dir = to_safe_path(os.path.join(output_dir, "4_Liftoff_Invariance"))
-    os.makedirs(task4_dir, exist_ok=True)
+    selected_files = []
+    for sp, flist in by_specimen.items():
+        selected_files.extend(flist[:max(2, max_train_files // max(1, len(by_specimen)))])
 
-    meta_by_fp = {fp: extract_file_metadata(fp) for fp in file_paths}
-    groups: Dict[tuple, Dict[str, str]] = {}
-    for fp, m in meta_by_fp.items():
-        key = (m.get("specimen"), m.get("sensor"), m.get("waveform"))
-        lo = m.get("liftoff")
-        if lo:
-            groups.setdefault(key, {})[lo] = fp
+    all_feats = []
+    all_morph = []
 
-    liftoff_results = []
-    pairwise_ckas: Dict[Tuple[str, str], List[float]] = {}
+    for fp in selected_files:
+        mask = find_ground_truth_mask(fp, data_dir=data_dir)
+        if mask is None:
+            continue
+        sp_key = gt_mgr.canonical_specimen_key(fp)
+        depth_gt = gt_mgr.generate_depth_map(sp_key)
+        try:
+            grid = load_cscan_from_tdms(
+                fp,
+                time_samples=model.config.time_samples,
+                temporal_samples=model.config.temporal_samples,
+                resample_mode=model.config.resample_mode,
+                normalization=model.config.normalization,
+                raster_correction=model.config.raster_correction,
+                crop_border=crop_border,
+                apply_lowpass=getattr(model.config, "apply_lowpass", True),
+                lowpass_cutoff=getattr(model.config, "lowpass_cutoff", 2500.0),
+                lowpass_order=getattr(model.config, "lowpass_order", 4),
+            )
+            fmap = extract_full_cscan_map(model, grid, batch_size=batch_size, device=device, show_pbar=False)
+            min_Y = min(fmap.shape[0], mask.shape[0])
+            min_X = min(fmap.shape[1], mask.shape[1])
+            sub_f = fmap[:min_Y, :min_X].reshape(-1, fmap.shape[-1])
+            sub_m = build_morphology_labels_from_scan(
+                sp_key,
+                mask[:min_Y, :min_X],
+                depth_gt[:min_Y, :min_X] if depth_gt is not None else None,
+            ).reshape(-1)
 
-    # Select representative triplets (1 per specimen: corrosion, rivet_v1, rivet_v2) for fast & balanced evaluation
-    selected_groups = {}
-    for key, lo_files in groups.items():
-        if len(lo_files) >= 2:
-            sp = key[0] or "unknown"
-            if sp not in selected_groups:
-                selected_groups[sp] = (key, lo_files)
-            if len(selected_groups) >= 3:
-                break
+            classes_in_scan = np.unique(sub_m)
+            keep_indices = []
+            rng = np.random.RandomState(42)
+            for c in classes_in_scan:
+                c_idx = np.where(sub_m == c)[0]
+                if len(c_idx) > pts_per_class:
+                    c_idx = rng.choice(c_idx, size=pts_per_class, replace=False)
+                keep_indices.append(c_idx)
+            if keep_indices:
+                sel = np.concatenate(keep_indices)
+                all_feats.append(sub_f[sel])
+                all_morph.append(sub_m[sel])
+        except Exception as e:
+            print(f"  [Morphology Train Warning] Skipping {os.path.basename(fp)}: {e}", flush=True)
 
-    for sp, (key, lo_files) in selected_groups.items():
-        liftoff_keys = sorted(lo_files.keys())
-        if len(liftoff_keys) >= 2:
-            specimen, sensor, waveform = key
-            print(f"\nEvaluating Lift-off Invariance: Specimen={specimen}, Sensor={sensor}, Waveform={waveform}", flush=True)
-            print(f"  Available lift-off levels: {liftoff_keys}", flush=True)
+    if not all_feats:
+        print("  [Morphology Warning] No training representations collected; will fall back to scan metadata routing.", flush=True)
+        return None
 
-            features_by_lo = {}
-            for lo in liftoff_keys:
-                fp = lo_files[lo]
-                grid = load_cscan_from_tdms(
-                    fp,
-                    time_samples=model.config.time_samples,
-                    temporal_samples=model.config.temporal_samples,
-                    resample_mode=model.config.resample_mode,
-                    normalization=model.config.normalization,
-                    raster_correction=model.config.raster_correction,
-                    crop_border=crop_border,
-                )
-                fmap = extract_full_cscan_map(model, grid, batch_size=batch_size, device=device, show_pbar=False)
-                features_by_lo[lo] = fmap.reshape(-1, fmap.shape[-1])
+    X_train = np.concatenate(all_feats, axis=0)
+    y_train = np.concatenate(all_morph, axis=0)
 
-            for i in range(len(liftoff_keys)):
-                for j in range(i + 1, len(liftoff_keys)):
-                    lo_a = liftoff_keys[i]
-                    lo_b = liftoff_keys[j]
-                    fa = features_by_lo[lo_a]
-                    fb = features_by_lo[lo_b]
+    if len(np.unique(y_train)) < 2:
+        print("  [Morphology Warning] Insufficient morphology classes in train pool; will fall back to scan metadata routing.", flush=True)
+        return None
 
-                    n_sub = min(10000, fa.shape[0])
-                    sub_idx = np.random.RandomState(42).choice(fa.shape[0], size=n_sub, replace=False)
-
-                    cka = float(compute_linear_cka(fa[sub_idx], fb[sub_idx]))
-                    cos_sim = float(compute_feature_similarity_matrix(fa[sub_idx], fb[sub_idx]))
-
-                    print(f"  --> Pair ({lo_a} vs {lo_b}): Linear CKA = {cka:.4f} | Mean Cosine Sim = {cos_sim:.4f}")
-                    liftoff_results.append({
-                        "specimen": specimen,
-                        "sensor": sensor,
-                        "waveform": waveform,
-                        "pair": f"{lo_a}_vs_{lo_b}",
-                        "liftoff_a": lo_a,
-                        "liftoff_b": lo_b,
-                        "linear_cka": round(cka, 5),
-                        "cosine_similarity": round(cos_sim, 5),
-                    })
-                    pair_tuple = tuple(sorted([lo_a, lo_b]))
-                    pairwise_ckas.setdefault(pair_tuple, []).append(cka)
-
-    # 3x3 Lift-off Invariance Matrix Heatmap (z1, z2, z3)
-    lo_levels = ["z1", "z2", "z3"]
-    cka_matrix = np.eye(len(lo_levels), dtype=np.float32)
-    for i, la in enumerate(lo_levels):
-        for j, lb in enumerate(lo_levels):
-            if i != j:
-                pt = tuple(sorted([la, lb]))
-                if pt in pairwise_ckas and pairwise_ckas[pt]:
-                    cka_matrix[i, j] = float(np.mean(pairwise_ckas[pt]))
-
-    cka_matrix_plot_path = os.path.join(task4_dir, "liftoff_cka_matrix.png")
-    plot_liftoff_cka_heatmap(
-        cka_matrix=cka_matrix,
-        labels=lo_levels,
-        save_path=cka_matrix_plot_path,
-        title="5x5 PECT-JEPA Multi-Lift-Off Linear CKA Invariance",
-    )
-
-    mean_cka = float(np.mean([r["linear_cka"] for r in liftoff_results])) if liftoff_results else None
-    mean_cos = float(np.mean([r["cosine_similarity"] for r in liftoff_results])) if liftoff_results else None
-
-    summary = {
-        "total_pairs_evaluated": len(liftoff_results),
-        "mean_linear_cka": mean_cka,
-        "mean_cosine_similarity": mean_cos,
-        "liftoff_levels": lo_levels,
-        "cka_matrix": cka_matrix.tolist(),
-        "cka_matrix_plot_path": cka_matrix_plot_path,
-        "pairwise_results": liftoff_results,
-    }
-
-    lo_json_path = os.path.join(task4_dir, "liftoff_invariance_summary.json")
-    with open(lo_json_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\nSaved lift-off invariance artifacts to: {task4_dir}")
-    return summary
+    print(f"  Fitting Morphology Classifier on {len(y_train)} samples across classes: {np.unique(y_train).tolist()}...", flush=True)
+    clf = DefectMorphologyClassifier(classifier_type="linear", random_state=42)
+    clf.fit(X_train, y_train)
+    print("  Morphology Classifier fitted successfully!\n", flush=True)
+    return clf
 
 
 def main():
@@ -1268,7 +1299,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 70)
-    print("  5x5 SPATIOTEMPORAL PECT-JEPA MODULAR EVALUATION SUITE")
+    print("  5x5 SPATIOTEMPORAL PECT-JEPA STREAMLINED EVALUATION SUITE")
     print("=" * 70)
     print(f"[Evaluation] Model Checkpoint: {checkpoint_path}")
     print(f"[Evaluation] Output Directory: {args.output_dir}")
@@ -1333,10 +1364,32 @@ def main():
 
     crop_border = args.crop_border if args.crop_border is not None else getattr(model.config, "crop_border", 15)
 
-    # 2. Evaluate each test file for Tasks 1, 2, 3, 5
+    # 2. Fit base DefectMorphologyClassifier on training pool (if available)
+    morphology_clf = None
+    if train_files and len(train_files) > 0 and protocol_name != "single_file":
+        try:
+            print("\n--- Training Base Defect Morphology Classifier ---", flush=True)
+            morphology_clf = train_base_morphology_classifier(
+                model=model,
+                train_files=train_files,
+                data_dir=args.data_dir,
+                batch_size=args.batch_size,
+                device=args.device,
+                crop_border=crop_border,
+            )
+        except Exception as e:
+            print(f"  [Morphology Warning] Could not train morphology classifier: {e}", flush=True)
+
+    # 3. Evaluate each test file across Streamlined Tasks:
+    #    Task 1: Anomaly Detection (1_Anomaly_Detection/<specimen>/)
+    #    Task 2: Depth Regression on Surface Flaws (2_Depth_Regression/<specimen>/)
+    #    Task 2b: Universal Flaw Size Regression (2b_Size_Regression/<specimen>/)
+    #    Task 3: 3D Volumetric Tomography (3D_Tomography/<specimen>/)
+    #    Task 4: High-Dimensional Latent Diagnostics (Latent_Diagnostics/<specimen>/)
     file_results = []
     test_features_cache = {}
-    print(f"\n--- Evaluating {len(test_files)} Test Scans across 5 Benchmark Tasks ---", flush=True)
+    all_size_pairs = []
+    print(f"\n--- Evaluating {len(test_files)} Test Scans across Streamlined Benchmark Tasks ---", flush=True)
     for idx, fp in enumerate(test_files):
         print(f"\n[{idx + 1}/{len(test_files)}] Processing: {os.path.basename(fp)}", flush=True)
         res = evaluate_single_file(
@@ -1348,10 +1401,19 @@ def main():
             save_features=args.save_features,
             crop_border=crop_border,
             eval_3d=args.eval_3d,
+            eval_diagnostics=args.eval_diagnostics,
+            morphology_clf=morphology_clf,
         )
         if "_eval_sample" in res and res["_eval_sample"] is not None:
             test_features_cache[fp] = res["_eval_sample"]
             del res["_eval_sample"]
+
+        # Collect size calibration scatter pairs
+        t2b_sizing = res.get("task2b_flaw_size_sizing", {})
+        if "size_pairs" in t2b_sizing:
+            all_size_pairs.append(t2b_sizing["size_pairs"])
+            del t2b_sizing["size_pairs"]
+
         file_results.append(res)
         import matplotlib.pyplot as plt
         plt.close('all')
@@ -1361,7 +1423,33 @@ def main():
             torch.cuda.empty_cache()
         sys.stdout.flush()
 
-    # 3. Task 1b: True Zero-Shot Cross-File OOD Benchmark
+    # 4. Global Flaw Size Calibration Scatter Plot
+    if all_size_pairs:
+        try:
+            valid_pairs = [p for p in all_size_pairs if len(p[0]) > 0 and len(p[1]) > 0]
+            if valid_pairs:
+                y_true_all_sz = np.concatenate([p[0] for p in valid_pairs])
+                y_pred_all_sz = np.concatenate([p[1] for p in valid_pairs])
+                if len(y_true_all_sz) >= 2:
+                    global_scatter_dir = os.path.join(args.output_dir, "2b_Size_Regression")
+                    os.makedirs(global_scatter_dir, exist_ok=True)
+                    global_scatter_path = os.path.join(global_scatter_dir, "global_flaw_size_calibration_scatter.png")
+                    r2_sz = float(r2_score(y_true_all_sz, y_pred_all_sz))
+                    mae_sz = float(mean_absolute_error(y_true_all_sz, y_pred_all_sz))
+                    plot_flaw_size_calibration_scatter(
+                        true_sizes=y_true_all_sz,
+                        pred_sizes=y_pred_all_sz,
+                        save_path=global_scatter_path,
+                        title="Global Flaw Size Calibration Scatter (All Evaluated Scans)",
+                        r2=r2_sz,
+                        mae=mae_sz,
+                        unit="mm",
+                    )
+                    print(f"  [Size Regression] Saved global flaw size calibration scatter to: {global_scatter_path}", flush=True)
+        except Exception as e:
+            print(f"  [Size Regression Warning] Failed to generate global size scatter: {e}", flush=True)
+
+    # 5. Task 1b: True Zero-Shot Cross-File OOD Benchmark
     cross_file_ood_summary = {}
     if train_files and len(train_files) > 0 and len(test_files) > 0 and protocol_name != "single_file":
         try:
@@ -1379,24 +1467,8 @@ def main():
         except Exception as e:
             print(f"  [OOD Benchmark Warning] Cross-file OOD evaluation failed: {e}", flush=True)
 
-    # 4. Task 4: Lift-off Invariance Analysis (run by default if multiple lift-offs exist)
-    liftoff_summary = {}
-    if args.eval_liftoff:
-        all_pool = find_all_tdms_files(args.data_dir)
-        try:
-            liftoff_summary = evaluate_liftoff_invariance(
-                file_paths=all_pool,
-                model=model,
-                output_dir=args.output_dir,
-                batch_size=args.batch_size,
-                device=args.device,
-                crop_border=crop_border,
-            )
-        except Exception as e:
-            print(f"  [Task 4 Warning] Lift-off invariance analysis failed: {e}")
-
     # =========================================================================
-    # 4. Generate Dedicated Per-Task Summaries (1_, 2_, 3_, 5_)
+    # 6. Generate Dedicated Per-Task Summaries
     # =========================================================================
     specimen_groups: Dict[str, List[Dict[str, Any]]] = {}
     for r in file_results:
@@ -1410,8 +1482,9 @@ def main():
         aps = [r["metrics"]["linear_probe_average_precision"] for r in sp_results if r["metrics"].get("linear_probe_average_precision") is not None]
         f1s = [r["metrics"]["linear_probe_f1"] for r in sp_results if r["metrics"].get("linear_probe_f1") is not None]
         cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in sp_results if r["metrics"].get("contrast_ratio_cnr") is not None]
-        mlp_aucs = [r["metrics"]["mlp_2layer_auc_roc"] for r in sp_results if r["metrics"].get("mlp_2layer_auc_roc") is not None]
-        delta_aucs = [r["metrics"]["delta_auc"] for r in sp_results if r["metrics"].get("delta_auc") is not None]
+        ious = [r["metrics"]["defect_iou_jaccard"] for r in sp_results if r["metrics"].get("defect_iou_jaccard") is not None]
+        dices = [r["metrics"]["defect_dice_f1"] for r in sp_results if r["metrics"].get("defect_dice_f1") is not None]
+        maha_aucs = [r["metrics"]["unsupervised_maha_auc"] for r in sp_results if r["metrics"].get("unsupervised_maha_auc") is not None]
 
         sp_t1_summary = {
             "specimen": sp,
@@ -1423,13 +1496,10 @@ def main():
                 "mean_average_precision": float(np.mean(aps)) if aps else None,
                 "mean_f1": float(np.mean(f1s)) if f1s else None,
             },
-            "mlp_2layer": {
-                "mean_auc_roc": float(np.mean(mlp_aucs)) if mlp_aucs else None,
-            },
-            "representation_gap": {
-                "mean_delta_auc": float(np.mean(delta_aucs)) if delta_aucs else None,
-            },
             "mean_contrast_ratio_cnr": float(np.mean(cnrs)) if cnrs else None,
+            "mean_defect_iou_jaccard": float(np.mean(ious)) if ious else None,
+            "mean_defect_dice_f1": float(np.mean(dices)) if dices else None,
+            "mean_unsupervised_maha_auc": float(np.mean(maha_aucs)) if maha_aucs else None,
             "files": [
                 {
                     "file_name": r["file_name"],
@@ -1440,6 +1510,7 @@ def main():
                     "average_precision": r["metrics"].get("linear_probe_average_precision"),
                     "f1": r["metrics"].get("linear_probe_f1"),
                     "cnr": r["metrics"].get("contrast_ratio_cnr"),
+                    "iou": r["metrics"].get("defect_iou_jaccard"),
                 }
                 for r in sp_results
             ],
@@ -1447,31 +1518,33 @@ def main():
         with open(os.path.join(t1_sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
             json.dump(sp_t1_summary, f, indent=2)
 
-    # Task 2: Depth Regression per specimen
+    # Task 2: Depth Regression per specimen (Surface-breaking flaws)
     for sp, sp_results in specimen_groups.items():
         t2_sp_dir = os.path.join(args.output_dir, "2_Depth_Regression", sp)
         r2s = [r["metrics"]["depth_r2"] for r in sp_results if r["metrics"].get("depth_r2") is not None]
+        def_r2s = [r["metrics"]["defect_only_r2"] for r in sp_results if r["metrics"].get("defect_only_r2") is not None]
         maes = [r["metrics"]["depth_mae_mm"] for r in sp_results if r["metrics"].get("depth_mae_mm") is not None]
         rmses = [r["metrics"]["depth_rmse_mm"] for r in sp_results if r["metrics"].get("depth_rmse_mm") is not None]
 
         sp_t2_summary = {
             "specimen": sp,
             "total_files": len(sp_results),
-            "evaluated_files": len(r2s),
-            "linear_probe": {
-                "mean_r2_score": float(np.mean(r2s)) if r2s else None,
-                "mean_mae_mm": float(np.mean(maes)) if maes else None,
-                "mean_rmse_mm": float(np.mean(rmses)) if rmses else None,
-            },
+            "evaluated_surface_files": len(r2s),
+            "mean_plate_r2_score": float(np.mean(r2s)) if r2s else None,
+            "mean_defect_only_r2": float(np.mean(def_r2s)) if def_r2s else None,
+            "mean_mae_mm": float(np.mean(maes)) if maes else None,
+            "mean_rmse_mm": float(np.mean(rmses)) if rmses else None,
             "files": [
                 {
                     "file_name": r["file_name"],
                     "sensor": r["metadata"].get("sensor"),
                     "waveform": r["metadata"].get("waveform"),
                     "liftoff": r["metadata"].get("liftoff"),
-                    "r2_score": r["metrics"].get("depth_r2"),
+                    "defect_only_r2": r["metrics"].get("defect_only_r2"),
+                    "depth_r2": r["metrics"].get("depth_r2"),
                     "mae_mm": r["metrics"].get("depth_mae_mm"),
                     "rmse_mm": r["metrics"].get("depth_rmse_mm"),
+                    "notice": r.get("task2_depth_regression", {}).get("notice"),
                 }
                 for r in sp_results
             ],
@@ -1479,62 +1552,83 @@ def main():
         with open(os.path.join(t2_sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
             json.dump(sp_t2_summary, f, indent=2)
 
-    # Task 3: Severity Classification per specimen
+    # Task 2b: Universal Flaw Size Regression per specimen
     for sp, sp_results in specimen_groups.items():
-        t3_sp_dir = os.path.join(args.output_dir, "3_Severity_Classification", sp)
-        f1s = [r["metrics"]["severity_macro_f1"] for r in sp_results if r["metrics"].get("severity_macro_f1") is not None]
-        accs = [r["metrics"]["severity_accuracy"] for r in sp_results if r["metrics"].get("severity_accuracy") is not None]
+        t2b_sp_dir = os.path.join(args.output_dir, "2b_Size_Regression", sp)
+        size_def_r2s = [r["metrics"]["flaw_size_defect_r2"] for r in sp_results if r["metrics"].get("flaw_size_defect_r2") is not None]
+        size_maes = [r["metrics"]["flaw_size_defect_mae_mm"] for r in sp_results if r["metrics"].get("flaw_size_defect_mae_mm") is not None]
+        size_plate_r2s = [r["metrics"]["flaw_size_plate_r2"] for r in sp_results if r["metrics"].get("flaw_size_plate_r2") is not None]
 
-        sp_t3_summary = {
+        sp_t2b_summary = {
             "specimen": sp,
             "total_files": len(sp_results),
-            "evaluated_files": len(f1s),
-            "linear_probe": {
-                "mean_macro_f1": float(np.mean(f1s)) if f1s else None,
-                "mean_accuracy": float(np.mean(accs)) if accs else None,
-            },
+            "evaluated_files": len(size_def_r2s),
+            "mean_flaw_size_defect_r2": float(np.mean(size_def_r2s)) if size_def_r2s else None,
+            "mean_flaw_size_defect_mae_mm": float(np.mean(size_maes)) if size_maes else None,
+            "mean_flaw_size_plate_r2": float(np.mean(size_plate_r2s)) if size_plate_r2s else None,
             "files": [
                 {
                     "file_name": r["file_name"],
                     "sensor": r["metadata"].get("sensor"),
                     "waveform": r["metadata"].get("waveform"),
                     "liftoff": r["metadata"].get("liftoff"),
-                    "macro_f1": r["metrics"].get("severity_macro_f1"),
-                    "accuracy": r["metrics"].get("severity_accuracy"),
+                    "flaw_size_defect_r2": r["metrics"].get("flaw_size_defect_r2"),
+                    "flaw_size_defect_mae_mm": r["metrics"].get("flaw_size_defect_mae_mm"),
+                    "flaw_size_plate_r2": r["metrics"].get("flaw_size_plate_r2"),
                 }
                 for r in sp_results
             ],
         }
-        with open(os.path.join(t3_sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(sp_t3_summary, f, indent=2)
+        with open(os.path.join(t2b_sp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(sp_t2b_summary, f, indent=2)
 
-    # Task 5: Representation Geometry per specimen & overall
-    geom_data = []
-    for r in file_results:
-        lq = r.get("task5_representation_geometry", {}).get("latent_quality", {})
-        if lq:
-            geom_data.append({
-                "file": r.get("file_name"),
-                "specimen": r.get("specimen"),
-                "pca_variance_explained": lq.get("pca_variance_explained"),
-                "total_3pc_variance": lq.get("total_3pc_variance"),
-                "angular_cnr": lq.get("angular_cnr"),
-                "angular_auc": lq.get("angular_auc"),
-                "angular_ap": lq.get("angular_ap"),
-            })
-    geom_dir = os.path.join(args.output_dir, "5_Representation_Geometry")
-    geom_summary = {
-        "files_count": len(geom_data),
-        "mean_total_3pc_variance": float(np.mean([g["total_3pc_variance"] for g in geom_data if g.get("total_3pc_variance") is not None])) if any(g.get("total_3pc_variance") is not None for g in geom_data) else None,
-        "mean_angular_cnr": float(np.mean([g["angular_cnr"] for g in geom_data if g.get("angular_cnr") is not None and not np.isnan(g["angular_cnr"])])) if any(g.get("angular_cnr") is not None for g in geom_data) else None,
-        "mean_angular_auc": float(np.mean([g["angular_auc"] for g in geom_data if g.get("angular_auc") is not None and not np.isnan(g["angular_auc"])])) if any(g.get("angular_auc") is not None for g in geom_data) else None,
-        "per_file": geom_data,
-    }
-    with open(os.path.join(geom_dir, "geometry_summary.json"), "w", encoding="utf-8") as f:
-        json.dump(geom_summary, f, indent=2)
+    # Task 3: 3D Volumetric Tomography per specimen
+    for sp, sp_results in specimen_groups.items():
+        t3d_sp_dir = os.path.join(args.output_dir, "3D_Tomography", sp)
+        t3d_list = [r.get("task3_3d_tomography", {}) for r in sp_results if r.get("task3_3d_tomography")]
+        sp_t3d_summary = {
+            "specimen": sp,
+            "total_files": len(sp_results),
+            "tomography_count": len(t3d_list),
+            "files": [
+                {
+                    "file_name": r["file_name"],
+                    "num_defect_nodes": r.get("task3_3d_tomography", {}).get("num_defect_nodes"),
+                    "num_defect_edges": r.get("task3_3d_tomography", {}).get("num_defect_edges"),
+                    "crack_metrics": r.get("task3_3d_tomography", {}).get("crack_metrics"),
+                    "corrosion_metrics": r.get("task3_3d_tomography", {}).get("corrosion_metrics"),
+                }
+                for r in sp_results
+            ],
+        }
+        with open(os.path.join(t3d_sp_dir, "tomography_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(sp_t3d_summary, f, indent=2)
+
+    # Task 4: High-Dimensional Latent Diagnostics per specimen
+    for sp, sp_results in specimen_groups.items():
+        tdiag_sp_dir = os.path.join(args.output_dir, "Latent_Diagnostics", sp)
+        mean_sens = [r["metrics"]["mean_latent_sensitivity"] for r in sp_results if r["metrics"].get("mean_latent_sensitivity") is not None]
+        max_sens = [r["metrics"]["max_latent_sensitivity"] for r in sp_results if r["metrics"].get("max_latent_sensitivity") is not None]
+        sp_tdiag_summary = {
+            "specimen": sp,
+            "total_files": len(sp_results),
+            "mean_channel_sensitivity": float(np.mean(mean_sens)) if mean_sens else None,
+            "max_channel_sensitivity": float(np.max(max_sens)) if max_sens else None,
+            "files": [
+                {
+                    "file_name": r["file_name"],
+                    "mean_sensitivity": r["metrics"].get("mean_latent_sensitivity"),
+                    "max_sensitivity": r["metrics"].get("max_latent_sensitivity"),
+                    "top_channels": r.get("task4_latent_diagnostics", {}).get("top_active_channels"),
+                }
+                for r in sp_results
+            ],
+        }
+        with open(os.path.join(tdiag_sp_dir, "latent_diagnostics_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(sp_tdiag_summary, f, indent=2)
 
     # =========================================================================
-    # 5. Global Consolidated Evaluation Report & CSV
+    # 7. Global Consolidated Evaluation Report & CSV
     # =========================================================================
     all_cnrs = [r["metrics"]["contrast_ratio_cnr"] for r in file_results if r["metrics"].get("contrast_ratio_cnr") is not None]
     all_aucs = [r["metrics"]["linear_probe_auc_roc"] for r in file_results if r["metrics"].get("linear_probe_auc_roc") is not None]
@@ -1542,26 +1636,18 @@ def main():
     all_f1s = [r["metrics"]["linear_probe_f1"] for r in file_results if r["metrics"].get("linear_probe_f1") is not None]
     all_r2s = [r["metrics"]["depth_r2"] for r in file_results if r["metrics"].get("depth_r2") is not None]
     all_maes = [r["metrics"]["depth_mae_mm"] for r in file_results if r["metrics"].get("depth_mae_mm") is not None]
-    all_defect_r2s = [
-        r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score")
-        for r in file_results
-        if r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score") is not None
-    ]
-    all_hurdle_r2s = [
-        r.get("task2_depth_regression", {}).get("hurdle_depth_protocol", {}).get("compound_hurdle", {}).get("plate_r2_score")
-        for r in file_results
-        if isinstance(r.get("task2_depth_regression", {}).get("hurdle_depth_protocol"), dict)
-        and r.get("task2_depth_regression", {}).get("hurdle_depth_protocol", {}).get("compound_hurdle", {}).get("plate_r2_score") is not None
-    ]
-    all_sev_f1s = [r["metrics"]["severity_macro_f1"] for r in file_results if r["metrics"].get("severity_macro_f1") is not None]
+    all_defect_r2s = [r["metrics"]["defect_only_r2"] for r in file_results if r["metrics"].get("defect_only_r2") is not None]
+    all_hurdle_r2s = [r["metrics"]["hurdle_plate_r2"] for r in file_results if r["metrics"].get("hurdle_plate_r2") is not None]
     all_maha_aucs = [r["metrics"]["unsupervised_maha_auc"] for r in file_results if r["metrics"].get("unsupervised_maha_auc") is not None]
     all_maha_aps = [r["metrics"]["unsupervised_maha_ap"] for r in file_results if r["metrics"].get("unsupervised_maha_ap") is not None]
     all_ious = [r["metrics"]["defect_iou_jaccard"] for r in file_results if r["metrics"].get("defect_iou_jaccard") is not None]
     all_dices = [r["metrics"]["defect_dice_f1"] for r in file_results if r["metrics"].get("defect_dice_f1") is not None]
     all_size_defect_r2s = [r["metrics"]["flaw_size_defect_r2"] for r in file_results if r["metrics"].get("flaw_size_defect_r2") is not None]
     all_size_maes = [r["metrics"]["flaw_size_defect_mae_mm"] for r in file_results if r["metrics"].get("flaw_size_defect_mae_mm") is not None]
+    all_size_plate_r2s = [r["metrics"]["flaw_size_plate_r2"] for r in file_results if r["metrics"].get("flaw_size_plate_r2") is not None]
+    all_sens = [r["metrics"]["mean_latent_sensitivity"] for r in file_results if r["metrics"].get("mean_latent_sensitivity") is not None]
 
-    # Per-Specimen Breakdown
+    # Per-Specimen Breakdown dictionary
     per_specimen_summary = {}
     for sp_name, sp_res_list in specimen_groups.items():
         sp_aucs = [r["metrics"]["linear_probe_auc_roc"] for r in sp_res_list if r["metrics"].get("linear_probe_auc_roc") is not None]
@@ -1571,16 +1657,11 @@ def main():
         sp_maha_aps = [r["metrics"]["unsupervised_maha_ap"] for r in sp_res_list if r["metrics"].get("unsupervised_maha_ap") is not None]
         sp_ious = [r["metrics"]["defect_iou_jaccard"] for r in sp_res_list if r["metrics"].get("defect_iou_jaccard") is not None]
         sp_dices = [r["metrics"]["defect_dice_f1"] for r in sp_res_list if r["metrics"].get("defect_dice_f1") is not None]
-        sp_defect_r2s = [
-            r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score")
-            for r in sp_res_list
-            if r.get("task2_depth_regression", {}).get("defects_only", {}).get("r2_score") is not None
-        ]
+        sp_defect_r2s = [r["metrics"]["defect_only_r2"] for r in sp_res_list if r["metrics"].get("defect_only_r2") is not None]
         sp_maes = [r["metrics"]["depth_mae_mm"] for r in sp_res_list if r["metrics"].get("depth_mae_mm") is not None]
         sp_rmses = [r["metrics"]["depth_rmse_mm"] for r in sp_res_list if r["metrics"].get("depth_rmse_mm") is not None]
         sp_size_defect_r2s = [r["metrics"]["flaw_size_defect_r2"] for r in sp_res_list if r["metrics"].get("flaw_size_defect_r2") is not None]
         sp_size_maes = [r["metrics"]["flaw_size_defect_mae_mm"] for r in sp_res_list if r["metrics"].get("flaw_size_defect_mae_mm") is not None]
-        sp_sev_f1s = [r["metrics"]["severity_macro_f1"] for r in sp_res_list if r["metrics"].get("severity_macro_f1") is not None]
 
         per_specimen_summary[sp_name] = {
             "total_files": len(sp_res_list),
@@ -1596,7 +1677,6 @@ def main():
             "depth_rmse_mm": float(np.mean(sp_rmses)) if sp_rmses else None,
             "flaw_size_defect_r2": float(np.mean(sp_size_defect_r2s)) if sp_size_defect_r2s else None,
             "flaw_size_defect_mae_mm": float(np.mean(sp_size_maes)) if sp_size_maes else None,
-            "severity_macro_f1": float(np.mean(sp_sev_f1s)) if sp_sev_f1s else None,
         }
 
     report = {
@@ -1604,8 +1684,8 @@ def main():
         "holdout_target": holdout_target,
         "checkpoint": args.checkpoint,
         "model_architecture": {
-            "resample_mode": model.config.resample_mode,
-            "in_channels": model.config.in_channels,
+            "tokenizer_type": getattr(model.config, "tokenizer_type", "unknown"),
+            "predictor_type": getattr(model.config, "predictor_type", "unknown"),
             "embed_dim": model.config.embed_dim,
             "encoder_depth": model.config.encoder_depth,
             "predictor_depth": model.config.predictor_depth,
@@ -1626,31 +1706,22 @@ def main():
                 "mean_defect_dice_f1": float(np.mean(all_dices)) if all_dices else None,
             },
             "task2_depth_regression": {
-                "mean_depth_r2": float(np.mean(all_r2s)) if all_r2s else None,
-                "mean_depth_mae_mm": float(np.mean(all_maes)) if all_maes else None,
-                "mean_hurdle_plate_r2": float(np.mean(all_hurdle_r2s)) if all_hurdle_r2s else None,
                 "mean_defect_only_r2": float(np.mean(all_defect_r2s)) if all_defect_r2s else None,
+                "mean_depth_mae_mm": float(np.mean(all_maes)) if all_maes else None,
+                "mean_depth_plate_r2": float(np.mean(all_r2s)) if all_r2s else None,
+                "mean_hurdle_plate_r2": float(np.mean(all_hurdle_r2s)) if all_hurdle_r2s else None,
             },
             "task2b_flaw_size_sizing": {
                 "mean_flaw_size_defect_r2": float(np.mean(all_size_defect_r2s)) if all_size_defect_r2s else None,
                 "mean_flaw_size_defect_mae_mm": float(np.mean(all_size_maes)) if all_size_maes else None,
+                "mean_flaw_size_plate_r2": float(np.mean(all_size_plate_r2s)) if all_size_plate_r2s else None,
             },
-            "task3_severity_classification": {
-                "mean_severity_macro_f1": float(np.mean(all_sev_f1s)) if all_sev_f1s else None,
-            },
-            "task4_liftoff_invariance": {
-                "mean_linear_cka": liftoff_summary.get("mean_linear_cka"),
-                "mean_cosine_similarity": liftoff_summary.get("mean_cosine_similarity"),
-            },
-            "task5_representation_geometry": {
-                "mean_total_3pc_variance": geom_summary.get("mean_total_3pc_variance"),
-                "mean_angular_cnr": geom_summary.get("mean_angular_cnr"),
-                "mean_angular_auc": geom_summary.get("mean_angular_auc"),
+            "task4_latent_diagnostics": {
+                "mean_channel_sensitivity": float(np.mean(all_sens)) if all_sens else None,
             },
         },
         "per_specimen_summary": per_specimen_summary,
         "per_file_results": file_results,
-        "liftoff_invariance": liftoff_summary,
     }
 
     report_path = os.path.join(args.output_dir, "evaluation_summary.json")
@@ -1666,15 +1737,13 @@ def main():
             "task1_linear_auc", "task1_linear_ap", "task1_linear_f1",
             "task1_mlp_auc", "task1_delta_auc", "task1_cnr",
             "task1_defect_iou", "task1_defect_dice",
-            "task2_depth_r2", "task2_depth_mae_mm", "task2_depth_rmse_mm",
-            "task2b_size_defect_r2", "task2b_size_mae_mm",
-            "task3_severity_macro_f1", "task3_severity_accuracy",
-            "task5_3pc_variance", "task5_angular_cnr", "task5_angular_auc"
+            "task2_depth_defect_r2", "task2_depth_mae_mm", "task2_depth_rmse_mm",
+            "task2b_size_defect_r2", "task2b_size_mae_mm", "task2b_size_plate_r2",
+            "task4_mean_channel_sensitivity", "task4_max_channel_sensitivity",
         ])
         for r in file_results:
             m = r.get("metrics", {})
             meta = r.get("metadata", {})
-            lq = r.get("task5_representation_geometry", {}).get("latent_quality", {})
             writer.writerow([
                 r.get("file_name"),
                 r.get("specimen"),
@@ -1689,25 +1758,23 @@ def main():
                 f"{m.get('contrast_ratio_cnr', 0.0):.4f}" if m.get('contrast_ratio_cnr') is not None else "",
                 f"{m.get('defect_iou_jaccard', 0.0):.4f}" if m.get('defect_iou_jaccard') is not None else "",
                 f"{m.get('defect_dice_f1', 0.0):.4f}" if m.get('defect_dice_f1') is not None else "",
-                f"{m.get('depth_r2', 0.0):.4f}" if m.get('depth_r2') is not None else "",
+                f"{m.get('defect_only_r2', 0.0):.4f}" if m.get('defect_only_r2') is not None else "",
                 f"{m.get('depth_mae_mm', 0.0):.4f}" if m.get('depth_mae_mm') is not None else "",
                 f"{m.get('depth_rmse_mm', 0.0):.4f}" if m.get('depth_rmse_mm') is not None else "",
                 f"{m.get('flaw_size_defect_r2', 0.0):.4f}" if m.get('flaw_size_defect_r2') is not None else "",
                 f"{m.get('flaw_size_defect_mae_mm', 0.0):.4f}" if m.get('flaw_size_defect_mae_mm') is not None else "",
-                f"{m.get('severity_macro_f1', 0.0):.4f}" if m.get('severity_macro_f1') is not None else "",
-                f"{m.get('severity_accuracy', 0.0):.4f}" if m.get('severity_accuracy') is not None else "",
-                f"{lq.get('total_3pc_variance', 0.0):.4f}" if lq.get('total_3pc_variance') is not None else "",
-                f"{lq.get('angular_cnr', 0.0):.4f}" if lq.get('angular_cnr') is not None else "",
-                f"{lq.get('angular_auc', 0.0):.4f}" if lq.get('angular_auc') is not None else "",
+                f"{m.get('flaw_size_plate_r2', 0.0):.4f}" if m.get('flaw_size_plate_r2') is not None else "",
+                f"{m.get('mean_latent_sensitivity', 0.0):.4f}" if m.get('mean_latent_sensitivity') is not None else "",
+                f"{m.get('max_latent_sensitivity', 0.0):.4f}" if m.get('max_latent_sensitivity') is not None else "",
             ])
 
     print("\n" + "=" * 78)
-    print("  EVALUATION SUMMARY REPORT (PER-SPECIMEN & UNSUPERVISED LATENT BREAKDOWN)")
+    print("  STREAMLINED EVALUATION REPORT (NDT DOWNSTREAM BENCHMARK)")
     print("=" * 78)
     print(f"Protocol: {protocol_name.upper()} | Holdout Target: {holdout_target}")
     print(f"Evaluated Test Files: {len(file_results)} ({len(all_aucs)} with Ground Truth labels)")
 
-    # 1. Per-Specimen Disentangled Benchmark
+    # 1. Per-Specimen Breakdown
     print("\n" + "-" * 78)
     print("  1. PER-SPECIMEN BENCHMARK BREAKDOWN")
     print("-" * 78)
@@ -1716,7 +1783,7 @@ def main():
         if not sp_info or sp_info.get("total_files", 0) == 0:
             continue
         print(f"\n>> Specimen: {sp_name.upper()} ({sp_info.get('total_files')} files)")
-        if sp_name == "corrosion":
+        if sp_info.get("defect_only_r2") is not None:
             print(f"   [Task 2 Depth Sizing]  Defect-Only R²: {sp_info.get('defect_only_r2', 0.0):.4f} | Depth MAE: {sp_info.get('depth_mae_mm', 0.0):.4f} mm")
         if sp_info.get("flaw_size_defect_r2") is not None:
             print(f"   [Task 2b Flaw Sizing]  Defect-Only Size R²: {sp_info.get('flaw_size_defect_r2', 0.0):.4f} | Size MAE: {sp_info.get('flaw_size_defect_mae_mm', 0.0):.4f} mm")
@@ -1724,23 +1791,10 @@ def main():
         if sp_info.get("mean_defect_iou") is not None:
             print(f"   [Boundary Contours & IoU] Mean IoU: {sp_info.get('mean_defect_iou', 0.0):.4f} ({sp_info.get('mean_defect_iou', 0.0)*100:.1f}%) | Dice: {sp_info.get('mean_defect_dice', 0.0):.4f}")
         print(f"   [Pure Latent Geometry] Unsupervised Maha AUC: {sp_info.get('unsupervised_maha_auc', 0.0):.4f} | AP: {sp_info.get('unsupervised_maha_ap', 0.0):.4f}")
-        if sp_info.get("severity_macro_f1") is not None:
-            print(f"   [Task 3 Severity Clf]  Severity Macro F1: {sp_info.get('severity_macro_f1', 0.0):.4f}")
 
-    # 2. Global Unsupervised Latent Discrimination (All 57 scans, Zero Labels)
+    # 2. Consolidated Overall Metrics
     print("\n" + "-" * 78)
-    print("  2. GLOBAL INTRINSIC UNSUPERVISED LATENT DISCRIMINABILITY (ZERO LABELS)")
-    print("-" * 78)
-    if all_maha_aucs:
-        print(f"  Unsupervised Mahalanobis AUC: Mean = {np.mean(all_maha_aucs):.4f} +/- {np.std(all_maha_aucs):.4f} | AP = {np.mean(all_maha_aps):.4f}")
-    if geom_summary.get("mean_total_3pc_variance") is not None:
-        print(f"  Top-3 Principal Components Variance: {geom_summary['mean_total_3pc_variance']:.1%}")
-    if liftoff_summary.get("mean_linear_cka") is not None:
-        print(f"  Lift-off Invariance (Linear CKA):   {liftoff_summary['mean_linear_cka']:.4f}")
-
-    # 3. Overall Supervised Probe Reference
-    print("\n" + "-" * 78)
-    print("  3. CONSOLIDATED PROBE METRICS REFERENCE (ALL FILES)")
+    print("  2. CONSOLIDATED OVERALL METRICS (ALL FILES)")
     print("-" * 78)
     if all_aucs:
         print(f"  Linear Probe Defect AUC: Mean = {np.mean(all_aucs):.4f} +/- {np.std(all_aucs):.4f} | AP = {np.mean(all_aps):.4f} | CNR = {np.mean(all_cnrs):.2f}")
@@ -1748,15 +1802,17 @@ def main():
         print(f"  Defect-Only Depth R²:   Mean = {np.mean(all_defect_r2s):.4f} | Plate MAE = {np.mean(all_maes):.4f} mm")
     if all_size_defect_r2s:
         print(f"  Defect-Only Size R²:    Mean = {np.mean(all_size_defect_r2s):.4f} | Size MAE = {np.mean(all_size_maes):.4f} mm")
-    if all_hurdle_r2s:
-        print(f"  Two-Stage Hurdle Plate R²: Mean = {np.mean(all_hurdle_r2s):.4f}")
+    if all_maha_aucs:
+        print(f"  Unsupervised Maha AUC:  Mean = {np.mean(all_maha_aucs):.4f} +/- {np.std(all_maha_aucs):.4f} | AP = {np.mean(all_maha_aps):.4f}")
+    if all_sens:
+        print(f"  Mean Latent Sensitivity S_k: {np.mean(all_sens):.4f}")
 
     print(f"\nArtifacts organized into 5 modular task folders:")
     print(f"  - 1_Anomaly_Detection:       {os.path.join(args.output_dir, '1_Anomaly_Detection')}")
     print(f"  - 2_Depth_Regression:        {os.path.join(args.output_dir, '2_Depth_Regression')}")
-    print(f"  - 3_Severity_Classification: {os.path.join(args.output_dir, '3_Severity_Classification')}")
-    print(f"  - 4_Liftoff_Invariance:      {os.path.join(args.output_dir, '4_Liftoff_Invariance')}")
-    print(f"  - 5_Representation_Geometry: {os.path.join(args.output_dir, '5_Representation_Geometry')}")
+    print(f"  - 2b_Size_Regression:        {os.path.join(args.output_dir, '2b_Size_Regression')}")
+    print(f"  - 3D_Tomography:             {os.path.join(args.output_dir, '3D_Tomography')}")
+    print(f"  - Latent_Diagnostics:        {os.path.join(args.output_dir, 'Latent_Diagnostics')}")
     print(f"  - Summary JSON:              {report_path}")
     print(f"  - Summary CSV:               {csv_path}")
     print("=" * 70 + "\n")
@@ -1764,3 +1820,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
