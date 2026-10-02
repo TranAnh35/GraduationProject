@@ -193,6 +193,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Enable harmonic radial phase curvature kappa_theta(f) in SpatioSpectralTokenizer (default: True)")
     p.add_argument("--feature_extraction_mode", type=str, default="unified", choices=["unified", "context"],
                    help="Feature representation mode for C-scan feature extraction (default: unified)")
+    p.add_argument("--temporal_ac_coupling", type=lambda v: v.lower() == "true", default=False,
+                   help="EXP-24: Enable zero-mean temporal AC coupling to remove static sensor DC baseline (default: False)")
+    p.add_argument("--scale_separated_prediction", type=lambda v: v.lower() == "true", default=False,
+                   help="EXP-24: Formulate target as perturbation Delta H = H_tgt - H_base relative to background (default: False)")
+    p.add_argument("--carrier_normalized_features", type=lambda v: v.lower() == "true", default=False,
+                   help="EXP-24: Normalize extracted flaw perturbation by carrier norm ||H_base|| (default: False)")
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
@@ -307,6 +313,9 @@ def main():
         use_radial_attention_bias=args.use_radial_attention_bias,
         use_phase_curvature=args.use_phase_curvature,
         feature_extraction_mode=args.feature_extraction_mode,
+        temporal_ac_coupling=args.temporal_ac_coupling,
+        scale_separated_prediction=args.scale_separated_prediction,
+        carrier_normalized_features=args.carrier_normalized_features,
         predictor_type=args.predictor_type,
         predictor_depth=args.predictor_depth,
         diffusion_gamma_init=args.diffusion_gamma_init,

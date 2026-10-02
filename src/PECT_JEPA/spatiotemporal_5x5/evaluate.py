@@ -1585,6 +1585,7 @@ def main():
     # Task 3: 3D Volumetric Tomography per specimen
     for sp, sp_results in specimen_groups.items():
         t3d_sp_dir = os.path.join(args.output_dir, "3D_Tomography", sp)
+        os.makedirs(t3d_sp_dir, exist_ok=True)
         t3d_list = [r.get("task3_3d_tomography", {}) for r in sp_results if r.get("task3_3d_tomography")]
         sp_t3d_summary = {
             "specimen": sp,
@@ -1607,6 +1608,7 @@ def main():
     # Task 4: High-Dimensional Latent Diagnostics per specimen
     for sp, sp_results in specimen_groups.items():
         tdiag_sp_dir = os.path.join(args.output_dir, "Latent_Diagnostics", sp)
+        os.makedirs(tdiag_sp_dir, exist_ok=True)
         mean_sens = [r["metrics"]["mean_latent_sensitivity"] for r in sp_results if r["metrics"].get("mean_latent_sensitivity") is not None]
         max_sens = [r["metrics"]["max_latent_sensitivity"] for r in sp_results if r["metrics"].get("max_latent_sensitivity") is not None]
         sp_tdiag_summary = {

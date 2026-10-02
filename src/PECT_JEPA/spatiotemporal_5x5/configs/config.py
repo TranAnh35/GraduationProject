@@ -78,6 +78,9 @@ class Spatiotemporal5x5Config:
     use_radial_attention_bias: bool = True # Continuous physical radial distance bias B_radial in Context Encoder
     use_phase_curvature: bool = True       # Harmonic radial phase curvature kappa_theta(f) across concentric rings
     feature_extraction_mode: str = "unified" # 'unified' ([H_ctx; Delta_H]) | 'context' (H_ctx only)
+    temporal_ac_coupling: bool = False       # EXP-24: Remove static temporal DC offset per probe in tokenizer
+    scale_separated_prediction: bool = False # EXP-24: Predict relative deviation Delta H = H_tgt - H_base from Delta H_ctx
+    carrier_normalized_features: bool = False # EXP-24: Normalize extracted flaw representation by carrier magnitude ||H_base||
 
     # ------------------------------------------------------------------- Loss
     loss_type: str = "l1"                # Base prediction norm ('l1' | 'smooth_l1')

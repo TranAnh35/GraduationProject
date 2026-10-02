@@ -1055,6 +1055,7 @@ class ContinuousFieldTokenizer5x5(nn.Module):
         dropout: float = 0.0,
         use_snr_tapering: bool = True,
         phase_noise_floor: float = 0.02,
+        temporal_ac_coupling: bool = False,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -1065,6 +1066,7 @@ class ContinuousFieldTokenizer5x5(nn.Module):
         self.num_freq_bins = min(num_freq_bins, in_channels // 2)
         self.use_snr_tapering = use_snr_tapering
         self.phase_noise_floor = phase_noise_floor
+        self.temporal_ac_coupling = temporal_ac_coupling
 
         # 1. Multi-scale 1D Temporal Conv Filterbank for transient dynamics
         d_sub = embed_dim // 3
@@ -1108,6 +1110,8 @@ class ContinuousFieldTokenizer5x5(nn.Module):
         assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
 
         x_flat = x.reshape(B * self.num_tokens, C)
+        if self.temporal_ac_coupling:
+            x_flat = x_flat - x_flat.mean(dim=-1, keepdim=True)
 
         # 1. Multi-scale Temporal Features
         x_1d = x_flat.unsqueeze(1)  # [B*25, 1, C]
@@ -1158,6 +1162,7 @@ def build_tokenizer_5x5(config) -> nn.Module:
             dropout=config.dropout,
             use_snr_tapering=getattr(config, "phase_snr_tapering", True),
             phase_noise_floor=getattr(config, "phase_noise_floor", 0.02),
+            temporal_ac_coupling=getattr(config, "temporal_ac_coupling", False),
         )
     elif tokenizer_type in ("spatio_spectral", "skin_depth"):
         return SpatioSpectralTokenizer5x5(

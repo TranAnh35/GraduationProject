@@ -256,6 +256,14 @@ class PECT_JEPA_5x5(nn.Module):
             H_tgt = H_tgt_full.detach()
             H_rep_reg = torch.cat([H_ctx, H_tgt_full], dim=1)
 
+        # Scale-Separated Perturbation Target (EXP-24):
+        # Neutralize the acquisition shortcut by setting target as relative perturbation Delta H = H_tgt - H_base
+        if getattr(self.config, "scale_separated_prediction", False):
+            H_base = H_ctx.mean(dim=1, keepdim=True)  # [B, 1, D]
+            H_target_for_loss = H_tgt - H_base
+        else:
+            H_target_for_loss = H_tgt
+
         # 7a. Compute Lift-Off Perturbation (if liftoff_invar_weight > 0)
         H_ctx_pert = None
         if self.training and getattr(self.config, "liftoff_invar_weight", 0.0) > 0.0:
@@ -298,7 +306,7 @@ class PECT_JEPA_5x5(nn.Module):
         # 7c. Compute Combined JEPA Loss
         loss_dict = self.loss_fn(
             H_pred=H_pred,
-            H_target=H_tgt,
+            H_target=H_target_for_loss,
             target_indices=target_indices,
             H_ctx=H_ctx,
             H_ctx_pert=H_ctx_pert,
@@ -425,6 +433,17 @@ class PECT_JEPA_5x5(nn.Module):
             H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
 
         # Coordinate-wise physical discrepancy: mean across center target tokens
+        if getattr(self.config, "scale_separated_prediction", False):
+            H_base = H_ctx_masked.mean(dim=1, keepdim=True)  # [B, 1, D]
+            h_diff_center = h_ctx_center - H_base.squeeze(1)  # [B, D]
+            delta_H = torch.abs((H_tgt - H_base) - H_pred).mean(dim=1)  # [B, D]
+            if getattr(self.config, "carrier_normalized_features", False):
+                carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
+                h_diff_center = h_diff_center / carrier_scale
+                delta_H = delta_H / carrier_scale
+            Z_unified = torch.cat([h_diff_center, delta_H], dim=-1)  # [B, 2 * D]
+            return Z_unified
+
         delta_H = torch.abs(H_tgt - H_pred).mean(dim=1)  # [B, D]
 
         # Concatenate into unified [B, 2 * D] vector
@@ -514,10 +533,21 @@ class PECT_JEPA_5x5(nn.Module):
         else:
             H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
 
-        # Discrepancy per token: [B, N_tgt, D]
-        delta_H_tokens = torch.abs(H_tgt - H_pred)
-        delta_H = delta_H_tokens.mean(dim=1)  # [B, D]
-        Z_unified = torch.cat([h_ctx_center, delta_H], dim=-1)  # [B, 2 * D]
+        # Coordinate-wise physical discrepancy: mean across center target tokens
+        if getattr(self.config, "scale_separated_prediction", False):
+            H_base = H_ctx_masked.mean(dim=1, keepdim=True)  # [B, 1, D]
+            h_diff_center = h_ctx_center - H_base.squeeze(1)  # [B, D]
+            delta_H_tokens = torch.abs((H_tgt - H_base) - H_pred)
+            delta_H = delta_H_tokens.mean(dim=1)  # [B, D]
+            if getattr(self.config, "carrier_normalized_features", False):
+                carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
+                h_diff_center = h_diff_center / carrier_scale
+                delta_H = delta_H / carrier_scale
+            Z_unified = torch.cat([h_diff_center, delta_H], dim=-1)  # [B, 2 * D]
+        else:
+            delta_H_tokens = torch.abs(H_tgt - H_pred)
+            delta_H = delta_H_tokens.mean(dim=1)  # [B, D]
+            Z_unified = torch.cat([h_ctx_center, delta_H], dim=-1)  # [B, 2 * D]
 
         if N_total == 100:
             # Tokenizer subbands (0: Deepest, 1: Mid-deep, 2: Mid-shallow, 3: Near-surface)

@@ -1140,6 +1140,7 @@ class AnisotropicDiffusionPredictor5x5(Predictor5x5):
 
         if return_residual:
             return H_pred, delta_pred, H_base
+        return H_pred
 
 class NeuralFieldSubspacePredictor5x5(Predictor5x5):
     """
