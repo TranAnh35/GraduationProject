@@ -435,13 +435,16 @@ class PECT_JEPA_5x5(nn.Module):
         # Coordinate-wise physical discrepancy: mean across center target tokens
         if getattr(self.config, "scale_separated_prediction", False):
             H_base = H_ctx_masked.mean(dim=1, keepdim=True)  # [B, 1, D]
-            h_diff_center = h_ctx_center - H_base.squeeze(1)  # [B, D]
+            if getattr(self.config, "keep_absolute_center_feature", False):
+                h_center_rep = h_ctx_center
+            else:
+                h_center_rep = h_ctx_center - H_base.squeeze(1)  # [B, D]
             delta_H = torch.abs((H_tgt - H_base) - H_pred).mean(dim=1)  # [B, D]
             if getattr(self.config, "carrier_normalized_features", False):
                 carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
-                h_diff_center = h_diff_center / carrier_scale
+                h_center_rep = h_center_rep / carrier_scale
                 delta_H = delta_H / carrier_scale
-            Z_unified = torch.cat([h_diff_center, delta_H], dim=-1)  # [B, 2 * D]
+            Z_unified = torch.cat([h_center_rep, delta_H], dim=-1)  # [B, 2 * D]
             return Z_unified
 
         delta_H = torch.abs(H_tgt - H_pred).mean(dim=1)  # [B, D]
@@ -536,14 +539,17 @@ class PECT_JEPA_5x5(nn.Module):
         # Coordinate-wise physical discrepancy: mean across center target tokens
         if getattr(self.config, "scale_separated_prediction", False):
             H_base = H_ctx_masked.mean(dim=1, keepdim=True)  # [B, 1, D]
-            h_diff_center = h_ctx_center - H_base.squeeze(1)  # [B, D]
+            if getattr(self.config, "keep_absolute_center_feature", False):
+                h_center_rep = h_ctx_center
+            else:
+                h_center_rep = h_ctx_center - H_base.squeeze(1)  # [B, D]
             delta_H_tokens = torch.abs((H_tgt - H_base) - H_pred)
             delta_H = delta_H_tokens.mean(dim=1)  # [B, D]
             if getattr(self.config, "carrier_normalized_features", False):
                 carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
-                h_diff_center = h_diff_center / carrier_scale
+                h_center_rep = h_center_rep / carrier_scale
                 delta_H = delta_H / carrier_scale
-            Z_unified = torch.cat([h_diff_center, delta_H], dim=-1)  # [B, 2 * D]
+            Z_unified = torch.cat([h_center_rep, delta_H], dim=-1)  # [B, 2 * D]
         else:
             delta_H_tokens = torch.abs(H_tgt - H_pred)
             delta_H = delta_H_tokens.mean(dim=1)  # [B, D]

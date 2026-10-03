@@ -82,6 +82,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("Unified 5x5 Spatiotemporal PECT-JEPA Training")
     p.add_argument("--data_dir", type=str, default="data", help="Directory containing TDMS files")
     p.add_argument("--epochs", type=int, default=10, help="Total training epochs (default: 10)")
+    p.add_argument("--warmup_epochs", type=int, default=5, help="Number of linear warmup epochs (default: 5)")
     p.add_argument("--batch_size", type=int, default=256, help="Batch size (recommended: 128 - 512 for 5x5)")
     p.add_argument("--k_per_file", type=int, default=8, help="Points per file in file-balanced sampler")
     p.add_argument("--num_workers", type=str, default="auto", help="Number of CPU workers (integer or 'auto')")
@@ -199,6 +200,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="EXP-24: Formulate target as perturbation Delta H = H_tgt - H_base relative to background (default: False)")
     p.add_argument("--carrier_normalized_features", type=lambda v: v.lower() == "true", default=False,
                    help="EXP-24: Normalize extracted flaw perturbation by carrier norm ||H_base|| (default: False)")
+    p.add_argument("--keep_absolute_center_feature", type=lambda v: v.lower() == "true", default=True,
+                   help="EXP-25: Keep absolute center representation [h_center, Delta H] instead of [h - H_base, Delta H] (default: True)")
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
@@ -316,6 +319,8 @@ def main():
         temporal_ac_coupling=args.temporal_ac_coupling,
         scale_separated_prediction=args.scale_separated_prediction,
         carrier_normalized_features=args.carrier_normalized_features,
+        keep_absolute_center_feature=args.keep_absolute_center_feature,
+        warmup_epochs=args.warmup_epochs,
         predictor_type=args.predictor_type,
         predictor_depth=args.predictor_depth,
         diffusion_gamma_init=args.diffusion_gamma_init,
@@ -548,7 +553,7 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            from .evaluate import main as eval_main
+            from src.PECT_JEPA.spatiotemporal_5x5.evaluate import main as eval_main
             eval_out_dir = os.path.join(logger.run_dir, "evaluation_results")
             eval_args = [
                 "--checkpoint", best_ckpt,
