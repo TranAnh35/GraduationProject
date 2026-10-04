@@ -1271,16 +1271,188 @@ class NeuralFieldSubspacePredictor5x5(Predictor5x5):
         return H_pred
 
 
+
+class FrequencyConditionedDiffusionPredictor5x5(nn.Module):
+    """
+    Frequency-Conditioned Diffusion World Model Predictor for 5x5 PECT-JEPA (EXP-28).
+
+    Physical Grounding:
+      Eddy current spatial diffusion is fundamentally frequency-dependent:
+          delta(omega) = sqrt(2 / (omega * mu * sigma)) ~ 1 / sqrt(omega)
+      The spatial diffusion attenuation kernel decays over characteristic length scale delta(omega).
+      High-frequency transient components (near-surface) decay rapidly with spatial radius r,
+      while low-frequency components (deep penetration) diffuse broadly across the sensor array.
+
+      This predictor computes a continuous relative coordinate & frequency cross-attention bias:
+          rel_feat = [Delta x, Delta y, ||Delta r||, omega_char, ||Delta r|| * sqrt(omega_char)]
+          attn_bias = MLP(rel_feat) in R^(B, num_heads, N_tgt, N_ctx)
+      Where omega_char in (0, 1] is the normalized spectral centroid extracted purely unsupervised
+      from the observed signal FFT power spectrum.
+
+    Subspace Separation:
+      Preserves the full-rank dual-head latent subspace decomposition:
+          H_pred = H_base + Delta H_pred
+      where H_base models the nominal incident diffusion carrier and Delta H_pred models
+      the localized flaw scattering perturbation.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        depth: int = 2,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
+        grid_size: int = 5,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        self.blocks = nn.ModuleList([
+            PredictorBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout
+            )
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.spatial_topology = spatial_topology
+        self.star_radii = star_radii
+        self.grid_size = grid_size
+
+        # Frequency-conditioned relative coordinate diffusion MLP:
+        # Input features: [dx, dy, dist, freq_val, dist * sqrt(freq_val)] -> 5 features
+        # Output: num_heads per-head attention biases
+        self.rel_diff_mlp = nn.Sequential(
+            nn.Linear(5, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, num_heads),
+        )
+
+        # Context initialization projection
+        self.ctx_init_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm_ctx_init = nn.LayerNorm(embed_dim)
+
+        # Dual-Head Latent Subspace Decomposition
+        self.base_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.residual_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        # Precompute spatial coordinate offsets [25, 2] in mm
+        offsets = get_spatial_topology_offsets(
+            topology=spatial_topology, star_radii=star_radii, grid_size=grid_size
+        )
+        self.register_buffer("coords_25", torch.from_numpy(offsets).float(), persistent=False)
+
+        self.last_h_base: Optional[torch.Tensor] = None
+        self.last_delta_pred: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        H_context: torch.Tensor,
+        target_pos: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+        freq_condition: Optional[torch.Tensor] = None,
+        diffusion_operator: Optional[torch.Tensor] = None,
+        return_residual: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        B, N_tgt, D = target_pos.shape
+        device = target_pos.device
+
+        # 1. Nominal Context Baseline
+        h_ctx_mean = H_context.mean(dim=1, keepdim=True)  # [B, 1, D]
+        h_base_init = self.norm_ctx_init(self.ctx_init_proj(h_ctx_mean))  # [B, 1, D]
+
+        # 2. Target Query Formulation with Relative Position Conditioning
+        queries = h_base_init.expand(B, N_tgt, -1) + self.mask_token.expand(B, N_tgt, -1) + target_pos
+
+        # 3. Frequency-Conditioned Relative Diffusion Cross-Attention Bias
+        attn_bias = None
+        if context_indices is not None and target_indices is not None and hasattr(self, "coords_25"):
+            coords = self.coords_25.to(device)  # [25, 2]
+            c_idx = torch.clamp(context_indices.long(), 0, coords.shape[0] - 1)  # [B, N_ctx]
+            t_idx = torch.clamp(target_indices.long(), 0, coords.shape[0] - 1)   # [B, N_tgt]
+
+            pos_tgt = coords[t_idx]             # [B, N_tgt, 2]
+            pos_ctx = coords[c_idx]             # [B, N_ctx, 2]
+
+            delta_r = pos_tgt.unsqueeze(2) - pos_ctx.unsqueeze(1)  # [B, N_tgt, N_ctx, 2]
+            dist_r = torch.sqrt(torch.sum(delta_r ** 2, dim=-1, keepdim=True) + 1e-4)  # [B, N_tgt, N_ctx, 1]
+
+            # Frequency conditioning
+            if freq_condition is None:
+                f_val = torch.full((B, N_tgt, c_idx.shape[1], 1), 0.5, device=device, dtype=torch.float32)
+            else:
+                if freq_condition.ndim == 1:
+                    f_val = freq_condition.view(B, 1, 1, 1).expand(B, N_tgt, c_idx.shape[1], 1)
+                elif freq_condition.ndim == 2:
+                    f_val = freq_condition.unsqueeze(1).expand(B, N_tgt, c_idx.shape[1], 1)
+                else:
+                    f_val = freq_condition.view(B, 1, 1, 1).expand(B, N_tgt, c_idx.shape[1], 1)
+
+            diff_scale = dist_r * torch.sqrt(torch.clamp(f_val, min=1e-4))  # [B, N_tgt, N_ctx, 1]
+            rel_feat = torch.cat([delta_r, dist_r, f_val, diff_scale], dim=-1)  # [B, N_tgt, N_ctx, 5]
+            rel_emb = self.rel_diff_mlp(rel_feat)  # [B, N_tgt, N_ctx, num_heads]
+            attn_bias = rel_emb.permute(0, 3, 1, 2)  # [B, num_heads, N_tgt, N_ctx]
+
+        # 4. Transformer Refinement
+        q = queries
+        for blk in self.blocks:
+            q = blk(target_queries=q, H_context=H_context, attn_bias=attn_bias)
+
+        q = self.norm(q)
+
+        # 5. Dual-Head Latent Subspace Decomposition
+        H_base = self.base_head(q)
+        delta_pred = self.residual_head(q)
+        H_pred = H_base + delta_pred
+
+        self.last_h_base = H_base
+        self.last_delta_pred = delta_pred
+
+        if return_residual:
+            return H_pred, delta_pred, H_base
+        return H_pred
+
+
 def build_predictor_5x5(config) -> nn.Module:
     """
     Factory function to construct Predictor based on config.
     Defaults to ContinuousHelmholtzPredictor5x5 or ResidualDiffusionPredictor5x5.
     """
-    predictor_type = getattr(config, "predictor_type", "continuous_helmholtz")
+    predictor_type = getattr(config, "predictor_type", "freq_conditioned_diffusion")
     spatial_topology = getattr(config, "spatial_topology", "concentric_star")
     star_radii = getattr(config, "star_radii", (1, 3, 7))
 
-    if predictor_type in ("neural_field_subspace", "subspace_field_operator", "subspace_neural_field", "continuous_field_subspace"):
+    if predictor_type in ("freq_conditioned_diffusion", "frequency_conditioned_diffusion", "frequency_diffusion"):
+        return FrequencyConditionedDiffusionPredictor5x5(
+            embed_dim=config.embed_dim,
+            depth=config.predictor_depth,
+            num_heads=config.predictor_heads,
+            mlp_ratio=config.mlp_ratio,
+            dropout=config.dropout,
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
+            grid_size=config.grid_size,
+        )
+    elif predictor_type in ("neural_field_subspace", "subspace_field_operator", "subspace_neural_field", "continuous_field_subspace"):
         return NeuralFieldSubspacePredictor5x5(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,

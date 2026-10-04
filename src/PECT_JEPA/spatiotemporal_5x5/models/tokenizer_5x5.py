@@ -1147,12 +1147,139 @@ class ContinuousFieldTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+
+class ContinuousLinearFieldTokenizer5x5(nn.Module):
+    """
+    Continuous Linear Dual-Domain Field Tokenizer for 5x5 PECT-JEPA (EXP-28).
+
+    Waveform-Agnostic, Continuous 25-Token Architecture:
+      - Strictly 1 continuous token per spatial probe on the Concentric Star or 5x5 grid (25 tokens total).
+      - Zero temporal slicing (tau_0..tau_3) and zero temporal pooling (AdaptiveAvgPool1d(1) eliminated).
+      - Continuous 1D Learnable Projection: directly projects the full in_channels waveform vector
+        into latent space via an MLP with LayerNorm and GELU, preserving peak arrival delay t_p
+        and LOI point with full end-to-end gradient sensitivity.
+      - Full uncrushed 14-harmonic Fourier dispersion (phase & log-magnitude).
+      - Dodd-Deeds lift-off invariance via Fourier phase with magnitude-weighted SNR tanh tapering.
+      - Direct orthogonal dual-domain projection (NO zero-sum convex gating), preserving carrier
+        and dispersion at full rank.
+      - 2D spatial positional embedding.
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+        use_snr_tapering: bool = True,
+        phase_noise_floor: float = 0.02,
+        temporal_ac_coupling: bool = False,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_tokens = self.num_spatial        # Exactly 25 tokens
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+        self.use_snr_tapering = use_snr_tapering
+        self.phase_noise_floor = phase_noise_floor
+        self.temporal_ac_coupling = temporal_ac_coupling
+
+        # 1. Continuous 1D Temporal Projection (NO temporal pooling!)
+        self.time_proj = nn.Sequential(
+            nn.Linear(in_channels, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Uncrushed Spectral Dispersion Branch (14 frequency bins: phase + log-mag)
+        self.spectral_dim = self.num_freq_bins * 2
+        self.proj_freq = nn.Sequential(
+            nn.Linear(self.spectral_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Direct Orthogonal Dual-Domain Fusion (No zero-sum convex gate)
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+
+        # 4. Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_flat = x.reshape(B * self.num_tokens, C)
+        if self.temporal_ac_coupling:
+            x_flat = x_flat - x_flat.mean(dim=-1, keepdim=True)
+
+        # 1. Continuous Temporal Projection preserving peak arrival t_p
+        z_time = self.ln_time(self.time_proj(x_flat))  # [B*25, D]
+
+        # 2. Uncrushed Spectral Dispersion
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)
+        self._last_fft = X_fft
+        X_sub = X_fft[:, 1:self.num_freq_bins + 1]  # Exclude DC
+
+        phase = torch.angle(X_sub) / torch.pi
+        mag_linear = torch.abs(X_sub)
+        mag = torch.log1p(mag_linear)
+
+        if self.use_snr_tapering:
+            snr_weight = torch.tanh(mag_linear / self.phase_noise_floor)
+            phase = phase * snr_weight
+
+        spectral_feat = torch.cat([phase, mag], dim=-1).to(x.dtype)  # [B*25, 2*num_freq_bins]
+        z_freq = self.ln_freq(self.proj_freq(spectral_feat))        # [B*25, D]
+
+        # 3. Direct Orthogonal Dual-Domain Fusion with Residual Highway
+        z_cat = torch.cat([z_time, z_freq], dim=-1)                 # [B*25, 2*D]
+        z_fused = self.fuse_proj(z_cat) + z_time                     # [B*25, D]
+        tokens = self.drop(self.norm_out(z_fused)).reshape(B, self.num_tokens, self.embed_dim)
+
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "continuous_field")
-    if tokenizer_type in ("continuous_field", "waveform_agnostic_field", "continuous_dual_domain"):
+    tokenizer_type = getattr(config, "tokenizer_type", "continuous_linear_field")
+    if tokenizer_type in ("continuous_linear_field", "continuous_linear", "linear_field"):
+        return ContinuousLinearFieldTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+            use_snr_tapering=getattr(config, "phase_snr_tapering", True),
+            phase_noise_floor=getattr(config, "phase_noise_floor", 0.02),
+            temporal_ac_coupling=getattr(config, "temporal_ac_coupling", False),
+        )
+    elif tokenizer_type in ("continuous_field", "waveform_agnostic_field", "continuous_dual_domain"):
         return ContinuousFieldTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
