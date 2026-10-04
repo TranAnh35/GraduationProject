@@ -226,6 +226,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--val_files_count", type=int, default=4,
                    help="Number of in-domain validation files for compound_ood protocol (default: 4)")
     p.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio from training pool (default: 0.1)")
+    p.add_argument("--split_summary", type=str, default=None,
+                   help="Path to pre-saved split_summary.json to directly load exact train/val/test splits")
     p.add_argument("--log_dir", type=str, default="experiments/5x5", help="Experiment logs directory")
     p.add_argument("--use_tensorboard", type=lambda v: v.lower() == "true", default=True, help="Enable TensorBoard")
     p.add_argument("--use_wandb", type=lambda v: v.lower() == "true", default=False, help="Enable Weights & Biases")
@@ -388,17 +390,25 @@ def main():
         if vals:
             logger.info(f"  Available {k} categories: {vals}")
 
-    train_files, val_files, test_files, split_summary = get_dataset_split(
-        all_files,
-        protocol=args.split_protocol,
-        holdout_target=args.holdout_target,
-        holdout_liftoff=args.holdout_liftoff,
-        holdout_sensor=args.holdout_sensor,
-        holdout_waveform=args.holdout_waveform,
-        val_ratio=args.val_ratio,
-        val_files_count=args.val_files_count,
-        seed=config.seed,
-    )
+    if args.split_summary and os.path.exists(args.split_summary):
+        logger.info(f"Loading pre-saved dataset split directly from: {args.split_summary}")
+        with open(args.split_summary, "r", encoding="utf-8") as f:
+            split_summary = json.load(f)
+        train_files = split_summary["train_files"]
+        val_files = split_summary["val_files"]
+        test_files = split_summary["test_files"]
+    else:
+        train_files, val_files, test_files, split_summary = get_dataset_split(
+            all_files,
+            protocol=args.split_protocol,
+            holdout_target=args.holdout_target,
+            holdout_liftoff=args.holdout_liftoff,
+            holdout_sensor=args.holdout_sensor,
+            holdout_waveform=args.holdout_waveform,
+            val_ratio=args.val_ratio,
+            val_files_count=args.val_files_count,
+            seed=config.seed,
+        )
 
     if args.split_protocol in ("compound_ood", "tri_ood", "multi_ood", "option_a"):
         logger.info("Dataset Split Protocol: COMPOUND_OOD (Option A - Multi-Domain Shift)")
