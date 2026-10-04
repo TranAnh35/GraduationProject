@@ -1089,5 +1089,47 @@ This document permanently tracks all completed, rejected, and active research hy
   - Instead, the self-supervised network accurately reconstructs target representations across both sound and defect regions. Flaw information is encoded in the **directional orientation and geometric covariance** of the latent vector $[h_{\text{center}}, \Delta H_{\text{pred}}]$ in $\mathbb{R}^{128}$ (which is why linear probes achieve AUC $> 0.93 - 0.99$ and CNR $> 2.6 - 7.3$), rather than scalar residual amplitude.
   - This conclusively disproves the assumption that flaw detection can be achieved via scalar reconstruction error thresholding, cementing the necessity of multi-dimensional latent feature readouts.
 
+### EXP-26: Learnable Scale Mixing JEPA
+- **Run Directory**: `experiments/5x5/exp26_learnable_scale_mixing`
+- **Primary Research Question**: Can an end-to-end learnable scale-mixing gate $g = \sigma(\text{MLP}([H_{\text{base}}, \Delta H]))$ adaptively decouple carrier drift from localized flaw perturbations without hand-crafted heuristics?
+- **Configuration & Hyperparameters**:
+  - `learnable_scale_mixing`: `True` (`ScaleMixingGate` module with 2-layer MLP + Sigmoid).
+  - `scale_separated_prediction`: `True`, `scale_separated`: `True`.
+  - `temporal_ac_coupling`: `False` (Preserving full DC energy integral).
+  - `carrier_normalized_features`: `False` (No divisive normalization).
+  - `keep_absolute_center_feature`: `True`.
+  - `epochs`: 5, `steps_per_epoch`: 1000, `batch_size`: 256, `lr`: 3e-4, `optimizer`: AdamW with cosine decay.
+- **Pretraining Trajectory & Convergence**:
+  - Epoch 1: `train_loss = 1.1803`, `val_loss = 1.3458`, `val_loss_pred = 0.3227`, `Two-NN = 9.71D`.
+  - Epoch 2: `train_loss = 1.0461`, `val_loss = 1.0262`, `val_loss_pred = 0.3208`, `Two-NN = 12.39D`.
+  - Epoch 3: `train_loss = 0.9451`, `val_loss = 0.6404`, `val_loss_pred = 0.2349`, `Two-NN = 12.77D`.
+  - Epoch 4: `train_loss = 0.6791`, `val_loss = 0.5111`, `val_loss_pred = 0.1765`, `Two-NN = 12.81D`.
+  - Epoch 5 (Best Checkpoint): `train_loss = 0.6138`, `val_loss = 0.4893` (**New all-time project record!** Down from 0.5900 in EXP-25B, -63.6% total reduction), `val_loss_pred = 0.1681` (**New all-time project record!** Down from 0.2036 in EXP-25B), `Two-NN = 12.56D`.
+- **Relational Physical Geometry (25 Calibrated Pits, N=300 Pairs)**:
+  - **Cross-Sensor Relational RSA (TMR $\leftrightarrow$ Hall Pot)**: Reached **$0.7839$** (**New all-time project peak!** vs EXP-25B: $0.7813$, EXP-22: $0.7041$).
+  - **Physical Volume Tracking $\rho(|\Delta V|)$**: Reached **$0.5468$** (+4.6% over EXP-25B's $0.5225$, +35.2% over EXP-22's $0.4044$).
+  - **Independent Diameter Sensitivity $\rho(D_z, \Delta D \mid \Delta d)$**: Surged to **$0.1880$** (+29.2% over EXP-25B's $0.1455$, +16.0% over EXP-22's $0.1620$).
+  - **Diameter Sensitivity $\rho(|\Delta D|)$**: Reached **$0.1008$** (Highest across all models).
+  - **Depth Sensitivity $\rho(|\Delta d|)$**: **$0.5775$** (EXP-25B: $0.6199$, EXP-22: $0.6099$).
+- **Downstream Inspection Battery Across Representative Scans**:
+  - **Corrosion Chirp $z1$**: Depth $R^2 = \mathbf{0.8901}$, MAE = $\mathbf{91.6\,\mu\text{m}}$ (Higher than EXP-25B: 0.8757, $92.2\,\mu\text{m}$; EXP-22: 0.8210, $120.5\,\mu\text{m}$). Detection AUC = $0.8937$, AP = $0.7520$, CNR = $3.14$.
+  - **Corrosion Square $z1$**: Depth $R^2 = \mathbf{0.5881}$, MAE = $\mathbf{170.0\,\mu\text{m}}$ (Substantially outperforms EXP-25B: 0.4093, $196.9\,\mu\text{m}$). Detection AUC = $0.8851$, AP = $0.7360$, CNR = $3.23$.
+  - **Corrosion Chirp $z3$ (High Lift-Off)**: Depth $R^2 = 0.9410$, MAE = $69.5\,\mu\text{m}$. Detection AUC = $0.8924$, AP = $0.7536$, CNR = $3.17$.
+  - **Rivet Chirp $z1$**: AUC = $0.9962$, AP = $0.9584$, CNR = $9.86$.
+  - **Rivet Chirp $z3$ (High Lift-Off)**: AUC = $0.9733$, AP = $0.8435$, CNR = $6.41$ (EXP-22: 0.9661, AP 0.8165, CNR 6.11).
+- **Post-Hoc Gating Activation Audit**:
+  - Evaluated the learned gate $g(x) \in (0, 1)^D$ across all scans:
+    - Corrosion Chirp $z1$: $g_{\text{sound}} = 0.8513$, $g_{\text{defect}} = 0.8520$ (Ratio: 1.00).
+    - Corrosion Square $z1$: $g_{\text{sound}} = 0.8720$, $g_{\text{defect}} = 0.8721$ (Ratio: 1.00).
+    - Corrosion Chirp $z3$: $g_{\text{sound}} = 0.8517$, $g_{\text{defect}} = 0.8513$ (Ratio: 1.00).
+    - Rivet Chirp $z1$: $g_{\text{sound}} = 0.8632$, $g_{\text{defect}} = 0.8619$ (Ratio: 1.00).
+    - Rivet Chirp $z3$: $g_{\text{sound}} = 0.8634$, $g_{\text{defect}} = 0.8656$ (Ratio: 1.00).
+- **Scientific Synthesis**:
+  - The learnable scale-mixing gate converged to a uniform stationary weighting factor $g \approx 0.86$, consistently transmitting $86\%$ of the local perturbation stream and suppressing the macroscopic carrier stream down to $(1 - g) \approx 0.14$.
+  - This uniform carrier suppression boosted geometric lateral sizing (independent diameter tracking $+29.2\%$ to $0.1880$, volume tracking to $0.5468$, cross-sensor RSA to $0.7839$) and improved depth regression on Square pulses ($R^2: 0.4093 \to 0.5881$) and Chirp $z1$ ($R^2: 0.8757 \to 0.8901$).
+  - However, because defects represent only $\approx 1.2\%$ of spatial scans, unconstrained self-supervised learning cannot spontaneously develop binary spatial gating (turning off on sound and on on defects). Sound metal itself requires non-zero perturbation prediction to model natural sensor noise and coil geometry.
+  - Therefore, static dual-stream concatenation (EXP-25B) remains slightly superior for raw anomaly detection on severe lift-off fasteners (Rivet $z3$ AP $92.74\%$ vs $84.35\%$), while learnable scale mixing (EXP-26) achieves higher precision in physical flaw sizing and cross-sensor relational consistency.
+
+
 
 

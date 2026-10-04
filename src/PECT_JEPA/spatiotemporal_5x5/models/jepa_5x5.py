@@ -34,6 +34,46 @@ from ..masking.cluster_mask import (
 from ..losses.jepa_loss import JEPALoss5x5
 
 
+class ScaleMixingGate(nn.Module):
+    """
+    EXP-26: Learnable Data-Dependent Scale-Mixing Gate
+    Computes a coordinate-wise gating vector g in (0, 1)^D that dynamically
+    blends or weights the background carrier baseline and the local flaw perturbation:
+        g = sigmoid(MLP([H_base, Delta_H]))
+    On sound metal, g is driven towards 0 to suppress lift-off drift and scanner noise.
+    On defect regions, g opens towards 1 to admit the high-frequency physical perturbation.
+    """
+    def __init__(self, embed_dim: int, hidden_dim: Optional[int] = None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = embed_dim
+        self.gate_net = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Sigmoid(),
+        )
+        # Initialize output layer with conservative bias so gate starts ~0.38
+        nn.init.constant_(self.gate_net[-2].bias, -0.5)
+
+    def forward(self, h_base: torch.Tensor, delta_h: torch.Tensor) -> torch.Tensor:
+        """
+        Inputs:
+            h_base: [B, ..., D]
+            delta_h: [B, ..., D]
+        Returns:
+            g: [B, ..., D] in (0, 1)
+        """
+        if h_base.shape != delta_h.shape:
+            if h_base.ndim == 3 and delta_h.ndim == 3:
+                if h_base.shape[1] == 1 and delta_h.shape[1] > 1:
+                    h_base = h_base.expand(-1, delta_h.shape[1], -1)
+                elif delta_h.shape[1] == 1 and h_base.shape[1] > 1:
+                    delta_h = delta_h.expand(-1, h_base.shape[1], -1)
+        combined = torch.cat([h_base, delta_h], dim=-1)
+        return self.gate_net(combined)
+
+
 class PECT_JEPA_5x5(nn.Module):
     """
     Unified 5x5 Spatiotemporal PECT-JEPA Self-Supervised Model.
@@ -110,6 +150,12 @@ class PECT_JEPA_5x5(nn.Module):
         # 7. Physical Alignment Modules (Option B)
         self.depth_head = nn.Linear(config.embed_dim, 1, bias=False)
         nn.init.trunc_normal_(self.depth_head.weight, std=0.02)
+
+        # 8. EXP-26: Learnable Scale-Mixing Gate
+        if getattr(config, "learnable_scale_mixing", False):
+            self.scale_gate = ScaleMixingGate(config.embed_dim)
+        else:
+            self.scale_gate = None
 
     @staticmethod
     def compute_characteristic_frequency(
@@ -258,11 +304,19 @@ class PECT_JEPA_5x5(nn.Module):
 
         # Scale-Separated Perturbation Target (EXP-24):
         # Neutralize the acquisition shortcut by setting target as relative perturbation Delta H = H_tgt - H_base
+        gate = None
         if getattr(self.config, "scale_separated_prediction", False):
             H_base = H_ctx.mean(dim=1, keepdim=True)  # [B, 1, D]
             H_target_for_loss = H_tgt - H_base
+            if getattr(self, "scale_gate", None) is not None:
+                H_base_exp = H_base.expand_as(H_pred)
+                gate = self.scale_gate(H_base_exp, H_pred)
+                H_pred_for_loss = gate * H_pred
+            else:
+                H_pred_for_loss = H_pred
         else:
             H_target_for_loss = H_tgt
+            H_pred_for_loss = H_pred
 
         # 7a. Compute Lift-Off Perturbation (if liftoff_invar_weight > 0)
         H_ctx_pert = None
@@ -305,7 +359,7 @@ class PECT_JEPA_5x5(nn.Module):
 
         # 7c. Compute Combined JEPA Loss
         loss_dict = self.loss_fn(
-            H_pred=H_pred,
+            H_pred=H_pred_for_loss,
             H_target=H_target_for_loss,
             target_indices=target_indices,
             H_ctx=H_ctx,
@@ -327,7 +381,8 @@ class PECT_JEPA_5x5(nn.Module):
             "H_ctx": H_ctx,
             "context_indices": context_indices,
             "target_indices": target_indices,
-            "mask_bool": mask_bool
+            "mask_bool": mask_bool,
+            "gate": gate,
         })
         return loss_dict
 
@@ -445,6 +500,10 @@ class PECT_JEPA_5x5(nn.Module):
                 carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
                 h_center_rep = h_center_rep / carrier_scale
                 delta_H = delta_H / carrier_scale
+            if getattr(self.config, "learnable_scale_mixing", False) and getattr(self, "scale_gate", None) is not None:
+                g = self.scale_gate(h_center_rep, delta_H)
+                h_center_rep = (1.0 - g) * h_center_rep
+                delta_H = g * delta_H
             Z_unified = torch.cat([h_center_rep, delta_H], dim=-1)  # [B, 2 * D]
             return Z_unified
 
@@ -550,6 +609,10 @@ class PECT_JEPA_5x5(nn.Module):
                 carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
                 h_center_rep = h_center_rep / carrier_scale
                 delta_H = delta_H / carrier_scale
+            if getattr(self.config, "learnable_scale_mixing", False) and getattr(self, "scale_gate", None) is not None:
+                g = self.scale_gate(h_center_rep, delta_H)
+                h_center_rep = (1.0 - g) * h_center_rep
+                delta_H = g * delta_H
             Z_unified = torch.cat([h_center_rep, delta_H], dim=-1)  # [B, 2 * D]
         else:
             delta_H_tokens = torch.abs(H_tgt - H_pred)

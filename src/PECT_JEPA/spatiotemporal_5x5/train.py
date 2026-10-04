@@ -202,6 +202,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="EXP-24: Normalize extracted flaw perturbation by carrier norm ||H_base|| (default: False)")
     p.add_argument("--keep_absolute_center_feature", type=lambda v: v.lower() == "true", default=True,
                    help="EXP-25: Keep absolute center representation [h_center, Delta H] instead of [h - H_base, Delta H] (default: True)")
+    p.add_argument("--learnable_scale_mixing", type=lambda v: v.lower() == "true", default=False,
+                   help="EXP-26: Learnable data-dependent scale-mixing gate g = sigma(MLP([H_base, Delta H])) (default: False)")
     p.add_argument("--device", type=str, default="cuda", help="Target device (cuda or cpu)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--mixed_precision", type=lambda v: v.lower() == "true", default=True, help="Use AMP FP16")
@@ -320,6 +322,7 @@ def main():
         scale_separated_prediction=args.scale_separated_prediction,
         carrier_normalized_features=args.carrier_normalized_features,
         keep_absolute_center_feature=args.keep_absolute_center_feature,
+        learnable_scale_mixing=args.learnable_scale_mixing,
         warmup_epochs=args.warmup_epochs,
         predictor_type=args.predictor_type,
         predictor_depth=args.predictor_depth,
