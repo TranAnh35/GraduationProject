@@ -319,6 +319,7 @@ class PECT_JEPA_5x5(nn.Module):
             delta_pred=delta_pred,
             H_rep_reg=H_rep_reg,
             file_ids=file_ids,
+            scale_separated=getattr(self.config, "scale_separated_prediction", False),
         )
         loss_dict.update({
             "H_pred": H_pred,

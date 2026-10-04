@@ -488,6 +488,7 @@ class JEPALoss5x5(nn.Module):
         delta_pred: Optional[torch.Tensor] = None,
         H_rep_reg: Optional[torch.Tensor] = None,
         file_ids: Optional[torch.Tensor] = None,
+        scale_separated: bool = False,
     ) -> Dict[str, torch.Tensor]:
         weights = self.compute_disturbance_weights(x_raw)
         l_pred, l_fluct = self.fluctuation_prediction_loss(H_pred, H_target, target_indices=target_indices, weights=weights)
@@ -542,11 +543,19 @@ class JEPALoss5x5(nn.Module):
         if self.norm_floor_weight > 0.0 and rep_reg is not None:
             l_norm, mean_norm = self.norm_floor_loss(rep_reg)
 
-        # Subspace Residual Perturbation Loss (EXP-22)
+        # Subspace Residual Perturbation Loss (EXP-22 / Fixed EXP-25B)
         l_pert = zero_loss
-        if self.subspace_perturbation_weight > 0.0 and delta_pred is not None and H_ctx is not None:
-            h_ctx_mean = H_ctx.mean(dim=1, keepdim=True)
-            delta_target = H_target - h_ctx_mean.expand_as(H_target)
+        if self.subspace_perturbation_weight > 0.0 and delta_pred is not None:
+            if scale_separated:
+                # When scale_separated_prediction is True, H_target is ALREADY (H_tgt - H_base).
+                # delta_pred predicts the relative perturbation, so target is exactly H_target!
+                delta_target = H_target
+            elif H_ctx is not None:
+                # Legacy unseparated mode (EXP-22): H_target is raw H_tgt, so subtract h_ctx_mean
+                h_ctx_mean = H_ctx.mean(dim=1, keepdim=True)
+                delta_target = H_target - h_ctx_mean.expand_as(H_target)
+            else:
+                delta_target = H_target
             l_pert = F.l1_loss(delta_pred, delta_target)
 
         total = (
