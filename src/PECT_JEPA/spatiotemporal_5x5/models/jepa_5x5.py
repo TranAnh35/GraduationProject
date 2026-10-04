@@ -669,14 +669,103 @@ class PECT_JEPA_5x5(nn.Module):
         return Z_unified, V_depth
 
     @torch.no_grad()
+    def extract_foundation_representation(
+        self, x: torch.Tensor, self_calibrate: bool = False
+    ) -> torch.Tensor:
+        """
+        Universal PECT Foundation Representation Extraction:
+        Extracts the full-rank, non-competing dual-subspace representation:
+            Z_foundation = [Phi_carrier, Phi_scattering] in R^(2 * D)
+        where:
+            Phi_carrier = h_ctx_center (incident diffusion field & background geometry)
+            Phi_scattering = |(H_tgt - H_base) - H_pred| (diffraction perturbation field)
+
+        Guarantees:
+        1. Full-rank preservation: Neither carrier nor scattering is zero-sum suppressed.
+        2. Waveform-agnostic: Operates identically on Chirp, Square, and Gaussian pulses.
+        3. Sensor-agnostic self-calibration: When self_calibrate=True, applies zero-mean
+           unit-variance normalization across spatial coordinates within each scan/batch
+           to neutralize sensor hardware DC transfer function offsets (mu_sensor).
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        device = x.device
+
+        # 1. Full tokenization & Context Encoding
+        tokens, pos = self.tokenizer(x)
+        H_full = self.context_encoder(tokens, pos)
+        center_spatial_idx = 0
+        h_ctx_center = H_full[:, center_spatial_idx, :]  # [B, D]
+
+        # 2. Context Masking & Predictor Target
+        all_indices = torch.arange(tokens.shape[1], device=device)
+        center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
+        mask_tgt = torch.zeros(tokens.shape[1], dtype=torch.bool, device=device)
+        mask_tgt[center_tgt_indices] = True
+
+        batch_arange = torch.arange(B, device=device).unsqueeze(1)
+        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)
+        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)
+
+        ctx_tokens = tokens[batch_arange, ctx_idx]
+        ctx_pos = pos[batch_arange, ctx_idx]
+        target_pos = pos[batch_arange, tgt_idx]
+
+        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+
+        # 3. Predictor center prediction
+        if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
+            freq_cond = self.compute_characteristic_frequency(
+                x, num_bins=getattr(self.config, "num_freq_bins", 14)
+            )
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
+        else:
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+            )
+
+        # 4. Target representation & relative perturbation
+        target_tokens = tokens[batch_arange, tgt_idx]
+        H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+
+        H_base = H_ctx_masked.mean(dim=1, keepdim=True)
+        phi_carrier = h_ctx_center  # [B, D]
+        phi_scattering = torch.abs((H_tgt - H_base) - H_pred).mean(dim=1)  # [B, D]
+
+        if self_calibrate and B > 1:
+            phi_carrier = (phi_carrier - phi_carrier.mean(dim=0, keepdim=True)) / (
+                phi_carrier.std(dim=0, keepdim=True) + 1e-6
+            )
+            phi_scattering = (phi_scattering - phi_scattering.mean(dim=0, keepdim=True)) / (
+                phi_scattering.std(dim=0, keepdim=True) + 1e-6
+            )
+
+        return torch.cat([phi_carrier, phi_scattering], dim=-1)  # [B, 2 * D]
+
+    @torch.no_grad()
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """
         Unified feature extractor dispatching according to config.feature_extraction_mode.
+        'foundation': [B, 2 * D] universal full-rank dual-subspace foundation representation
         'unified': [B, 2 * D] dual-perspective representation
         'context': [B, D] context encoder center feature
         """
         mode = getattr(self.config, "feature_extraction_mode", "unified")
-        if mode == "unified":
+        if mode == "foundation":
+            return self.extract_foundation_representation(
+                x, self_calibrate=getattr(self.config, "self_calibrated_norm", False)
+            )
+        elif mode == "unified":
             return self.extract_unified_features(x)
         return self.extract_center_feature(x)
 

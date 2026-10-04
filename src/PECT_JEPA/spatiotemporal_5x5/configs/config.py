@@ -83,6 +83,7 @@ class Spatiotemporal5x5Config:
     carrier_normalized_features: bool = False # EXP-24: Normalize extracted flaw representation by carrier magnitude ||H_base||
     keep_absolute_center_feature: bool = True # EXP-25: Keep absolute center representation [h_center, Delta H] instead of [h - H_base, Delta H]
     learnable_scale_mixing: bool = False     # EXP-26: Learnable data-dependent scale-mixing gating g = sigma(MLP([H_base, Delta H]))
+    self_calibrated_norm: bool = False       # Foundation Mode: Zero-center representations per scan/batch to eliminate sensor DC offset
 
     # ------------------------------------------------------------------- Loss
     loss_type: str = "l1"                # Base prediction norm ('l1' | 'smooth_l1')
