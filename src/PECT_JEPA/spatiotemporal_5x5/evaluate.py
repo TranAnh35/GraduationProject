@@ -308,9 +308,10 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     state_dict = ckpt.get("model_state_dict", ckpt)
 
     # If tokenizer_type was not specified in checkpoint config, infer from state_dict
-    # If tokenizer_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "tokenizer_type" in cfg_dict):
-        if "tokenizer.scale_shallow" in state_dict:
+        if "tokenizer.time_proj.0.weight" in state_dict:
+            config.tokenizer_type = "continuous_linear_field"
+        elif "tokenizer.scale_shallow" in state_dict:
             config.tokenizer_type = "uncrushed_diffusion"
         elif "tokenizer.pos_scale" in state_dict or "tokenizer.gate_proj.0.weight" in state_dict:
             config.tokenizer_type = "spatio_spectral"
@@ -327,7 +328,9 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
 
     # If predictor_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "predictor_type" in cfg_dict):
-        if "predictor.raw_alpha_x" in state_dict or "predictor.raw_alpha_y" in state_dict:
+        if "predictor.rel_diff_mlp.0.weight" in state_dict:
+            config.predictor_type = "freq_conditioned_diffusion"
+        elif "predictor.raw_alpha_x" in state_dict or "predictor.raw_alpha_y" in state_dict:
             config.predictor_type = "anisotropic_diffusion"
         elif "predictor.raw_d_scale" in state_dict:
             config.predictor_type = "continuous_helmholtz"
