@@ -1029,3 +1029,51 @@ This document permanently tracks all completed, rejected, and active research hy
   3. *Cross-Sensor Zero-Shot Transfer*: Drops to $AUC \approx 0.5000$ and $R^2 < 0$.
   4. *Conclusion*: Disproves the hypothesis that representations lack defect features. Cross-sensor failure is a linear readout calibration problem: linear probe hyperplanes $w^T z + b = 0$ calibrated to Sensor A saturate when applied to Sensor B due to disparate hardware transfer functions $V(B)$.
 
+### EXP-25B: Bug-Fixed Scale-Preserved Dual-Stream JEPA
+- **Run Directory**: `experiments/5x5/exp25b_scale_preserved_dual_stream_fixed`
+- **Primary Research Question**: Does correcting the double-subtraction defect ($\delta_{\text{target}} = H_{\text{tgt}} - H_{\text{base}}$ instead of $H_{\text{tgt}} - 2H_{\text{base}}$) stabilize self-supervised pretraining convergence, restore physical depth sensitivity, and maintain downstream NDT inspection performance?
+- **Configuration & Hyperparameters**:
+  - `scale_separated_prediction`: `True`, `scale_separated`: `True` (Bug-fixed: no redundant context subtraction in `JEPALoss5x5`).
+  - `temporal_ac_coupling`: `False` (Preserving full transient DC energy integral).
+  - `carrier_normalized_features`: `False` (No division by $\|H_{\text{base}}\|$).
+  - `keep_absolute_center_feature`: `True` (Dual-stream $[h_{\text{center}}, \Delta H_{\text{pred}}]$).
+  - `epochs`: 5, `steps_per_epoch`: 1000, `batch_size`: 256, `lr`: 3e-4, `optimizer`: AdamW with cosine decay.
+- **Pretraining Trajectory & Convergence**:
+  - Epoch 1: `train_loss = 1.0924`, `val_loss = 1.2826`, `val_loss_pred = 0.8986`, `Two-NN = 14.19D`.
+  - Epoch 4 (Best Checkpoint): `train_loss = 0.1585`, `val_loss = 0.5900` (-54.0% reduction), `val_loss_pred = 0.2036` (Lowest prediction loss in project for scale-separated formulation), `Two-NN = 13.10D`.
+- **Relational Physical Geometry (25 Calibrated Pits, N=300 Pairs)**:
+  - **Depth Sensitivity $\rho(|\Delta d|)$**: Recovered to **$0.4791$** (vs Buggy EXP-25: $0.4476$, EXP-22: $0.4829$).
+  - **Independent Depth Sensitivity $\rho(D_z, \Delta d \mid \Delta D)$**: Recovered to **$0.4723$** (vs Buggy EXP-25: $0.4417$, EXP-22: $0.4812$).
+  - **Physical Volume Tracking $\rho(|\Delta V|)$**: **$0.5213$** (+28.9% over EXP-22's $0.4044$).
+  - **Aspect Ratio Tracking $\rho(|\Delta(d/D)|)$**: **$0.1094$** (+17.1% over EXP-22's $0.0934$).
+  - **Independent Diameter Tracking $\rho(D_z, \Delta D \mid \Delta d)$**: **$0.0725$** (+52.6% over EXP-22's $0.0475$).
+  - **Cross-Sensor Relational RSA (TMR $\leftrightarrow$ Hall Pot)**: **$0.7813$** (+11.0% over EXP-22's $0.7041$).
+- **Downstream Inspection Battery Across Representative Scans**:
+  - **Corrosion Chirp $z1$**:
+    - AUC-ROC: **0.9390** (EXP-22: 0.9234)
+    - Average Precision (AP): **0.8380** (EXP-22: 0.7873)
+    - CNR: **2.64** (EXP-22: 2.27)
+    - Defect Depth $R^2$: **0.8725** (EXP-22: 0.7972)
+    - Depth MAE: **$94.1\,\mu\text{m}$** (EXP-22: $125.5\,\mu\text{m}$)
+  - **Corrosion Square $z1$**:
+    - AUC-ROC: **0.8970** (EXP-22: 0.8676, EXP-25: 0.8925) - **Highest among all models**
+    - AP: **0.7565** (EXP-22: 0.6819, EXP-25: 0.7467) - **Highest among all models**
+    - CNR: **2.20** (EXP-22: 1.86, EXP-25: 2.12) - **Highest among all models**
+    - Defect Depth $R^2$: **0.1823**, MAE: $234.0\,\mu\text{m}$
+  - **Corrosion Chirp $z3$ (High Lift-Off)**:
+    - AUC-ROC: **0.9500** (EXP-22: 0.9110)
+    - AP: **0.8544** (EXP-22: 0.7622)
+    - CNR: **2.79** (EXP-22: 2.10)
+    - Defect Depth $R^2$: **0.9387** (EXP-22: 0.9376, EXP-25: 0.9294) - **New Best SOTA**
+    - Depth MAE: **$67.0\,\mu\text{m}$** (EXP-22: $70.8\,\mu\text{m}$, EXP-25: $76.8\,\mu\text{m}$) - **New Best SOTA**
+  - **Rivet Chirp $z1$**:
+    - AUC-ROC: **0.9964**, AP: **0.9572**, CNR: **7.36** (EXP-22: 7.29, EXP-25: 7.26) - **Highest CNR**
+  - **Rivet Chirp $z3$ (High Lift-Off)**:
+    - AUC-ROC: **0.9906** (EXP-22: 0.9731, EXP-25: 0.9878)
+    - AP: **0.9421** (EXP-22: 0.8078, EXP-25: 0.8925) - **Massive +13.43% absolute gain over EXP-22**
+    - CNR: **5.15** (EXP-22: 3.80, EXP-25: 4.57) - **+35.5% relative gain over EXP-22**
+- **Scientific Synthesis**:
+  - Correcting the double-subtraction defect removed the mathematically conflicting optimization objective ($H_{\text{tgt}} - 2H_{\text{base}}$), restoring physical depth sensitivity ($\rho = 0.4791$) while setting new records on high lift-off rivet detection (AP $94.21\%$, CNR $5.15$) and high lift-off depth precision ($67.0\,\mu\text{m}$ MAE).
+  - EXP-25B serves as the verified, mathematically consistent baseline for Phase 2 architectural research.
+
+
