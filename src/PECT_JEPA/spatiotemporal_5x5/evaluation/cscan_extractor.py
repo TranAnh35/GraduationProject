@@ -54,7 +54,7 @@ def extract_full_cscan_map(
 
     padded = np.pad(full_cscan_3d, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
     extraction_mode = getattr(model.config, "feature_extraction_mode", "unified")
-    feat_dim = (2 * model.config.embed_dim) if extraction_mode == "unified" else model.config.embed_dim
+    feat_dim = (2 * model.config.embed_dim) if extraction_mode in ("unified", "foundation") else model.config.embed_dim
     out_map = np.zeros((sY, sX, feat_dim), dtype=np.float32)
     out_vol_3d = np.zeros((sY, sX, 4), dtype=np.float32) if return_volume_3d else None
 
