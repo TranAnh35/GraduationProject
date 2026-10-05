@@ -25,3 +25,23 @@
 - **Full-Rank Dual-Subspace Preservation (No Zero-Sum Competition)**: The incident diffusion carrier field ($\Phi_{\text{carrier}}$) and the localized defect scattering perturbation ($\Phi_{\text{scattering}}$) are independent physical components ($x_{\text{total}} = x_{\text{inc}} + \Delta x$). NEVER force them into competing zero-sum convex gates ($(1-g) \cdot \Phi_{\text{carrier}} + g \cdot \Phi_{\text{scattering}}$) that artificially starve carrier contrast. Both subspaces must be preserved at full rank.
 - **Hardware-Agnostic Self-Calibration**: Hardware transfer function offsets across disparate sensors (Hall Air, Hall Pot, TMR) must be handled via unsupervised spatial self-calibration (zero-centering against natural $>98\%$ sound metal), preserving full dynamic range without corrupting pretraining manifolds with artificial cross-sensor penalties.
 
+## 5. Professional Scientific Rigor & Forensic Analysis Protocols
+- **Strict Prohibition of Flattery, Hyperbole, and Premature SOTA Claims**:
+  - NEVER use celebratory, hyperbolic, or subjective praising language ("xuất sắc", "vượt trội", "kỷ lục thế giới", "thành công rực rỡ", "bước đột phá vĩ đại", "SOTA tuyệt đối") when evaluating models that still exhibit mediocre or flawed metrics (e.g., AUC < 95%, AP < 75%, Zero-Shot AUC < 75%, or collapsed slices).
+  - Reports and communications must maintain a strictly objective, sober, peer-reviewed scientific tone: report raw numbers, standard deviations, exact positive/negative deltas, and explicitly acknowledge when performance is insufficient for practical NDT deployment.
+- **Prohibition of Repetitive Inherent-Data Excuses (No Scapegoating Dataset Invariants)**:
+  - NEVER invoke long-established, inherent physical characteristics of the PECT problem (e.g., 98.8% sound metal class imbalance, low Gaussian wavepacket energy, disparate coil transfer functions, lift-off signal attenuation) as "excuses" or "new discoveries" to justify poor model performance.
+  - These conditions are established physical realities known from Day 1. The fundamental mission of this research is to solve inspection under these exact conditions. When a model fails, the analysis must explain the mechanistic algorithmic failure (e.g., gradient starvation, loss-metric misalignment, representation over-parameterization), not blame the dataset.
+- **Comprehensive Multi-Metric Forensic Reporting (No Selective Cherry-Picking)**:
+  - Every downstream benchmark report MUST report the complete suite of evaluation metrics produced by the pipeline, without omitting failure cases:
+    - Supervised Linear Probe: Mean AUC-ROC, Std AUC, Mean AP, Mean CNR, Mean IoU (Jaccard), Mean Dice F1.
+    - Zero-Shot Cross-File OOD Transfer: Mean AUC, Mean AP, Mean F1 (uncalibrated generalization to unseen inspection files).
+    - Unsupervised Anomaly Detection: Mean Mahalanobis AUC, Mean Mahalanobis AP (pure representation distance without supervised readouts).
+    - Multi-Slice Disaggregation: Every report must present the full matrix breakdown across all 3 waveforms (Chirp, Gaussian, Square), all 3 sensors (Hall Air, Hall Pot, TMR), and all 3 lift-off levels (z1, z2, z3).
+  - Any regression (where an experiment performs worse than a previous baseline on any slice or task) MUST be explicitly flagged and analyzed with top priority, never hidden beneath aggregate averages.
+- **Causal Latent-Space Analysis Mandate**:
+  - When analyzing why a model succeeded or failed, the agent must trace the mechanistic causal chain connecting:
+    $$\text{Code/Math Formulation} \longrightarrow \text{Optimization Dynamics (Gradients/Loss)} \longrightarrow \text{Latent Geometry (SVD, CKA, RSA, Two-NN)} \longrightarrow \text{Downstream Task Performance}$$
+  - Every proposal for an architectural or loss modification must be explicitly grounded in resolving a demonstrated failure mechanism identified in prior forensic latent analyses (e.g., separating hyperplanes orthogonality, energy dominance, micro-noise over-fitting), rather than proposing disconnected or speculative modifications.
+
+
