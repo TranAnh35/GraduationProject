@@ -1175,6 +1175,7 @@ class ContinuousLinearFieldTokenizer5x5(nn.Module):
         use_snr_tapering: bool = True,
         phase_noise_floor: float = 0.02,
         temporal_ac_coupling: bool = False,
+        adaptive_phase_floor: bool = False,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -1186,6 +1187,7 @@ class ContinuousLinearFieldTokenizer5x5(nn.Module):
         self.use_snr_tapering = use_snr_tapering
         self.phase_noise_floor = phase_noise_floor
         self.temporal_ac_coupling = temporal_ac_coupling
+        self.adaptive_phase_floor = adaptive_phase_floor
 
         # 1. Continuous 1D Temporal Projection (NO temporal pooling!)
         self.time_proj = nn.Sequential(
@@ -1247,7 +1249,12 @@ class ContinuousLinearFieldTokenizer5x5(nn.Module):
         mag = torch.log1p(mag_linear)
 
         if self.use_snr_tapering:
-            snr_weight = torch.tanh(mag_linear / self.phase_noise_floor)
+            if getattr(self, "adaptive_phase_floor", False):
+                # Scale noise floor adaptively by mean harmonic magnitude per probe to prevent Gaussian starvation
+                local_floor = self.phase_noise_floor * (mag_linear.mean(dim=-1, keepdim=True) + 1e-6)
+                snr_weight = torch.tanh(mag_linear / (local_floor + 1e-8))
+            else:
+                snr_weight = torch.tanh(mag_linear / self.phase_noise_floor)
             phase = phase * snr_weight
 
         spectral_feat = torch.cat([phase, mag], dim=-1).to(x.dtype)  # [B*25, 2*num_freq_bins]
@@ -1278,6 +1285,7 @@ def build_tokenizer_5x5(config) -> nn.Module:
             use_snr_tapering=getattr(config, "phase_snr_tapering", True),
             phase_noise_floor=getattr(config, "phase_noise_floor", 0.02),
             temporal_ac_coupling=getattr(config, "temporal_ac_coupling", False),
+            adaptive_phase_floor=getattr(config, "adaptive_phase_floor", False),
         )
     elif tokenizer_type in ("continuous_field", "waveform_agnostic_field", "continuous_dual_domain"):
         return ContinuousFieldTokenizer5x5(

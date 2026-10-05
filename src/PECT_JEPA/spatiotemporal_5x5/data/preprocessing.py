@@ -61,7 +61,14 @@ def normalize_waveforms_linear(
     - 'min_max': scale to [0, 1].
     - 'none': pass-through.
     """
-    if normalization in ("file_peak", "global_peak"):
+    if normalization in ("energy_rms", "file_rms"):
+        # Waveform-Invariant Root-Mean-Square Energy Normalization (EXP-29):
+        # Normalizes the entire C-scan record by its scalar root-mean-square amplitude:
+        # Ensures unit signal energy E_rms = 1.0 identically across Square, Gauss, and Chirp
+        # while preserving 100% of spatial relative defect perturbation contrast Delta V.
+        rms = float(np.sqrt(np.mean(x ** 2) + eps))
+        return (x / (rms + eps)).astype(np.float32)
+    elif normalization in ("file_peak", "global_peak"):
         # True scalar peak over the entire C-scan record / array
         peak = float(np.max(np.abs(x)))
         return (x / (peak + eps)).astype(np.float32)

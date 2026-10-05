@@ -55,6 +55,8 @@ class Spatiotemporal5x5Config:
     spectral_features: str = "phase_and_mag" # 'phase_and_mag' | 'phase_only'
     phase_snr_tapering: bool = True     # Magnitude-weighted phase tapering to suppress noise floor
     phase_noise_floor: float = 0.05     # Signal magnitude threshold for phase tapering
+    adaptive_phase_floor: bool = True   # EXP-29: Scale SNR phase noise floor adaptively by mean harmonic magnitude
+    spatial_calibration: bool = True    # EXP-29: Zero-center full C-scan features by spatial median to eliminate 10x sensor/waveform DC drift
     embed_dim: int = 64                 # D (64 provides optimal capacity for 1.46M samples/epoch, 4 heads with dk=16)
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_depth: int = 4

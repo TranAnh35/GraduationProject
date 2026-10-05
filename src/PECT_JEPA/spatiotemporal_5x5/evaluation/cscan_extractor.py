@@ -33,6 +33,7 @@ def extract_full_cscan_map(
     device: str = "cuda",
     show_pbar: bool = False,
     return_volume_3d: bool = False,
+    spatial_calibration: Optional[bool] = None,
 ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """
     Extract exact [sY, sX, D] feature map from a 3D C-scan grid [sY, sX, C].
@@ -86,6 +87,14 @@ def extract_full_cscan_map(
             else:
                 z_feat = model.extract_features(x_b).cpu().numpy()
                 out_map[all_r[k:k_end], all_c[k:k_end]] = z_feat
+
+    use_calib = getattr(model.config, "spatial_calibration", False) if spatial_calibration is None else spatial_calibration
+    if use_calib:
+        # Intrinsic Scan-Level Spatial Calibration (EXP-29):
+        # Subtract spatial median to zero-center sound metal (>95% of C-scan pixels)
+        # Eliminates 10x hardware/sensor transfer function DC drift across disparate files
+        spatial_median = np.median(out_map, axis=(0, 1), keepdims=True)
+        out_map = out_map - spatial_median
 
     if return_volume_3d:
         return out_map, out_vol_3d

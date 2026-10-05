@@ -100,8 +100,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--crop_border", type=int, default=15,
                    help="Number of outer boundary pixels to crop on each edge (default: 15 to remove air/edge effect)")
     p.add_argument("--normalization", type=str, default="file_peak",
-                   choices=["file_peak", "global_peak", "dataset_peak", "per_sample_peak", "zscore", "peak_early", "min_max"],
-                   help="Waveform normalization strategy: 'file_peak' (EXP-15: true C-scan peak, preserves Delta V, default), 'dataset_peak', 'per_sample_peak', etc.")
+                   choices=["file_peak", "global_peak", "energy_rms", "file_rms", "dataset_peak", "per_sample_peak", "zscore", "peak_early", "min_max"],
+                   help="Waveform normalization strategy: 'energy_rms' (EXP-29: Waveform-Invariant RMS Energy Normalization), 'file_peak', 'global_peak', etc.")
+    p.add_argument("--adaptive_phase_floor", type=lambda v: v.lower() == "true", default=True,
+                   help="EXP-29: Scale SNR phase noise floor adaptively by mean harmonic magnitude (default: True)")
+    p.add_argument("--spatial_calibration", type=lambda v: v.lower() == "true", default=True,
+                   help="EXP-29: Zero-center full C-scan features by spatial median to eliminate 10x sensor/waveform DC drift (default: True)")
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Base learning rate")
     p.add_argument("--loss_type", type=str, default="l1", choices=["l1", "smooth_l1", "l2", "cosine"],
                    help="JEPA latent prediction loss function (default: l1)")
@@ -311,6 +315,8 @@ def main():
         spectral_features=args.spectral_features,
         phase_snr_tapering=args.phase_snr_tapering,
         phase_noise_floor=args.phase_noise_floor,
+        adaptive_phase_floor=args.adaptive_phase_floor,
+        spatial_calibration=args.spatial_calibration,
         apply_lowpass=args.apply_lowpass,
         lowpass_cutoff=args.lowpass_cutoff,
         lowpass_order=args.lowpass_order,
