@@ -43,5 +43,21 @@
   - When analyzing why a model succeeded or failed, the agent must trace the mechanistic causal chain connecting:
     $$\text{Code/Math Formulation} \longrightarrow \text{Optimization Dynamics (Gradients/Loss)} \longrightarrow \text{Latent Geometry (SVD, CKA, RSA, Two-NN)} \longrightarrow \text{Downstream Task Performance}$$
   - Every proposal for an architectural or loss modification must be explicitly grounded in resolving a demonstrated failure mechanism identified in prior forensic latent analyses (e.g., separating hyperplanes orthogonality, energy dominance, micro-noise over-fitting), rather than proposing disconnected or speculative modifications.
+- **Mandatory Dual-Tier Evaluation: Downstream Benchmarks + Deep Latent Diagnostics**:
+  - Evaluation must never rely solely on downstream metrics (AUC, AP, CNR, $R^2$, MAE, IoU). Every experiment must include deep latent-space diagnostics modeled after EXP-23, EXP-24, and EXP-25-ABL:
+    1. Singular Value Decomposition (SVD): Spectrum decay rate, effective rank $R_{\text{eff}}$, and condition number.
+    2. Alignment & Invariance (CKA / RSA): Centered Kernel Alignment (CKA) and Representational Similarity Analysis (RSA) across disparate sensors, waveforms, and flaw morphologies.
+    3. Cluster Geometry & Noise Floor: Sound-metal background variance $\sigma_{\text{sound}}^2$ versus defect perturbation norm $\|\Delta z_{\text{defect}}\|$, and inter-scan centroid drift $\|\mu_A - \mu_B\|$.
+    4. Separating Hyperplane Orientation: Cosine similarity $\cos(w_A, w_B)$ of linear decision boundaries across files.
+- **Current-Codebase Empirical Verification Mandate (Zero Metric Recycling)**:
+  - NEVER use numbers, latent measurements, or observations from past experiments to explain or diagnose the current model.
+  - Every assertion regarding the current experiment must be substantiated by empirical data extracted directly from the CURRENT checkpoint and CURRENT code.
+  - If a required measurement or metric does not exist in the default evaluation summary, the agent must proactively write and execute a diagnostic script to measure it directly before making any claims.
+- **Evidence-Grounded Scientific Rigor (Luận điểm - Luận cứ - Minh chứng)**:
+  - Every proposal, diagnosis, or evaluation must strictly follow a three-element structure:
+    1. **Luận điểm (Claim / Hypothesis)**: A precise, testable statement about model behavior or proposed modification.
+    2. **Luận cứ (Physical & Algorithmic Rationale)**: The underlying mathematical, physical, or optimization mechanism explaining why this occurs.
+    3. **Minh chứng (Empirical Evidence)**: Concrete, unvarnished numbers, tables, or plots extracted directly from the current model and codebase.
+
 
 
