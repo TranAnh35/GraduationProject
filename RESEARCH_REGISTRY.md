@@ -45,6 +45,7 @@ This document permanently tracks all completed, rejected, and active research hy
 | **EXP-FOUNDATION** | Universal Dual-Subspace PECT Foundation Model | `src/PECT_JEPA/spatiotemporal_5x5/foundation_evaluator.py` | 5 ep (unified) | Rivet z1 AUC: 99.64% (AP: 95.72%, CNR: 8.61) \| Rivet z3 AP: 94.21% (CNR: 4.98) \| TMR Sensor AUC: 97.17% (AP: 92.51%, Vol rho: 0.6451) \| Corrosion Depth R²: 0.7945 (MAE: 126.0 um) | **Accepted Foundation Benchmark** | Established the single, universal PECT Foundation Model checkpoint. Combines full-rank carrier field Phi_carrier and diffraction scattering field Phi_scattering without zero-sum gating. Operates waveform-agnostically across Chirp, Square, and Gaussian pulses, and eliminates sensor DC offsets via self-calibrated spatial normalization. All 4 unit tests passed 100%. |
 | **EXP-28** | Unpooled Continuous Linear Field Tokenizer + Frequency-Conditioned Diffusion World Model | `tokenizer_5x5.py`: `ContinuousLinearFieldTokenizer5x5` + `predictor.py`: `FrequencyConditionedDiffusionPredictor5x5` | 5 ep (pilot) | AUC: 88.84% ± 9.32% (+4.25%) \| AP: 57.10% (+6.96%) \| CNR: 2.98 (+0.28) \| Defect R²: 0.6182 \| Corrosion R²: 0.8807 (94.5 um) \| Gaussian AUC: 80.80% (+10.16%) \| TMR AP: 57.36% (+13.64%) | **Accepted SOTA Benchmark** | Grounded breakthrough resolving both temporal pooling blindness and unconditioned diffusion. Continuous 1D projection preserves peak arrival delay sensitivity (cosine sim drops from 0.9897 to 0.3307), driving historic +10.16% AUC / +16.82% AP recovery on Gaussian pulses. Frequency-conditioned diffusion cross-attention bias embeds skin depth delta(f) ~ 1/sqrt(f), surging held-out TMR hardware AP (+13.64%) and depth R² (0.48 -> 0.60). |
 | **EXP-28-FULL** | Full 20-Epoch Unpooled Linear Field + Freq-Conditioned Diffusion (No Step Caps) | `tokenizer_5x5.py`: `ContinuousLinearFieldTokenizer5x5` + `predictor.py`: `FrequencyConditionedDiffusionPredictor5x5` | 20 ep (113,900 batches) | AUC: 85.85% ± 11.42% \| AP: 52.02% \| CNR: 2.92 \| Two-NN: 23.05D (Record) \| Val Pred Loss: 0.0728 (-69.7%) \| Chirp AP: 72.74% \| Rivet CNR: 5.05 \| Corrosion R²: 0.8139 (96.4 um) | **Accepted SOTA Benchmark** | Full 20-epoch dataset-complete training (113,900 batches, zero step cutoffs). Two-NN intrinsic dimension expanded to project-record 23.05D, validation prediction loss plummeted to 0.0728 (-69.7%). Rivet fastener clutter CNR reached historic peak of 5.05 with 69.4 um depth precision; Chirp held-out OOD AP reached 72.74% (CNR 4.49, R² 0.7179); Corrosion depth R² reached 0.8139 with 96.4 um MAE across all 57 held-out test files. |
+| **EXP-29** | Waveform-Invariant Energy RMS Normalization + Adaptive Phase Floor + Spatial Calibration | `preprocessing.py`: `energy_rms` + `cscan_extractor.py`: `spatial_calibration` | 20 ep (113,900 batches) | AUC: 58.17% ± 5.67% (-27.68%) \| AP: 11.26% (-40.76%) \| CNR: 0.55 (-2.37) \| Defect R²: -0.0015 \| Drift/Signal: 0.72x \| Hyperplane Cos: +0.0000 | **Rejected / Autopsied** | Catastrophic downstream regression caused by inadvertent deactivation of scale-separated prediction (`scale_separated_prediction: false`), triggering the Carrier Acquisition Shortcut. Perturbation norm collapsed 22.2x (0.0071 -> 0.00032), destroying downstream linear probe margin despite successfully shrinking inter-file centroid drift by 307x. |
 
 
 ---
@@ -1326,10 +1327,35 @@ This document permanently tracks all completed, rejected, and active research hy
   - **Superior Chirp & Rivet Mastery**: On the complex held-out Chirp waveform, the full 20-epoch foundation model achieved exceptional downstream screening (AUC = $93.52\%$, AP = $72.74\%$, CNR = $4.49$, IoU = $44.64\%$) and depth regression ($R^2 = 0.7179$). On fastener clutter specimens (`Rivet`), CNR reached a project peak of $\mathbf{5.05}$ with depth MAE of only $\mathbf{69.4\,\mu\text{m}}$.
   - **Lift-off Invariance in Depth Sizing**: Remarkable stability is demonstrated across lift-off heights: Defect-Only Depth $R^2$ is $0.5462$ at z1, $0.6331$ at z2, and $\mathbf{0.6406}$ at severe 2.0mm lift-off z3, confirming that the uncrushed Fourier phase branch provides true Dodd-Deeds lift-off invariance without degrading with training duration.
 
-
-
-
-
-
-
-
+### EXP-29: Waveform-Invariant Energy RMS Normalization + Adaptive Phase Floor + Spatial Calibration (20 Epochs)
+- **Run Directory**: `experiments/5x5/exp29_energy_rms_spatial_calibration_20ep`
+- **Checkpoints**: `checkpoints/best_model_5x5.pt` (Epoch 18, step 108,205, `val_loss_pred = 0.0812`, `val_loss = 0.2185`)
+- **Evaluation Benchmark Directory**: `experiments/5x5/exp29_energy_rms_spatial_calibration_20ep/evaluation_results/`
+- **Latent Space Forensics Summary**: `experiments/5x5/exp29_energy_rms_spatial_calibration_20ep/latent_forensics_summary.json`
+- **Scientific Status**: **Rejected / Autopsied**
+- **Downstream Empirical Metrics Across ALL 57 Held-Out Compound OOD Test Files**:
+  - Linear Probe Mean AUC-ROC: **58.17% ± 5.67%** (vs 85.85% in EXP-28, **-27.68% catastrophic collapse**)
+  - Linear Probe Mean AP: **11.26%** (vs 52.02% in EXP-28, **-40.76% collapse**)
+  - Mean Contrast-to-Noise Ratio (CNR): **0.55** (vs 2.92 in EXP-28, **signal destroyed**)
+  - Mean Boundary IoU: **3.86%** (vs 29.32% in EXP-28)
+  - Defect-Only Depth Regression $R^2$: **-0.0015** (vs 0.6151 in EXP-28, **zero decodability**)
+  - Zero-Shot Cross-File OOD AUC: **49.81% ± 2.88%** (random guessing)
+  - Unsupervised Mahalanobis AUC: **49.80% ± 1.73%** (random guessing)
+- **Multi-Slice Disaggregation**:
+  - Waveforms: Chirp AUC 60.26% (AP 12.15%), Square AUC 58.77% (AP 11.37%), Gaussian AUC 53.81% (AP 9.53%)
+  - Sensors: Hall Air AUC 56.57% (AP 10.64%), Hall Pot AUC 58.28% (AP 11.61%), TMR AUC 59.00% (AP 11.40%)
+  - Lift-Off: z1 AUC 63.82% (AP 13.60%), z2 AUC 58.37% (AP 11.07%), z3 AUC 54.92% (AP 10.06%)
+- **Deep Latent Space Geometric Diagnostics (9 Representative Files)**:
+  - Defect Perturbation Norm $\|\Delta z_{\text{defect}}\|_2$: **0.000320** (vs 0.0071 in EXP-28, **collapsed 22.2x**)
+  - Sound Metal Spread $\sigma_{\text{sound}}$: **0.00148** (vs 0.0072 in EXP-28)
+  - Latent SNR ($\|\Delta z\| / \sigma$): **0.2652** (vs 0.9370 in EXP-28, **collapsed 3.5x**)
+  - Fisher Discriminant Ratio $J$: **0.0738** (vs 0.7528 in EXP-28, **collapsed 10.2x**)
+  - Inter-File Centroid Drift $\|\mu_A - \mu_B\|_2$: **0.000229** (vs 0.0707 in EXP-28, **reduced 307x**)
+  - Drift-to-Signal Ratio: **0.72x** (vs 10.00x in EXP-28)
+  - Hyperplane Cosine Alignment $\cos(w_A, w_B)$: **+0.0000** (strictly orthogonal)
+  - Mean Linear CKA Across Files: **0.0891** (vs 0.4490 in EXP-28)
+- **Mechanistic Root Cause (Causal Chain)**:
+  - **Code Level**: The training CLI command omitted `--scale_separated_prediction True`, which defaulted to `False` in `train.py`.
+  - **Optimization Dynamics**: Without scale separation, the predictor minimized loss against the absolute target token $H_{\text{tgt}}$ rather than the relative deviation $H_{\text{tgt}} - H_{\text{base}}$. Because sound metal represents $98.8\%$ of the physical scan, the predictor learned an identity shortcut ($H_{\text{pred}} \approx H_{\text{ctx}}$).
+  - **Latent Geometry**: The perturbation discrepancy vector $\Delta H = |H_{\text{tgt}} - H_{\text{pred}}|$ collapsed to near zero ($0.00032$). Even though spatial calibration successfully removed inter-file centroid drift (shrinking drift from 0.0707 to 0.0002), subtracting the median on an already collapsed perturbation field eliminated the remaining margin for linear classifiers ($w^T z + b \approx 0$).
+  - **Decision**: Scale-separated prediction is an indispensable physical invariant for PECT-JEPA that must never be deactivated. EXP-30 will re-integrate `scale_separated_prediction=True` with `energy_rms`.
