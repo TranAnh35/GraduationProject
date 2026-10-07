@@ -1372,3 +1372,34 @@ This document permanently tracks all completed, rejected, and active research hy
   - `energy_rms` scales each transient pulse by its total RMS energy. For Gaussian pulses, where excitation is concentrated in a narrow center packet, RMS division amplifies the baseline noise floor on both flanks, degrading Gaussian depth sizing ($R^2$ dropped from 0.6102 down to 0.4565).
   - Spatial calibration ($Z - \text{median}(Z)$) removes DC offsets but reduces the latent separation margin for subtle, deeply buried flaws at z3 lift-off (z3 Depth $R^2$ dropped from 0.6406 to 0.5389).
   - EXP-28-FULL remains the authoritative SOTA baseline across all metrics. Any future proposal must demonstrably exceed EXP-28-FULL on verified pilot checks before consideration.
+
+### EXP-30: Multi-Scale Differential Filterbank Tokenizer Pilot (3 Epochs)
+- **Run Directory**: `experiments/5x5/exp30_operator_diffusion_pilot`
+- **Checkpoints**: `checkpoints/best_model_5x5.pt` (Epoch 2, step 2000, `val_loss_pred = 0.1589`, `val_loss = 0.9365`)
+- **Scientific Status**: **Rejected** (Failed to eliminate cross-waveform hyperplane orthogonality; Zero-Shot AUC remained at 51.00% - 54.64%). Codebase reverted to EXP-28 baseline (`ContinuousLinearFieldTokenizer5x5`).
+- **Hypothesis Tested**:
+  - Replacing discrete coordinate projection `nn.Linear(128, 64)` with multi-scale 1D Conv filterbank ($k=3, 7, 15$) and progressive strided downsampling would provide translation equivariance along the time axis, eliminating sample-index memorization and aligning decision boundaries across disparate waveforms.
+- **Controlled 3-Epoch Pretraining Trajectory**:
+  - Epoch 1: `train_loss = 1.1524`, `val_loss = 1.1768`, `val_loss_pred = 0.2073`, `Two-NN = 8.93D`
+  - Epoch 2 (Best Checkpoint): `train_loss = 0.9634`, `val_loss = 0.9365`, `val_loss_pred = 0.1589`, `Two-NN = 11.15D`
+  - Epoch 3: `train_loss = 1.0239`, `val_loss = 1.0609`, `val_loss_pred = 0.2902`, `Two-NN = 10.21D`
+- **Downstream Empirical Metrics (True Zero-Shot Held-Out Test vs Within-File Oracle)**:
+  - `Hall_Air_Chirp_z1`: Within-File AUC **91.40%** | True Zero-Shot AUC **51.00%** (AP: 1.39%, Defect $R^2: -4.9353$)
+  - `Hall_Air_Chirp_z3`: Within-File AUC **67.52%** | True Zero-Shot AUC **51.01%** (AP: 1.27%, Defect $R^2: -2.6754$)
+  - `TMR_Chirp_z1`: Within-File AUC **97.29%** | True Zero-Shot AUC **54.64%** (AP: 1.45%, Defect $R^2: -6.7263$)
+  - `TMR_Square_z1`: Within-File AUC **89.22%** | True Zero-Shot AUC **39.76%** (AP: 1.01%, Defect $R^2: -6.1798$)
+  - `Hall_Pot_Gauss_z3`: Within-File AUC **65.95%** | True Zero-Shot AUC **51.54%** (AP: 1.30%, Defect $R^2: +0.2091$)
+- **Latent Space Diagnostics (Direct Current-Code Measurement)**:
+  - Mean Off-Diagonal Hyperplane Cosine: **$0.0798 \pm 0.1444$** (Essentially orthogonal; EXP-29 was $0.0220 \pm 0.2438$).
+  - Pairwise Hyperplane Normal Vector Cosines $\cos(w_i, w_j)$:
+    - $\cos(w_{\text{HP\_Gauss}}, w_{\text{HP\_Square}}) = -0.0067$ (Exact $90.38^\circ$ orthogonality on the exact same sensor coil!).
+    - $\cos(w_{\text{HA\_Gauss}}, w_{\text{HA\_Square}}) = +0.0698$ (Orthogonal on Hall Air).
+    - $\cos(w_{\text{HA\_Chirp}}, w_{\text{HP\_Square}}) = -0.0937$.
+    - Same-waveform across sensors remained aligned: $\cos(w_{\text{HP\_Gauss}}, w_{\text{HA\_Gauss}}) = +0.2632$, $\cos(w_{\text{HP\_Square}}, w_{\text{HA\_Square}}) = +0.2607$, $\cos(w_{\text{HA\_Chirp}}, w_{\text{TMR\_Chirp}}) = +0.1874$.
+  - Latent Effective Rank (SVD Entropy): **$15.79\text{D} / 128\text{D}$**.
+- **Causal Forensic Diagnosis & Rejection Conclusion**:
+  - The hypothesis that 1D Conv filterbanks would resolve cross-waveform orthogonality is empirically refuted.
+  - The root cause is not the tokenizer representation, but the **Intra-Scan Self-Prediction Objective**: JEPA only predicts missing spatial patches within the *same* waveform scan ($x_{\text{Square}} \to x_{\text{Square}}$ and $x_{\text{Chirp}} \to x_{\text{Chirp}}$).
+  - Coupled with VICReg covariance decorrelation ($\mathcal{L}_{\text{cov}} \to 0$), the network optimizes by assigning disparate waveform features into disjoint coordinate subspaces.
+  - Changes to tokenizer architecture reverted in full; EXP-28 baseline restored.
+

@@ -1724,7 +1724,9 @@ def main():
             "task4_latent_diagnostics": {
                 "mean_channel_sensitivity": float(np.mean(all_sens)) if all_sens else None,
             },
+            "zero_shot_held_out_transfer": cross_file_ood_summary,
         },
+        "zero_shot_cross_file_transfer": cross_file_ood_summary,
         "per_specimen_summary": per_specimen_summary,
         "per_file_results": file_results,
     }
@@ -1811,6 +1813,10 @@ def main():
         print(f"  Unsupervised Maha AUC:  Mean = {np.mean(all_maha_aucs):.4f} +/- {np.std(all_maha_aucs):.4f} | AP = {np.mean(all_maha_aps):.4f}")
     if all_sens:
         print(f"  Mean Latent Sensitivity S_k: {np.mean(all_sens):.4f}")
+    if cross_file_ood_summary and "linear_probe" in cross_file_ood_summary:
+        zs_lp = cross_file_ood_summary["linear_probe"]
+        print(f"\n  [TRUE ZERO-SHOT HELD-OUT TEST TRANSFER] (Probe trained on train pool, evaluated on unseen test files):")
+        print(f"    Zero-Shot Defect AUC: Mean = {zs_lp.get('mean_auc_roc')} +/- {zs_lp.get('std_auc_roc')} | AP = {zs_lp.get('mean_average_precision')} | F1 = {zs_lp.get('mean_f1')}")
 
     print(f"\nArtifacts organized into 5 modular task folders:")
     print(f"  - 1_Anomaly_Detection:       {os.path.join(args.output_dir, '1_Anomaly_Detection')}")
