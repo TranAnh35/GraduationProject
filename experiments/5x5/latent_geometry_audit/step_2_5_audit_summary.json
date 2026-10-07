@@ -1,0 +1,21 @@
+{
+  "defect_vector_realignment": {
+    "cos_raw_GC": 0.46238961815834045,
+    "cos_realigned_GC": 0.8535600900650024,
+    "gain": 0.391170471906662
+  },
+  "cycle_consistency": {
+    "procrustes_cycle_error": 0.2044257359380382,
+    "ridge_cycle_error": 1.0893535907283678
+  },
+  "cross_scan_generalization": {
+    "Gauss_z1_to_Gauss_z2": 58.09244886941581,
+    "Gauss_z1_to_Chirp_z1_proc": 80.96637312520552,
+    "Gauss_z1_to_Chirp_z2_raw": 50.977186491235,
+    "Gauss_z1_to_Chirp_z2_proc_generalized": 65.13997941078628,
+    "Gauss_z1_to_Chirp_z2_proc_refit": 62.64860781077877,
+    "Square_z1_to_Chirp_z1_ridge": 66.05316744295087,
+    "Square_z1_to_Chirp_z2_raw": 53.662997622225916,
+    "Square_z1_to_Chirp_z2_ridge_generalized": 57.955075916490514
+  }
+}
