@@ -1,0 +1,97 @@
+{
+  "step1_polarity": {
+    "Raw": {
+      "Square_Square": {
+        "auc": 64.37964729748344,
+        "auc_pm": 64.37964729748344
+      },
+      "Square_Gauss": {
+        "auc": 44.08670031183104,
+        "auc_pm": 55.91329968816896
+      },
+      "Square_Chirp": {
+        "auc": 33.776524536119176,
+        "auc_pm": 66.22347546388082
+      },
+      "Gauss_Square": {
+        "auc": 50.0,
+        "auc_pm": 50.0
+      },
+      "Gauss_Gauss": {
+        "auc": 50.0,
+        "auc_pm": 50.0
+      },
+      "Gauss_Chirp": {
+        "auc": 50.0,
+        "auc_pm": 50.0
+      },
+      "Chirp_Square": {
+        "auc": 50.0,
+        "auc_pm": 50.0
+      },
+      "Chirp_Gauss": {
+        "auc": 50.0,
+        "auc_pm": 50.0
+      },
+      "Chirp_Chirp": {
+        "auc": 50.0,
+        "auc_pm": 50.0
+      }
+    },
+    "Standardized": {
+      "Square_Square": {
+        "auc": 86.19522150671145,
+        "auc_pm": 86.19522150671145
+      },
+      "Square_Gauss": {
+        "auc": 58.89514426838266,
+        "auc_pm": 58.89514426838266
+      },
+      "Square_Chirp": {
+        "auc": 58.45986081752914,
+        "auc_pm": 58.45986081752914
+      },
+      "Gauss_Square": {
+        "auc": 52.95912584475823,
+        "auc_pm": 52.95912584475823
+      },
+      "Gauss_Gauss": {
+        "auc": 84.37306304650531,
+        "auc_pm": 84.37306304650531
+      },
+      "Gauss_Chirp": {
+        "auc": 48.93669948688119,
+        "auc_pm": 51.06330051311881
+      },
+      "Chirp_Square": {
+        "auc": 49.24364145914061,
+        "auc_pm": 50.75635854085939
+      },
+      "Chirp_Gauss": {
+        "auc": 53.456812340022076,
+        "auc_pm": 53.456812340022076
+      },
+      "Chirp_Chirp": {
+        "auc": 98.967489685249,
+        "auc_pm": 98.967489685249
+      }
+    }
+  },
+  "step2_paired_transform": {
+    "Square_Chirp": {
+      "baseline_auc": 58.45986081752914,
+      "procrustes_auc": 46.43964762746339,
+      "ridge_auc": 68.53257228191492
+    },
+    "Square_Gauss": {
+      "baseline_auc": 58.89514426838266,
+      "procrustes_auc": 47.08594327644761,
+      "ridge_auc": 45.89779446777113
+    },
+    "Gauss_Chirp": {
+      "baseline_auc": 48.93669948688119,
+      "procrustes_auc": 83.73429400982802,
+      "ridge_auc": 78.97999822731705
+    }
+  }
+}
