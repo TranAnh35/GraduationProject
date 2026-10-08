@@ -132,30 +132,45 @@ $p_{\min}=1/41\approx0.024$ (nội địa) và $1/17\approx0.059$ (rìa). **Khô
 
 ---
 
-## 7. Quy Tắc Quyết Định Ba Trạng Thái Cho Pilot Phase 2 (Mục 7)
+**Điều 4.4.** Các baseline tuyến tính là chẩn đoán, không phải thành phần mô hình. Việc có xem lại lệnh cấm differential probing trong GEMINI.md hay không là quyết định riêng của nhóm nghiên cứu, ghi lại cùng các kết quả này. Chưa nên đưa vào mô hình.
 
-*(Nguyên văn từ chuyên gia phản biện — Khóa cứng không sửa đổi)*
+---
 
-**7.1 Thống kê chính.** Tập đánh giá được $O_s$ gồm nội địa và rìa không góc có $Z_{\text{PtP},i}\ge3$, tính từ PtP thô, độc lập với mô hình. Quy tắc chọn này phải ghi trước. Kết luận chỉ áp dụng cho các ô được chọn (chủ yếu hàng nông).
-$$\text{AUC}^M_s=\frac1{|O_s|}\sum_{i\in O_s}q^M_i,\qquad \Delta_s=\text{AUC}^{\text{JEPA}}_s-\max_{b\in\{U,H,G\}}\text{AUC}^{\text{Lin-}b}_s$$
-Đối thủ là baseline mạnh nhất, nên thiên về baseline. CI 95% bằng bootstrap hai tầng ($B = 2000$), mỗi vòng resample đối tượng có hoàn lại và resample sham độc lập trong từng nhóm, cho ra $[L_s,U_s]$.
+## 7. Mục 7 (v1.0-RC2). Baseline, cổng và quyết định
 
-**7.2 Cổng tiên quyết.** Không đạt thì **không có kết luận về hiệu năng**.
-- **G0 (đối chứng dương):** Lin-U đạt AUC $\ge 0.8$ trên các ô $Z_{\text{PtP}}\ge6$ `[GIẢ ĐỊNH]`, nếu không thì **INVALID**.
-- **G1:** G-N1 và G-N2, nếu không thì **CONFOUNDED**.
-- **G2 (sọc dòng):** trên pixel lành ($d\ge20$), $R^2$ của $A_M$ theo $L_{\text{stripe}}(c)=\frac1{25}\sum_{p\in P_c}\big(\text{raw}(u_p,v_p{+}1)-\text{raw}(u_p,v_p)\big)^2$ phải $\le 0.5$ `[GIẢ ĐỊNH]`. Nếu vượt cho $M$ nào thì **CONFOUNDED($M$)**.
-- **G3 (sức mạnh):** $|O_s|\ge8$, nếu không thì **NOT DETECTED** (thiếu sức mạnh).
+**7.0 Nguyên tắc.** (a) Mọi siêu tham số được cố định không nhãn trước khi chấm. (b) Nhãn trạng thái theo thứ tự INVALID, CONFOUNDED, rồi ba trạng thái hiệu năng. (c) Mọi kết luận nêu phạm vi: checkpoint, seed, điều kiện, Transductive/Inductive, nhãn [Pilot].
 
-**7.3 Ba trạng thái.** Áp dụng trên tập scan chính $\mathcal S$ do nhóm nghiên cứu liệt kê và khóa trước. Chọn các scan có $|O_s|\ge12$ (ví dụ Hall Air và TMR/Chirp), cộng Hall Pot/Chirp làm trường hợp SNR thấp, và gắn nhãn Transductive hoặc Inductive cho từng scan.
-- **ESTABLISHED:** mọi cổng đạt, $L_s>\delta_{\min}$ ở $\ge 2$ scan chính, và không scan nào có $U_s<0$.
-- **REJECTED:** mọi cổng đạt và $U_s<\delta_{\min}$ ở mọi scan chính (CI loại trừ lợi thế $\ge \delta_{\min}$). Nếu $U_s<0$ ở mọi scan, ghi "JEPA kém baseline".
-- **NOT DETECTED:** mọi trường hợp còn lại.
+**7.1 Baseline và chọn α**
+- Lin-U: huấn luyện trên mọi pixel hợp lệ của scan được chấm, không dùng nhãn. Lin-H: pixel cách mọi tâm CAD ≥ 18 mm (dùng CAD, chỉ chẩn đoán). Lin-G: một mô hình chung trên toàn bộ file tiền huấn luyện của EXP-28, chuẩn hóa từng file, scan được chấm nằm trong tập huấn luyện như với JEPA.
+- Đặc trưng chuẩn hóa z-score trên tập huấn luyện của từng biến thể. Lưới α: 13 giá trị cách đều theo log₁₀ từ 10⁻³ đến 10³.
+- α* = giá trị cực tiểu hóa MSE dự đoán probe giữa, CV 5 khối không gian theo dải với guard 14 mm, trên tập huấn luyện của biến thể đó. Cấm dùng AUC, nhãn hoặc điểm sham để chọn α. Ghi log α* và đường CV. Tập "1-SE" gồm các α có MSE ≤ min + 1 SE.
 
-$\delta_{\min}=0.05$ `[GIẢ ĐỊNH]`. Hiệu chỉnh bằng phép A/A: $\Delta\text{AUC}$ giữa hai baseline tuyến tính khác regularization cho sàn nhiễu, và đặt $\delta_{\min}\ge2\times\text{SE}$ của A/A.
+**7.2 Các cổng.** Không qua cổng nào thì không có kết luận về hiệu năng.
 
-**7.4 Phạm vi bắt buộc.** Câu kết luận phải ghi: "checkpoint EXP-28 (một lần huấn luyện, một seed), scan …, Transductive/Inductive, giao thức v1.0, nhãn [Pilot]". ESTABLISHED/REJECTED không mở rộng sang JEPA nói chung. Muốn nâng nhãn cần $\ge 3$ seed huấn luyện.
+- **G0 (đối chứng dương).** Lin-U với α* đạt AUC ≥ 0,8 trên tập O⁶ (Z_PtP ≥ 6), |O⁶| ≥ 8. Không đạt: INVALID.
+- **G-Null.** Hoán vị nhãn đối tượng/sham (B = 1000) cho AUC trung bình ≈ 0,5 với mọi mô hình, khoảng 95% chứa 0,5. Không đạt: INVALID (lỗi pipeline).
+- **G2 (sọc dòng).** (a) Kiểm cổng: cộng offset dòng tổng hợp ~N(0; 0,02 V) vào raw, chỉ để thử cổng, không dùng huấn luyện. R²_stripe của A_M phải tăng so với không cộng, nếu không thì cổng không có năng lực phát hiện: INVALID. (b) Dữ liệu thực: R²_stripe ≤ 0,5, nếu không thì CONFOUNDED(M).
+- **G-N1 (vị trí, theo từng mô hình M).** Dùng sham nội địa, với S_j là điểm sham:
+  1. Phân loại: hồi quy bậc 2 theo (x, y), R²_pos > 0,2 hoặc Moran's I thô có p < 0,05 thì bắt buộc hiệu chỉnh S̃ = S − f̂(x, y). Mọi thống kê sau đó báo cả bản thô lẫn S̃.
+  2. Kiểm sau hiệu chỉnh ngoài mẫu: phần dư leave-one-out r_j = e_j/(1 − h_jj) (h_jj là đường chéo ma trận hat). Moran's I trên r_j với trọng số lân cận hàng/cột trên lưới 30 mm, kiểm hoán vị một phía B = 9999, yêu cầu p ≥ 0,05.
+  3. Kiểm chuyển vùng: khớp mặt phẳng trên nửa trên rồi dự đoán nửa dưới, và ngược lại; làm tương tự theo trục x. Trung bình phần dư của nửa kiểm tra, chia cho độ lệch chuẩn phần dư của nửa huấn luyện, phải có |·| ≤ 1 ở cả bốn hướng.
+  4. Không đạt (2) hoặc (3): CONFOUNDED(M). Rìa chỉ khử trung bình từng cạnh (4 điểm mỗi cạnh nên không có phép kiểm vị trí), và kết quả rìa được báo kèm phân tích độ nhạy "chỉ nội địa".
+- **A/A (hiệu chuẩn pipeline).** Huấn luyện Lin-U hai lần trên hai nửa pixel ngẫu nhiên (cùng α*), lặp 100 lần chia. Mỗi lần chạy toàn bộ quy trình chấm và tính Δ_AA. Yêu cầu |trung bình Δ_AA| ≤ δ/5 và khoảng tin cậy chứa 0 trong ≥ 90% lần. Không đạt: INVALID (pipeline).
 
-**7.5 Báo cáo phụ (không quyết định).** Bảng $5\times 5$ của $q_i$ theo từng mô hình và scan, tách nội địa/rìa/góc; AUC theo $R\in\{6,8,10\}$; phân rã theo $D$ và theo hàng; biến thể mặt nạ cụm.
+**7.3 Quyết định ba trạng thái (chỉ khi mọi cổng qua)**
+- Đơn vị xác nhận là điều kiện (specimen, waveform, lift-off). Các cảm biến là phép đo lặp trên cùng tập khuyết tật. Chỉ dùng cảm biến qua mọi cổng. Với khuyết tật i: d_i^b = mean_sensors(q_i^JEPA − q_i^{Lin-b}), b ∈ {U, H, G}. Bootstrap hai tầng (resample khuyết tật, resample sham độc lập), B = 2000.
+- δ = 0,05 [GIẢ ĐỊNH, cố định, không rút từ dữ liệu]. Kết quả từng cảm biến chỉ để mô tả.
+- ESTABLISHED: cận dưới CI 95% của d^b lớn hơn δ với **mọi** b.
+- REJECTED: tồn tại b có cận trên CI hiệu chỉnh Bonferroni(3) (98,3%) nhỏ hơn δ. Ghi thêm "JEPA kém baseline b" nếu cận trên < 0.
+- NOT DETECTED: các trường hợp còn lại.
+- Độ nhạy α: trạng thái phải không đổi trên cả tập 1-SE. Nếu đổi thì ghi "α-sensitive" và hạ xuống NOT DETECTED.
+- Nhãn khi không qua cổng: INVALID, CONFOUNDED(M), hoặc INVALID + CONFOUNDED(M). Không có kết luận hiệu năng.
+
+**7.4 Giới hạn của chính bản này**
+- N_eff chỉ 40 (nội địa) và 16 (rìa), nên Moran's I và kiểm chuyển vùng có sức mạnh thấp. Qua cổng là bằng chứng yếu.
+- δ = 0,05, ngưỡng 0,2/0,5/0,8, p = 0,05, δ/5 và 90% đều là giữ chỗ.
+- Toàn bộ scan nằm trên một coupon Corrosion. Kết quả không mở rộng sang specimen khác.
+- Nếu hầu hết hoặc mọi scan đều CONFOUNDED sau khi sửa, kết luận trung thực là coupon và thiết kế sham này không phân xử được giữa hai bộ dự đoán. Đó là kết luận hợp lệ, và hướng sửa là dữ liệu (layout ngẫu nhiên, nhiều negative khớp vị trí), không phải thêm thuật toán.
 
 ---
 
