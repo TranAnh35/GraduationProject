@@ -302,10 +302,11 @@ class PECT_JEPA_5x5(nn.Module):
             H_tgt = H_tgt_full.detach()
             H_rep_reg = torch.cat([H_ctx, H_tgt_full], dim=1)
 
-        # Scale-Separated Perturbation Target (EXP-24):
-        # Neutralize the acquisition shortcut by setting target as relative perturbation Delta H = H_tgt - H_base
+        # Relative Perturbation Target (EXP-33) / Scale-Separated Perturbation Target (EXP-24):
+        # Neutralize the carrier acquisition shortcut by setting target as relative perturbation Delta H = H_tgt - H_base
         gate = None
-        if getattr(self.config, "scale_separated_prediction", False):
+        use_relative = getattr(self.config, "relative_perturbation_target", False) or getattr(self.config, "scale_separated_prediction", False)
+        if use_relative:
             H_base = H_ctx.mean(dim=1, keepdim=True)  # [B, 1, D]
             H_target_for_loss = H_tgt - H_base
             if getattr(self, "scale_gate", None) is not None:
@@ -315,6 +316,7 @@ class PECT_JEPA_5x5(nn.Module):
             else:
                 H_pred_for_loss = H_pred
         else:
+            H_base = None
             H_target_for_loss = H_tgt
             H_pred_for_loss = H_pred
 
@@ -373,11 +375,14 @@ class PECT_JEPA_5x5(nn.Module):
             delta_pred=delta_pred,
             H_rep_reg=H_rep_reg,
             file_ids=file_ids,
-            scale_separated=getattr(self.config, "scale_separated_prediction", False),
+            scale_separated=use_relative,
         )
         loss_dict.update({
             "H_pred": H_pred,
             "H_tgt": H_tgt,
+            "H_pred_for_loss": H_pred_for_loss,
+            "H_target_for_loss": H_target_for_loss,
+            "H_base": H_base,
             "H_ctx": H_ctx,
             "context_indices": context_indices,
             "target_indices": target_indices,
@@ -799,3 +804,73 @@ class PECT_JEPA_5x5(nn.Module):
         tokens, pos = self.tokenizer(x)
         _, attn = self.context_encoder(tokens, pos, return_attention=True)
         return attn
+
+    @torch.no_grad()
+    def compute_center_anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the unsupervised anomaly detection score for the center probe p_0:
+        If relative_perturbation_target or scale_separated_prediction:
+            A(c) = || g_phi(H_ctx_ring) - (H_p0 - mean(H_ctx_ring)) ||_2^2
+        Else:
+            A(c) = || g_phi(H_ctx_ring) - H_p0 ||_2^2
+            
+        Args:
+            x: [B, 5, 5, C] batch of spatial measurement patches
+        Returns:
+            scores: [B] float tensor of anomaly prediction error scores
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        device = x.device
+        
+        tokens, pos = self.tokenizer(x)
+        N_total = tokens.shape[1]
+        center_spatial_idx = 0  # in concentric_star or standard topology, center is index 0
+        
+        all_indices = torch.arange(N_total, device=device)
+        center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
+        mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
+        mask_tgt[center_tgt_indices] = True
+        
+        batch_arange = torch.arange(B, device=device).unsqueeze(1)
+        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)
+        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)
+        
+        ctx_tokens = tokens[batch_arange, ctx_idx]
+        ctx_pos = pos[batch_arange, ctx_idx]
+        target_pos = pos[batch_arange, tgt_idx]
+        target_tokens = tokens[batch_arange, tgt_idx]
+        
+        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+        
+        if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
+            freq_cond = self.compute_characteristic_frequency(
+                x, num_bins=getattr(self.config, "num_freq_bins", 14)
+            )
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
+        else:
+            H_pred = self.predictor(
+                H_context=H_ctx_masked,
+                target_pos=target_pos,
+                context_indices=ctx_idx,
+                target_indices=tgt_idx,
+            )
+            
+        H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+        
+        use_relative = getattr(self.config, "relative_perturbation_target", False) or getattr(self.config, "scale_separated_prediction", False)
+        if use_relative:
+            H_base = H_ctx_masked.mean(dim=1, keepdim=True)
+            diff = H_pred - (H_tgt - H_base)
+        else:
+            diff = H_pred - H_tgt
+            
+        return torch.sum(diff ** 2, dim=-1).squeeze(-1)
+

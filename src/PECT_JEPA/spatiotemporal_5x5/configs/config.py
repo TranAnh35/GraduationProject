@@ -82,6 +82,7 @@ class Spatiotemporal5x5Config:
     feature_extraction_mode: str = "unified" # 'unified' ([H_ctx; Delta_H]) | 'context' (H_ctx only)
     temporal_ac_coupling: bool = False       # EXP-24: Remove static temporal DC offset per probe in tokenizer
     scale_separated_prediction: bool = False # EXP-24: Predict relative deviation Delta H = H_tgt - H_base from Delta H_ctx
+    relative_perturbation_target: bool = True # EXP-33: Relative Perturbation Target JEPA (Delta H_tgt = H_tgt - mean(H_ctx_ring))
     carrier_normalized_features: bool = False # EXP-24: Normalize extracted flaw representation by carrier magnitude ||H_base||
     keep_absolute_center_feature: bool = True # EXP-25: Keep absolute center representation [h_center, Delta H] instead of [h - H_base, Delta H]
     learnable_scale_mixing: bool = False     # EXP-26: Learnable data-dependent scale-mixing gating g = sigma(MLP([H_base, Delta H]))

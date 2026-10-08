@@ -202,6 +202,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="EXP-24: Enable zero-mean temporal AC coupling to remove static sensor DC baseline (default: False)")
     p.add_argument("--scale_separated_prediction", type=lambda v: v.lower() == "true", default=False,
                    help="EXP-24: Formulate target as perturbation Delta H = H_tgt - H_base relative to background (default: False)")
+    p.add_argument("--relative_perturbation_target", type=lambda v: v.lower() == "true", default=True,
+                   help="EXP-33: Formulate target as relative perturbation Delta H = H_tgt - mean(H_ctx_ring) (default: True)")
     p.add_argument("--carrier_normalized_features", type=lambda v: v.lower() == "true", default=False,
                    help="EXP-24: Normalize extracted flaw perturbation by carrier norm ||H_base|| (default: False)")
     p.add_argument("--keep_absolute_center_feature", type=lambda v: v.lower() == "true", default=True,
