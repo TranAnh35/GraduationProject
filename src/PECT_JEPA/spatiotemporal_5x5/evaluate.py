@@ -310,7 +310,10 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     # If tokenizer_type was not specified in checkpoint config, infer from state_dict
     if not (isinstance(cfg_dict, dict) and "tokenizer_type" in cfg_dict):
         if "tokenizer.time_proj.0.weight" in state_dict:
-            config.tokenizer_type = "continuous_linear_field"
+            if state_dict["tokenizer.time_proj.0.weight"].shape[1] == (config.in_channels + 3):
+                config.tokenizer_type = "energy_adaptive_dual_domain"
+            else:
+                config.tokenizer_type = "continuous_linear_field"
         elif "tokenizer.scale_shallow" in state_dict:
             config.tokenizer_type = "uncrushed_diffusion"
         elif "tokenizer.pos_scale" in state_dict or "tokenizer.gate_proj.0.weight" in state_dict:

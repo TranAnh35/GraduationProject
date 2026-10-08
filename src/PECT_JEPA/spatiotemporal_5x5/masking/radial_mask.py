@@ -147,3 +147,12 @@ class RadialDiffusionMasker5x5:
         mask_bool = torch.from_numpy(mask_np).to(device=dev, dtype=torch.bool)
 
         return ctx, tgt, mask_bool
+
+    def __call__(
+        self,
+        batch_size: int,
+        device: Optional[torch.device] = None,
+        seed: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.sample_mask(batch_size=batch_size, device=device, seed=seed)
+

@@ -48,7 +48,7 @@ class Spatiotemporal5x5Config:
     mask_bank_size: int = 2048          # Precomputed mask pool size per configuration
 
     # ------------------------------------------------------------ Architecture
-    tokenizer_type: str = "uncrushed_diffusion" # 'uncrushed_diffusion' (EXP-18/19: 50 tokens, uncrushed harmonic dispersion) | 'dual_scale_diffusion'
+    tokenizer_type: str = "energy_adaptive_dual_domain" # 'energy_adaptive_dual_domain' (EXP-35) | 'continuous_linear_field' (EXP-28/34) | 'uncrushed_diffusion'
     num_temporal_stages: int = 4        # Number of chronological diffusion stages (for CST backward compatibility)
     num_scales: int = 4                 # Number of physical skin-depth scales (for spatio_spectral)
     tokenizer_heads: int = 4            # Number of attention heads for dual-domain fusion

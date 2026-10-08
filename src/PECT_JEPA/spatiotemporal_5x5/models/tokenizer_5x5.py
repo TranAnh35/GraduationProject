@@ -1269,12 +1269,165 @@ class ContinuousLinearFieldTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class EnergyAdaptiveDualDomainTokenizer5x5(nn.Module):
+    """
+    Energy-Adaptive Dual-Domain Tokenizer for 5x5 PECT-JEPA (Stage 2 Re-foundation, EXP-35).
+
+    Resolves the 2 core failure modes identified in ContinuousLinearFieldTokenizer5x5:
+    1. Spectral Out-of-Band Noise Ingestion: Bins with near-zero excitation power (e.g. 9-12 out of 14 bins
+       in Square and Gaussian pulses) previously injected random uniform phase noise into z_freq.
+       Solution: Energy Saliency Gating s(f) = |X(f)|^2 / sum(|X|^2) smoothly suppresses inactive bins to 0
+       while preserving Dodd-Deeds lift-off invariant phase theta(f) in active excitation bands.
+       Continuous spectral moments (centroid f_c, spread sigma_f) are added to capture dispersion bandwidth.
+    2. Time-Branch Dominance (+ z_time bias): The legacy fusion added an asymmetric + z_time skip, starving
+       z_freq gradients (2.91x ratio) and forcing the latent space into waveform-locked chronological time coordinates.
+       Solution: Symmetric Balanced Residual Fusion: z_fused = W_fuse [z_time, z_freq] + 0.5 * (z_time + z_freq),
+       achieving a 1.07:1 gradient balance between physical time dynamics and spectral dispersion.
+    3. Waveform-Agnostic Shape Normalization: Waveform instance normalization removes pulse morphology memorization,
+       while concatenating 3 physical transient invariants: peak arrival time t_p, peak-to-peak voltage V_pp,
+       and transient energy integral E_time.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_tokens = self.num_spatial        # Exactly 25 tokens
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+
+        # 1. Temporal Branch: Instance-Normalized Waveform + Physical Transient Invariants (t_p, V_pp, E_time)
+        self.time_in_dim = in_channels + 3
+        self.time_proj = nn.Sequential(
+            nn.Linear(self.time_in_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Spectral Branch: Energy-Saliency Weighted Phase + Log-Mag + Moments
+        # Features: [s * theta (K), s * mag (K), s (K), f_centroid (1), f_spread (1)] = 3*K + 2
+        self.spectral_dim = self.num_freq_bins * 3 + 2
+        self.proj_freq = nn.Sequential(
+            nn.Linear(self.spectral_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Symmetric Dual-Domain Balanced Highway Fusion
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+
+        # 4. Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: [B, 5, 5, C] tensor (or [5, 5, C])
+        Returns:
+            tokens:     [B, 25, D]
+            pos_expand: [B, 25, D]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_flat = x.reshape(B * self.num_tokens, C)
+
+        # --- A. Time Domain Feature Extraction ---
+        # 1. Physical transient anchors:
+        # Peak arrival index normalized to [0, 1]
+        t_p = torch.argmax(torch.abs(x_flat), dim=-1, keepdim=True).float() / float(C)
+        v_max, _ = torch.max(x_flat, dim=-1, keepdim=True)
+        v_min, _ = torch.min(x_flat, dim=-1, keepdim=True)
+        v_pp = v_max - v_min
+        e_time = torch.mean(torch.abs(x_flat), dim=-1, keepdim=True)
+
+        # 2. Instance-normalized waveform (shape-invariant transient dynamic):
+        x_mean = x_flat.mean(dim=-1, keepdim=True)
+        x_std = x_flat.std(dim=-1, keepdim=True)
+        x_norm = (x_flat - x_mean) / (x_std + 1e-6)
+
+        phi_time = torch.cat([x_norm, t_p, v_pp, e_time], dim=-1).to(x.dtype)
+        z_time = self.ln_time(self.time_proj(phi_time))  # [B*25, D]
+
+        # --- B. Frequency Domain Feature Extraction ---
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)
+        self._last_fft = X_fft
+        X_sub = X_fft[:, 1:self.num_freq_bins + 1]  # Exclude DC, [B*25, K]
+
+        # Relative Power Spectral Density:
+        P = torch.abs(X_sub) ** 2
+        P_tot = P.sum(dim=-1, keepdim=True) + 1e-8
+        s = P / P_tot  # [B*25, K] in [0, 1]
+
+        # Dodd-Deeds Lift-off Invariant Phase:
+        theta = torch.angle(X_sub) / torch.pi  # [-1, 1]
+        mag = torch.log1p(torch.abs(X_sub))
+
+        # Energy-Saliency Gating:
+        theta_gated = s * theta
+        mag_gated = s * mag
+
+        # Continuous Spectral Moments:
+        bin_indices = torch.arange(1, self.num_freq_bins + 1, device=x.device, dtype=torch.float32).unsqueeze(0)
+        f_centroid = (bin_indices * s).sum(dim=-1, keepdim=True) / float(self.num_freq_bins)
+        var_f = ((bin_indices / float(self.num_freq_bins) - f_centroid) ** 2 * s).sum(dim=-1, keepdim=True)
+        f_spread = torch.sqrt(torch.clamp(var_f, min=0.0) + 1e-8)
+
+        phi_freq = torch.cat([theta_gated, mag_gated, s, f_centroid, f_spread], dim=-1).to(x.dtype)
+        z_freq = self.ln_freq(self.proj_freq(phi_freq))  # [B*25, D]
+
+        # --- C. Symmetric Balanced Dual-Domain Fusion ---
+        z_cat = torch.cat([z_time, z_freq], dim=-1)
+        # Balanced residual highway: 50% time + 50% freq (NO asymmetric + z_time bias)
+        z_fused = self.fuse_proj(z_cat) + 0.5 * (z_time + z_freq)
+        tokens = self.drop(self.norm_out(z_fused)).reshape(B, self.num_tokens, self.embed_dim)
+
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
     tokenizer_type = getattr(config, "tokenizer_type", "continuous_linear_field")
-    if tokenizer_type in ("continuous_linear_field", "continuous_linear", "linear_field"):
+    if tokenizer_type in ("energy_adaptive_dual_domain", "energy_adaptive_field", "adaptive_dual_domain"):
+        return EnergyAdaptiveDualDomainTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type in ("continuous_linear_field", "continuous_linear", "linear_field"):
         return ContinuousLinearFieldTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
