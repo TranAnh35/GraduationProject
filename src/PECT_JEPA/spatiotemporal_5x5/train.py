@@ -330,6 +330,7 @@ def main():
         feature_extraction_mode=args.feature_extraction_mode,
         temporal_ac_coupling=args.temporal_ac_coupling,
         scale_separated_prediction=args.scale_separated_prediction,
+        relative_perturbation_target=args.relative_perturbation_target,
         carrier_normalized_features=args.carrier_normalized_features,
         keep_absolute_center_feature=args.keep_absolute_center_feature,
         learnable_scale_mixing=args.learnable_scale_mixing,
