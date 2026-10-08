@@ -78,7 +78,7 @@ class TestComplementarySpatiotemporalMasker5x5(unittest.TestCase):
             num_spatial_cluster=8,
             mode="causal",
         )
-        self.config = Spatiotemporal5x5Config()
+        self.config = Spatiotemporal5x5Config(tokenizer_type="spatiotemporal_patch")
         self.build_masker = build_masker_5x5
 
     def test_default_factory(self):

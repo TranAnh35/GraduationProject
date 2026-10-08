@@ -452,14 +452,29 @@ class PECT_JEPA_5x5(nn.Module):
             center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
 
         # 3. Context & Target Mask for JEPA Prediction Discrepancy
+        masker_type = getattr(self.config, "masker_type", "center_only")
+        radial_mode = getattr(self.config, "radial_mask_mode", "inward_core")
+        is_radial = masker_type in ("radial_diffusion", "radial", "radial_inward", "inward_diffusion", "inward_core")
+
+        if is_radial and N_total == 25:
+            # Concentric Star Radial Inward Diffusion:
+            # Context: Outer 16 probes (Ring 2 + Ring 3: indices 9..24, r >= 3mm)
+            # Target: Core 9 probes (Center + Ring 1: indices 0..8, r <= 1mm) or Center (index 0)
+            ctx_indices_proto = torch.arange(9, 25, device=device)
+            if radial_mode in ("inward_core", "default", "core"):
+                tgt_indices_proto = torch.arange(0, 9, device=device)
+            else:
+                tgt_indices_proto = torch.tensor([0], device=device)
+            ctx_idx = ctx_indices_proto.unsqueeze(0).expand(B, -1)
+            tgt_idx = tgt_indices_proto.unsqueeze(0).expand(B, -1)
+        else:
+            all_indices = torch.arange(N_total, device=device)
+            mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
+            mask_tgt[center_tgt_indices] = True
+            ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)  # [B, N_ctx]
+            tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)      # [B, N_tgt]
+
         batch_arange = torch.arange(B, device=device).unsqueeze(1)
-        all_indices = torch.arange(N_total, device=device)
-        mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
-        mask_tgt[center_tgt_indices] = True
-
-        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)  # [B, N_ctx]
-        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)      # [B, N_tgt]
-
         ctx_tokens = tokens[batch_arange, ctx_idx]
         ctx_pos = pos[batch_arange, ctx_idx]
         target_pos = pos[batch_arange, tgt_idx]
@@ -493,14 +508,16 @@ class PECT_JEPA_5x5(nn.Module):
         else:
             H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
 
-        # Coordinate-wise physical discrepancy: mean across center target tokens
-        if getattr(self.config, "scale_separated_prediction", False):
+        # Coordinate-wise physical discrepancy: center target token at index 0
+        use_relative = getattr(self.config, "relative_perturbation_target", False) or getattr(self.config, "scale_separated_prediction", False)
+        if use_relative:
             H_base = H_ctx_masked.mean(dim=1, keepdim=True)  # [B, 1, D]
             if getattr(self.config, "keep_absolute_center_feature", False):
                 h_center_rep = h_ctx_center
             else:
                 h_center_rep = h_ctx_center - H_base.squeeze(1)  # [B, D]
-            delta_H = torch.abs((H_tgt - H_base) - H_pred).mean(dim=1)  # [B, D]
+            delta_H_tokens = torch.abs((H_tgt - H_base) - H_pred)
+            delta_H = delta_H_tokens[:, 0, :] if delta_H_tokens.shape[1] > 1 else delta_H_tokens.squeeze(1)
             if getattr(self.config, "carrier_normalized_features", False):
                 carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
                 h_center_rep = h_center_rep / carrier_scale
@@ -512,7 +529,8 @@ class PECT_JEPA_5x5(nn.Module):
             Z_unified = torch.cat([h_center_rep, delta_H], dim=-1)  # [B, 2 * D]
             return Z_unified
 
-        delta_H = torch.abs(H_tgt - H_pred).mean(dim=1)  # [B, D]
+        delta_H_tokens = torch.abs(H_tgt - H_pred)
+        delta_H = delta_H_tokens[:, 0, :] if delta_H_tokens.shape[1] > 1 else delta_H_tokens.squeeze(1)  # [B, D]
 
         # Concatenate into unified [B, 2 * D] vector
         Z_unified = torch.cat([h_ctx_center, delta_H], dim=-1)  # [B, 2 * D]
@@ -560,14 +578,26 @@ class PECT_JEPA_5x5(nn.Module):
             center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
 
         # 3. Context & Target Mask for JEPA Prediction Discrepancy
+        masker_type = getattr(self.config, "masker_type", "center_only")
+        radial_mode = getattr(self.config, "radial_mask_mode", "inward_core")
+        is_radial = masker_type in ("radial_diffusion", "radial", "radial_inward", "inward_diffusion", "inward_core")
+
+        if is_radial and N_total == 25:
+            ctx_indices_proto = torch.arange(9, 25, device=device)
+            if radial_mode in ("inward_core", "default", "core"):
+                tgt_indices_proto = torch.arange(0, 9, device=device)
+            else:
+                tgt_indices_proto = torch.tensor([0], device=device)
+            ctx_idx = ctx_indices_proto.unsqueeze(0).expand(B, -1)
+            tgt_idx = tgt_indices_proto.unsqueeze(0).expand(B, -1)
+        else:
+            all_indices = torch.arange(N_total, device=device)
+            mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
+            mask_tgt[center_tgt_indices] = True
+            ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)  # [B, N_ctx]
+            tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)      # [B, N_tgt]
+
         batch_arange = torch.arange(B, device=device).unsqueeze(1)
-        all_indices = torch.arange(N_total, device=device)
-        mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
-        mask_tgt[center_tgt_indices] = True
-
-        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)  # [B, N_ctx]
-        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)      # [B, N_tgt]
-
         ctx_tokens = tokens[batch_arange, ctx_idx]
         ctx_pos = pos[batch_arange, ctx_idx]
         target_pos = pos[batch_arange, tgt_idx]
@@ -601,15 +631,16 @@ class PECT_JEPA_5x5(nn.Module):
         else:
             H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
 
-        # Coordinate-wise physical discrepancy: mean across center target tokens
-        if getattr(self.config, "scale_separated_prediction", False):
+        # Coordinate-wise physical discrepancy
+        use_relative = getattr(self.config, "relative_perturbation_target", False) or getattr(self.config, "scale_separated_prediction", False)
+        if use_relative:
             H_base = H_ctx_masked.mean(dim=1, keepdim=True)  # [B, 1, D]
             if getattr(self.config, "keep_absolute_center_feature", False):
                 h_center_rep = h_ctx_center
             else:
                 h_center_rep = h_ctx_center - H_base.squeeze(1)  # [B, D]
             delta_H_tokens = torch.abs((H_tgt - H_base) - H_pred)
-            delta_H = delta_H_tokens.mean(dim=1)  # [B, D]
+            delta_H = delta_H_tokens[:, 0, :] if delta_H_tokens.shape[1] > 1 else delta_H_tokens.squeeze(1)
             if getattr(self.config, "carrier_normalized_features", False):
                 carrier_scale = torch.norm(H_base, p=2, dim=-1).clamp(min=1e-3)  # [B, 1]
                 h_center_rep = h_center_rep / carrier_scale
@@ -621,7 +652,7 @@ class PECT_JEPA_5x5(nn.Module):
             Z_unified = torch.cat([h_center_rep, delta_H], dim=-1)  # [B, 2 * D]
         else:
             delta_H_tokens = torch.abs(H_tgt - H_pred)
-            delta_H = delta_H_tokens.mean(dim=1)  # [B, D]
+            delta_H = delta_H_tokens[:, 0, :] if delta_H_tokens.shape[1] > 1 else delta_H_tokens.squeeze(1)
             Z_unified = torch.cat([h_ctx_center, delta_H], dim=-1)  # [B, 2 * D]
 
         if N_total == 100:
@@ -704,15 +735,27 @@ class PECT_JEPA_5x5(nn.Module):
         h_ctx_center = H_full[:, center_spatial_idx, :]  # [B, D]
 
         # 2. Context Masking & Predictor Target
-        all_indices = torch.arange(tokens.shape[1], device=device)
-        center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
-        mask_tgt = torch.zeros(tokens.shape[1], dtype=torch.bool, device=device)
-        mask_tgt[center_tgt_indices] = True
+        masker_type = getattr(self.config, "masker_type", "center_only")
+        radial_mode = getattr(self.config, "radial_mask_mode", "inward_core")
+        is_radial = masker_type in ("radial_diffusion", "radial", "radial_inward", "inward_diffusion", "inward_core")
+
+        if is_radial and tokens.shape[1] == 25:
+            ctx_indices_proto = torch.arange(9, 25, device=device)
+            if radial_mode in ("inward_core", "default", "core"):
+                tgt_indices_proto = torch.arange(0, 9, device=device)
+            else:
+                tgt_indices_proto = torch.tensor([0], device=device)
+            ctx_idx = ctx_indices_proto.unsqueeze(0).expand(B, -1)
+            tgt_idx = tgt_indices_proto.unsqueeze(0).expand(B, -1)
+        else:
+            all_indices = torch.arange(tokens.shape[1], device=device)
+            center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
+            mask_tgt = torch.zeros(tokens.shape[1], dtype=torch.bool, device=device)
+            mask_tgt[center_tgt_indices] = True
+            ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)
+            tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)
 
         batch_arange = torch.arange(B, device=device).unsqueeze(1)
-        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)
-        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)
-
         ctx_tokens = tokens[batch_arange, ctx_idx]
         ctx_pos = pos[batch_arange, ctx_idx]
         target_pos = pos[batch_arange, tgt_idx]
@@ -745,7 +788,8 @@ class PECT_JEPA_5x5(nn.Module):
 
         H_base = H_ctx_masked.mean(dim=1, keepdim=True)
         phi_carrier = h_ctx_center  # [B, D]
-        phi_scattering = torch.abs((H_tgt - H_base) - H_pred).mean(dim=1)  # [B, D]
+        delta_phi_tokens = torch.abs((H_tgt - H_base) - H_pred)
+        phi_scattering = delta_phi_tokens[:, 0, :] if delta_phi_tokens.shape[1] > 1 else delta_phi_tokens.squeeze(1)  # [B, D] Center flaw perturbation
 
         if self_calibrate and B > 1:
             phi_carrier = (phi_carrier - phi_carrier.mean(dim=0, keepdim=True)) / (
@@ -828,15 +872,27 @@ class PECT_JEPA_5x5(nn.Module):
         N_total = tokens.shape[1]
         center_spatial_idx = 0  # in concentric_star or standard topology, center is index 0
         
-        all_indices = torch.arange(N_total, device=device)
-        center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
-        mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
-        mask_tgt[center_tgt_indices] = True
+        masker_type = getattr(self.config, "masker_type", "center_only")
+        radial_mode = getattr(self.config, "radial_mask_mode", "inward_core")
+        is_radial = masker_type in ("radial_diffusion", "radial", "radial_inward", "inward_diffusion", "inward_core")
+
+        if is_radial and N_total == 25:
+            ctx_indices_proto = torch.arange(9, 25, device=device)
+            if radial_mode in ("inward_core", "default", "core"):
+                tgt_indices_proto = torch.arange(0, 9, device=device)
+            else:
+                tgt_indices_proto = torch.tensor([0], device=device)
+            ctx_idx = ctx_indices_proto.unsqueeze(0).expand(B, -1)
+            tgt_idx = tgt_indices_proto.unsqueeze(0).expand(B, -1)
+        else:
+            all_indices = torch.arange(N_total, device=device)
+            center_tgt_indices = torch.tensor([center_spatial_idx], device=device)
+            mask_tgt = torch.zeros(N_total, dtype=torch.bool, device=device)
+            mask_tgt[center_tgt_indices] = True
+            ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)
+            tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)
         
         batch_arange = torch.arange(B, device=device).unsqueeze(1)
-        ctx_idx = all_indices[~mask_tgt].unsqueeze(0).expand(B, -1)
-        tgt_idx = center_tgt_indices.unsqueeze(0).expand(B, -1)
-        
         ctx_tokens = tokens[batch_arange, ctx_idx]
         ctx_pos = pos[batch_arange, ctx_idx]
         target_pos = pos[batch_arange, tgt_idx]
@@ -872,5 +928,11 @@ class PECT_JEPA_5x5(nn.Module):
         else:
             diff = H_pred - H_tgt
             
-        return torch.sum(diff ** 2, dim=-1).squeeze(-1)
+        if diff.ndim == 3 and diff.shape[1] > 1:
+            # diff is [B, N_tgt, D], index 0 is the center probe (r=0)
+            return torch.sum(diff[:, 0, :] ** 2, dim=-1)
+        elif diff.ndim == 3 and diff.shape[1] == 1:
+            return torch.sum(diff[:, 0, :] ** 2, dim=-1)
+        else:
+            return torch.sum(diff ** 2, dim=-1).squeeze(-1)
 

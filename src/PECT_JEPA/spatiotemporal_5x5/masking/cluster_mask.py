@@ -535,17 +535,41 @@ class ComplementarySpatiotemporalMasker5x5:
         return context_indices, target_indices, mask_bool
 
 
-def build_masker_5x5(config):
+def build_masker_5x5(config=None, **kwargs):
     """
     Factory function to construct masker based on config and tokenizer type.
-    - 25 tokens (continuous_stf, spatial_grid, etc.): ContiguousClusterMasker5x5
+    Accepts a Spatiotemporal5x5Config object, a masker_type string, or keyword arguments.
+    - 25 tokens (continuous_linear_field, spatial_grid, etc.): ContiguousClusterMasker5x5 or RadialDiffusionMasker5x5
     - 50 tokens (dual_scale_diffusion): SpatiotemporalDiffusionMasker5x5
     - 100 tokens (spatiotemporal_patch): ComplementarySpatiotemporalMasker5x5 (CST)
     """
-    tokenizer_type = getattr(config, "tokenizer_type", "spatiotemporal_patch")
-    masker_type = getattr(config, "masker_type", "auto")
-    use_mask_bank = getattr(config, "use_mask_bank", True)
-    bank_size = getattr(config, "mask_bank_size", 2048)
+    if isinstance(config, str):
+        masker_type = config
+        tokenizer_type = kwargs.get("tokenizer_type", "continuous_linear_field")
+        grid_size = kwargs.get("grid_size", 5)
+        use_mask_bank = kwargs.get("use_mask_bank", True)
+        bank_size = kwargs.get("mask_bank_size", 2048)
+        radial_mode = kwargs.get("radial_mask_mode", "inward_core")
+        min_masked = kwargs.get("min_masked", 10)
+        max_masked = kwargs.get("max_masked", 15)
+    else:
+        tokenizer_type = getattr(config, "tokenizer_type", "spatiotemporal_patch") if config else kwargs.get("tokenizer_type", "spatiotemporal_patch")
+        masker_type = getattr(config, "masker_type", "auto") if config else kwargs.get("masker_type", "auto")
+        grid_size = getattr(config, "grid_size", 5) if config else kwargs.get("grid_size", 5)
+        use_mask_bank = getattr(config, "use_mask_bank", True) if config else kwargs.get("use_mask_bank", True)
+        bank_size = getattr(config, "mask_bank_size", 2048) if config else kwargs.get("mask_bank_size", 2048)
+        radial_mode = getattr(config, "radial_mask_mode", "inward_core") if config else kwargs.get("radial_mask_mode", "inward_core")
+        min_masked = getattr(config, "min_masked", 10) if config else kwargs.get("min_masked", 10)
+        max_masked = getattr(config, "max_masked", 15) if config else kwargs.get("max_masked", 15)
+
+    if masker_type in ("radial_diffusion", "radial", "radial_inward", "inward_diffusion", "inward_core"):
+        from .radial_mask import RadialDiffusionMasker5x5
+        return RadialDiffusionMasker5x5(
+            mode=radial_mode,
+            grid_size=grid_size,
+            use_mask_bank=use_mask_bank,
+            bank_size=bank_size,
+        )
 
     if tokenizer_type in ("continuous_linear_field", "continuous_linear", "linear_field", "continuous_field", "waveform_agnostic_field", "continuous_dual_domain", "continuous_stf", "continuous_filterbank", "spatial_grid", "time_only", "dual_domain_attention", "dual_domain"):
         return ContiguousClusterMasker5x5(

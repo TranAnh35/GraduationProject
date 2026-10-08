@@ -43,6 +43,7 @@ class Spatiotemporal5x5Config:
     num_spatial_cluster: int = 8        # Number of spatial grid points in cluster (EXP-19: 8 cluster probes)
     num_cross_diffusion: int = 8        # Number of cross-scale deep masked points (8 cross points)
     cst_mask_mode: str = "cluster"      # 'cluster' (EXP-19: symmetric dual-cluster masking: masks both surface & deep) | 'surface_to_bulk'
+    radial_mask_mode: str = "inward_core" # EXP-34: 'inward_core' (Core 9 probes target, Ring 2+3 context) | 'inward_center'
     use_mask_bank: bool = True          # Enable precomputed GPU/CPU mask bank for sub-microsecond batch mask sampling
     mask_bank_size: int = 2048          # Precomputed mask pool size per configuration
 

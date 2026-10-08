@@ -137,8 +137,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_scales", type=int, default=4,
                    help="Number of physical skin-depth scales for spatio_spectral tokenizer (default: 4)")
     p.add_argument("--masker_type", type=str, default="auto",
-                   choices=["auto", "complementary_st", "spatiotemporal_diffusion", "contiguous_cluster"],
-                   help="Masker strategy: 'auto' (ContiguousCluster for 25 tok, CST for 100 tok, default), 'complementary_st', or 'contiguous_cluster'")
+                   choices=["auto", "radial_diffusion", "radial_inward", "complementary_st", "spatiotemporal_diffusion", "contiguous_cluster"],
+                   help="Masker strategy: 'radial_diffusion' (EXP-34: Physics-Grounded Radial Diffusion Masker), 'auto', 'contiguous_cluster', etc.")
+    p.add_argument("--radial_mask_mode", type=str, default="inward_core",
+                   choices=["inward_core", "inward_center", "ring_stratified"],
+                   help="Radial diffusion mask mode: 'inward_core' (Core 9 probes target, Ring 2+3 context, default) or 'inward_center'")
     p.add_argument("--num_temporal_stages", type=int, default=4,
                    help="Number of chronological diffusion stages for spatiotemporal_patch tokenizer and CST masker (default: 4)")
     p.add_argument("--cst_mask_mode", type=str, default="cluster", choices=["cluster", "surface_to_bulk", "surface_to_depth", "causal", "random"],
