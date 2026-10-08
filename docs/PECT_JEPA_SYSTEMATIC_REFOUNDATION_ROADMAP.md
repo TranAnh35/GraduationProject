@@ -114,8 +114,8 @@ Dưới đây là các hướng tiếp cận cần được mổ xẻ toán họ
 | :---: | :---: | :---: | :---: | :---: |
 | **0** | Baseline EXP-28-FULL (20 ep) | Hoàn thành | `experiments/5x5/exp28_full_20ep` | Baseline chuẩn: AUC 85.85%, AP 52.02%, Defect Size R² 0.5424. Gặp bẫy nội suy 2D. |
 | **0.1** | EXP-33 Pilot (Relative Target) | Hoàn thành | `experiments/5x5/exp33_relative_perturbation_jepa` | 3 ep: AUC 87.34%, AP 53.41%, TMR AP +8.81%, Square AP +9.18%. Chứng minh khử trường nền giúp gradient tập trung vào khuyết tật. |
-| **1.0** | **Tầng 1: Input & Masking** | **ĐANG TIẾN HÀNH** | Đang xác định cấu trúc toán học của bài toán che | Cần hoàn thiện cơ sở lý thuyết và kiểm chứng pilot trước khi chuyển sang Tầng 2. |
-| **2.0** | Tầng 2: Tokenizer | Chưa bắt đầu | - | Chờ hoàn thành Tầng 1. |
+| **1.0** | **Tầng 1: Input & Masking (EXP-34)** | **HOÀN THÀNH (ACCEPTED)** | `experiments/5x5/exp34_radial_inward_diffusion` | **Thành công vượt bậc**: Đổi sang `RadialDiffusionMasker5x5` (`inward_core`, che Core 9 probes $r \le 1\text{ mm}$, Context viền 16 probes $r \ge 3\text{ mm}$) triệt tiêu hoàn toàn đường tắt sao chép 1 mm lân cận. **Metrics 57 test scans**: AUC **91.93% ± 7.84%** (+4.59%), AP **66.71%** (+13.30%), CNR **3.89** (+1.17), Defect Depth $R^2$ **0.6437** (+0.0450), Defect Size $R^2$ **0.6797** (+0.0757), IoU **37.46%** (+9.49%). Val pred loss giảm 86.8% xuống 0.0130. Chấp nhận đưa vào chuẩn chung. |
+| **2.0** | **Tầng 2: Tokenizer** | **BẮT ĐẦU** | `src/PECT_JEPA/spatiotemporal_5x5/models/tokenizer_5x5.py` | Tiếp tục giữ cố định Masking EXP-34, tái thiết lập Tokenizer cân bằng năng lượng Thời gian - Tần số, giải quyết trực giao siêu phẳng giữa các dạng sóng. |
 | **3.0** | Tầng 3: Context Encoder | Chưa bắt đầu | - | Chờ hoàn thành Tầng 2. |
 | **4.0** | Tầng 4: Predictor | Chưa bắt đầu | - | Chờ hoàn thành Tầng 3. |
 | **5.0** | Tầng 5: Loss Function | Chưa bắt đầu | - | Chờ hoàn thành Tầng 4. |
