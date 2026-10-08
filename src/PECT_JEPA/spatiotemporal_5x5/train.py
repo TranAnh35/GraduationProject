@@ -314,6 +314,7 @@ def main():
         spatial_topology=args.spatial_topology,
         star_radii=tuple(args.star_radii),
         masker_type=args.masker_type,
+        radial_mask_mode=args.radial_mask_mode,
         num_temporal_stages=args.num_temporal_stages,
         cst_mask_mode=args.cst_mask_mode,
         num_freq_bins=args.num_freq_bins,
