@@ -121,11 +121,11 @@ from src.PECT_JEPA.spatiotemporal_5x5.evaluation.latent_diagnostics import (
 
 
 def to_safe_path(path: str) -> str:
-    """Ensures paths on Windows bypass the MAX_PATH (260 char) limitation using extended prefix."""
+    """Ensures paths on Windows bypass the MAX_PATH (260 char) limitation using extended prefix only if needed."""
     if not path:
         return path
     abs_path = os.path.abspath(path)
-    if os.name == "nt" and not abs_path.startswith("\\\\?\\"):
+    if os.name == "nt" and len(abs_path) >= 240 and not abs_path.startswith("\\\\?\\"):
         return "\\\\?\\" + abs_path
     return abs_path
 
@@ -1403,20 +1403,46 @@ def main():
     test_features_cache = {}
     all_size_pairs = []
     print(f"\n--- Evaluating {len(test_files)} Test Scans across Streamlined Benchmark Tasks ---", flush=True)
+    cache_dir = os.path.join(args.output_dir, ".eval_cache")
+    os.makedirs(cache_dir, exist_ok=True)
     for idx, fp in enumerate(test_files):
         print(f"\n[{idx + 1}/{len(test_files)}] Processing: {os.path.basename(fp)}", flush=True)
-        res = evaluate_single_file(
-            file_path=fp,
-            model=model,
-            output_dir=args.output_dir,
-            batch_size=args.batch_size,
-            device=args.device,
-            save_features=args.save_features,
-            crop_border=crop_border,
-            eval_3d=args.eval_3d,
-            eval_diagnostics=args.eval_diagnostics,
-            morphology_clf=morphology_clf,
-        )
+        cache_fp = os.path.join(cache_dir, f"{os.path.basename(fp)}.json")
+        res = None
+        if os.path.exists(cache_fp):
+            try:
+                with open(cache_fp, "r", encoding="utf-8") as f_c:
+                    res = json.load(f_c)
+                print(f"  [Cache Hit] Loaded cached evaluation result for {os.path.basename(fp)}", flush=True)
+                metrics_flat = res.get("metrics", {})
+                auc_str = f" | AUC: {metrics_flat['auc_roc']:.4f} | AP: {metrics_flat['average_precision']:.4f}" if metrics_flat.get("auc_roc") is not None else ""
+                cnr_str = f" | CNR: {metrics_flat['contrast_ratio_cnr']:.2f}" if metrics_flat.get("contrast_ratio_cnr") is not None else ""
+                r2_str = f" | Depth-R²: {metrics_flat['defect_only_r2']:.3f}" if metrics_flat.get("defect_only_r2") is not None else ""
+                sz_str = f" | Size-R²: {metrics_flat['flaw_size_defect_r2']:.3f}" if metrics_flat.get("flaw_size_defect_r2") is not None else ""
+                iou_str = f" | IoU: {metrics_flat['defect_iou_jaccard']:.3f}" if metrics_flat.get("defect_iou_jaccard") is not None else ""
+                print(f"  [Result]{cnr_str}{auc_str}{r2_str}{sz_str}{iou_str}", flush=True)
+            except Exception:
+                res = None
+
+        if res is None:
+            res = evaluate_single_file(
+                file_path=fp,
+                model=model,
+                output_dir=args.output_dir,
+                batch_size=args.batch_size,
+                device=args.device,
+                save_features=args.save_features,
+                crop_border=crop_border,
+                eval_3d=args.eval_3d,
+                eval_diagnostics=args.eval_diagnostics,
+                morphology_clf=morphology_clf,
+            )
+            try:
+                cached_dict = {k: v for k, v in res.items() if k != "_eval_sample"}
+                with open(cache_fp, "w", encoding="utf-8") as f_c:
+                    json.dump(cached_dict, f_c, indent=2, default=str)
+            except Exception as e:
+                pass
         if "_eval_sample" in res and res["_eval_sample"] is not None:
             test_features_cache[fp] = res["_eval_sample"]
             del res["_eval_sample"]

@@ -102,7 +102,13 @@ def read_tdms_1d_waveforms(
     Returns:
         waveforms: np.ndarray of shape [N_waveforms, target_time_samples] (float32)
     """
-    with TdmsFile.read(file_path) as tdms_file:
+    try:
+        tdms_file = TdmsFile.read(file_path)
+    except Exception:
+        with open(file_path, "rb", buffering=1024 * 1024) as f:
+            tdms_file = TdmsFile(f)
+            
+    with tdms_file:
         if "Freq_Sampling_SizeX_SizeY" in tdms_file:
             infor = tdms_file["Freq_Sampling_SizeX_SizeY"].channels()[0][:]
             f = float(infor[0])
