@@ -1413,12 +1413,180 @@ class EnergyAdaptiveDualDomainTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class ImpedanceDeconvolutionTokenizer5x5(nn.Module):
+    """
+    Self-Calibrated Impedance Deconvolution Tokenizer for 5x5 PECT-JEPA (EXP-38).
+
+    Eliminates sensor transfer function T(f) and excitation waveform I(f) variations
+    by computing relative spectral impedance deconvolution against the local spatial
+    sound-metal reference carrier in both the Fourier spectral domain and transient time domain:
+
+    1. Spectral Impedance Deconvolution:
+       V_p(f) = I(f) * T_sensor(f) * Z_p(f)
+       V_ref(f) = I(f) * T_sensor(f) * Z_sound(f)
+       Deconvolution: V_p(f) / V_ref(f) = Z_p(f) / Z_sound(f)
+       - Relative Phase Shift: Delta theta_p(f) = arg(V_p(f) * conj(V_ref(f))) / pi
+         100% independent of arg(I(f)) and arg(T_sensor(f)).
+       - Relative Amplitude Modulation: R_p(f) = (|V_p(f)| - |V_ref(f)|) / (|V_ref(f)| + eps)
+         100% independent of |I(f)| and |T_sensor(f)|.
+
+    2. Relative Transient Dynamics:
+       Delta x_p(t) = (x_p(t) - x_ref(t)) / (||x_ref|| + eps).
+
+    3. Waveform-Agnostic Energy Saliency Gating:
+       s(f) = |V_ref(f)|^2 / sum(|V_ref|^2) suppresses inactive out-of-band spectral noise.
+
+    4. Symmetric Balanced Dual-Domain Fusion:
+       z_fused = W_fuse [z_time, z_freq] + 0.5 * (z_time + z_freq).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_tokens = self.num_spatial        # Exactly 25 tokens
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+
+        # 1. Temporal Branch: Local Reference-Normalized Perturbation + Invariant Transient Features
+        self.time_in_dim = in_channels + 3
+        self.time_proj = nn.Sequential(
+            nn.Linear(self.time_in_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Spectral Branch: Deconvolved Relative Phase + Relative Mag + Saliency + Moments
+        self.spectral_dim = self.num_freq_bins * 3 + 2
+        self.proj_freq = nn.Sequential(
+            nn.Linear(self.spectral_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Symmetric Dual-Domain Balanced Highway Fusion
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+
+        # 4. Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: [B, 5, 5, C] tensor (or [5, 5, C])
+        Returns:
+            tokens:     [B, 25, D]
+            pos_expand: [B, 25, D]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_grid = x.reshape(B, self.num_spatial, C)
+
+        # Local sound-metal spatial median across the 25 probes
+        x_ref = torch.median(x_grid, dim=1, keepdim=True).values  # [B, 1, C]
+        e_ref = torch.sqrt(torch.mean(x_ref ** 2, dim=-1, keepdim=True) + 1e-6)  # [B, 1, 1]
+
+        # --- A. Time Domain: Normalized Transient Perturbation ---
+        delta_x = (x_grid - x_ref) / e_ref  # [B, 25, C]
+        t_p = torch.argmax(torch.abs(x_grid), dim=-1, keepdim=True).float() / float(C)  # [B, 25, 1]
+        v_pp = (x_grid.max(dim=-1, keepdim=True).values - x_grid.min(dim=-1, keepdim=True).values) / e_ref  # [B, 25, 1]
+        e_pert = torch.mean(torch.abs(x_grid - x_ref), dim=-1, keepdim=True) / e_ref  # [B, 25, 1]
+
+        phi_time = torch.cat([delta_x, t_p, v_pp, e_pert], dim=-1).to(x.dtype)
+        z_time = self.ln_time(self.time_proj(phi_time.reshape(B * self.num_spatial, -1)))  # [B*25, D]
+
+        # --- B. Frequency Domain: Dodd-Deeds Relative Impedance Deconvolution ---
+        x_fp32 = x_grid.float()
+        x_ref_fp32 = x_ref.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)      # [B, 25, C//2 + 1]
+        X_ref = torch.fft.rfft(x_ref_fp32, dim=-1)  # [B, 1, C//2 + 1]
+
+        self._last_fft = X_fft.reshape(B * self.num_spatial, -1)
+
+        X_sub = X_fft[:, :, 1:self.num_freq_bins + 1]          # [B, 25, K]
+        X_ref_sub = X_ref[:, :, 1:self.num_freq_bins + 1]      # [B, 1, K]
+
+        # Relative Phase Shift via conjugate multiplication (cancels I(f) and T_sensor(f)):
+        prod = X_sub * torch.conj(X_ref_sub)
+        delta_theta = torch.angle(prod) / torch.pi  # [B, 25, K] in [-1, 1]
+        self._last_phase = delta_theta.reshape(B * self.num_spatial, -1)
+
+        # Relative Amplitude Variation (cancels |I(f)| and |T_sensor(f)|):
+        mag_probe = torch.abs(X_sub)
+        mag_ref = torch.abs(X_ref_sub)
+        rel_mag = torch.clamp((mag_probe - mag_ref) / (mag_ref + 1e-6), min=-2.0, max=5.0)  # [B, 25, K]
+
+        # Reference Energy Saliency Gating:
+        P_ref = mag_ref ** 2
+        s = P_ref / (P_ref.sum(dim=-1, keepdim=True) + 1e-8)  # [B, 1, K]
+
+        delta_theta_gated = s * delta_theta  # [B, 25, K]
+        rel_mag_gated = s * rel_mag          # [B, 25, K]
+
+        # Continuous Spectral Moments:
+        bin_indices = torch.arange(1, self.num_freq_bins + 1, device=x.device, dtype=torch.float32).reshape(1, 1, -1)
+        f_centroid = (bin_indices * s).sum(dim=-1, keepdim=True) / float(self.num_freq_bins)  # [B, 1, 1]
+        var_f = ((bin_indices / float(self.num_freq_bins) - f_centroid) ** 2 * s).sum(dim=-1, keepdim=True)
+        f_spread = torch.sqrt(torch.clamp(var_f, min=0.0) + 1e-8)  # [B, 1, 1]
+
+        s_exp = s.expand(B, self.num_spatial, self.num_freq_bins)
+        fc_exp = f_centroid.expand(B, self.num_spatial, 1)
+        fs_exp = f_spread.expand(B, self.num_spatial, 1)
+
+        phi_freq = torch.cat([delta_theta_gated, rel_mag_gated, s_exp, fc_exp, fs_exp], dim=-1).to(x.dtype)
+        z_freq = self.ln_freq(self.proj_freq(phi_freq.reshape(B * self.num_spatial, -1)))  # [B*25, D]
+
+        # --- C. Symmetric Balanced Dual-Domain Fusion ---
+        z_cat = torch.cat([z_time, z_freq], dim=-1)
+        z_fused = self.fuse_proj(z_cat) + 0.5 * (z_time + z_freq)
+        tokens = self.drop(self.norm_out(z_fused)).reshape(B, self.num_tokens, self.embed_dim)
+
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
     tokenizer_type = getattr(config, "tokenizer_type", "continuous_linear_field")
-    if tokenizer_type in ("energy_adaptive_dual_domain", "energy_adaptive_field", "adaptive_dual_domain"):
+    if tokenizer_type in ("impedance_deconvolution", "impedance_deconv", "dodd_deeds_deconv"):
+        return ImpedanceDeconvolutionTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+        )
+    elif tokenizer_type in ("energy_adaptive_dual_domain", "energy_adaptive_field", "adaptive_dual_domain"):
         return EnergyAdaptiveDualDomainTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
