@@ -131,6 +131,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Minimum target L2 norm of representations (default: 1.0)")
     p.add_argument("--subspace_perturbation_weight", type=float, default=1.0,
                    help="Latent Subspace Residual Perturbation Loss weight (EXP-22, default: 1.0)")
+    p.add_argument("--cross_file_align_weight", type=float, default=0.0,
+                   help="Cross-File Manifold Alignment Regularization weight (EXP-39, default: 0.0)")
     p.add_argument("--tokenizer_type", type=str, default="energy_adaptive_dual_domain",
                    choices=["impedance_deconvolution", "impedance_deconv", "energy_adaptive_dual_domain", "energy_adaptive_field", "adaptive_dual_domain", "continuous_linear_field", "continuous_linear", "continuous_field", "waveform_agnostic_field", "uncrushed_diffusion", "snr_tapered_diffusion", "dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
                    help="Tokenizer architecture: 'impedance_deconvolution' (EXP-38: Dodd-Deeds Impedance Deconvolution), 'energy_adaptive_dual_domain' (EXP-35/37B), etc.")

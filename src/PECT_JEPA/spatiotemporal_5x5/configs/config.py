@@ -110,6 +110,7 @@ class Spatiotemporal5x5Config:
     uniformity_subsample: int = 1024     # Subsample size for stable, memory-efficient pairwise similarity
     norm_floor_weight: float = 0.1       # Norm Floor Barrier weight to prevent zero-vector collapse (||z|| >= target)
     norm_floor_target: float = 1.0       # Minimum expected representation L2 norm target
+    cross_file_align_weight: float = 0.0 # EXP-39: Cross-File Manifold Alignment Regularization weight
 
     # --------------------------------------------------------------- Training
     batch_size: int = 256

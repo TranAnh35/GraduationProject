@@ -39,6 +39,7 @@ class JEPALoss5x5(nn.Module):
         norm_floor_weight: float = 0.0,
         norm_floor_target: float = 1.0,
         subspace_perturbation_weight: float = 1.0,
+        cross_file_align_weight: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -60,6 +61,7 @@ class JEPALoss5x5(nn.Module):
         self.norm_floor_weight = norm_floor_weight
         self.norm_floor_target = norm_floor_target
         self.subspace_perturbation_weight = subspace_perturbation_weight
+        self.cross_file_align_weight = cross_file_align_weight
 
     def compute_disturbance_weights(self, x_raw: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
@@ -472,6 +474,64 @@ class JEPALoss5x5(nn.Module):
         pearson_r = torch.sum(z_c * p_c) / denom
         return 1.0 - torch.abs(torch.clamp(pearson_r, min=-1.0, max=1.0))
 
+    def cross_file_manifold_alignment_loss(
+        self, H_rep: torch.Tensor, file_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Cross-File Manifold Alignment Regularization (EXP-39).
+        Aligns coordinate variance profiles and penalizes global mixture off-diagonals across disparate files:
+        1. Coordinate Variance Profile Alignment:
+           Forces all inspection files to distribute signal variance across the SAME latent coordinate dimensions.
+        2. Global Mixture Covariance Off-Diagonal Penalty:
+           Forces disparate files to align along identical canonical orthogonal axes.
+        """
+        if file_ids is None or file_ids.numel() == 0:
+            return torch.tensor(0.0, device=H_rep.device, dtype=torch.float32)
+
+        z = torch.nan_to_num(H_rep.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        B, N, D = z.shape
+        z_flat = z.reshape(B * N, D)
+
+        if file_ids.ndim == 1:
+            file_ids_expanded = file_ids.unsqueeze(1).expand(B, N).reshape(-1)
+        else:
+            file_ids_expanded = file_ids.reshape(-1)
+
+        unique_files, inverse_indices, counts = torch.unique(file_ids_expanded, return_inverse=True, return_counts=True)
+        K = len(unique_files)
+        if K < 2:
+            return torch.tensor(0.0, device=z.device, dtype=torch.float32)
+
+        # Center each file independently
+        file_sums = torch.zeros(K, D, device=z.device, dtype=z.dtype)
+        file_sums.scatter_add_(0, inverse_indices.unsqueeze(1).expand(-1, D), z_flat)
+        file_means = file_sums / counts.unsqueeze(1).clamp(min=1)
+        z_centered = z_flat - file_means[inverse_indices]
+
+        # 1. Coordinate Standard Deviation Profiles per file: [K, D]
+        std_profiles = []
+        for k in range(K):
+            n_pts = int(counts[k].item())
+            if n_pts <= 2:
+                continue
+            zk = z_centered[inverse_indices == k]
+            var_k = (zk ** 2).mean(dim=0)  # [D]
+            std_profiles.append(torch.sqrt(var_k + 1e-6))
+
+        if len(std_profiles) < 2:
+            return torch.tensor(0.0, device=z.device, dtype=torch.float32)
+
+        S = torch.stack(std_profiles, dim=0)  # [K_eff, D]
+        mean_S = S.mean(dim=0, keepdim=True)
+        l_var_align = ((S - mean_S) ** 2).mean()
+
+        # 2. Global Covariance Off-Diagonal Penalty on Centered Data:
+        cov_global = (z_centered.T @ z_centered) / max(1, z_centered.shape[0] - 1)
+        off_diag_global = cov_global - torch.diag(torch.diag(cov_global))
+        l_cov_global = (off_diag_global ** 2).sum() / D
+
+        return torch.nan_to_num(l_var_align + l_cov_global, nan=0.0, posinf=10.0)
+
     def forward(
         self,
         H_pred: torch.Tensor,
@@ -543,6 +603,11 @@ class JEPALoss5x5(nn.Module):
         if self.norm_floor_weight > 0.0 and rep_reg is not None:
             l_norm, mean_norm = self.norm_floor_loss(rep_reg)
 
+        # Cross-File Manifold Alignment Regularization (EXP-39)
+        l_cross_align = zero_loss
+        if self.cross_file_align_weight > 0.0 and rep_reg is not None and file_ids is not None:
+            l_cross_align = self.cross_file_manifold_alignment_loss(rep_reg, file_ids=file_ids)
+
         # Subspace Residual Perturbation Loss (EXP-22 / Fixed EXP-25B)
         l_pert = zero_loss
         if self.subspace_perturbation_weight > 0.0 and delta_pred is not None:
@@ -568,6 +633,7 @@ class JEPALoss5x5(nn.Module):
             + self.cov_weight * l_cov
             + self.uniformity_weight * l_unif
             + self.norm_floor_weight * l_norm
+            + self.cross_file_align_weight * l_cross_align
         )
 
         return {
@@ -582,5 +648,6 @@ class JEPALoss5x5(nn.Module):
             "loss_cov": l_cov.detach(),
             "loss_unif": l_unif.detach(),
             "loss_norm": l_norm.detach(),
+            "loss_cross_align": l_cross_align.detach(),
             "mean_norm": mean_norm.detach(),
         }
