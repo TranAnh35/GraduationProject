@@ -7,7 +7,7 @@ from .tokenizer_5x5 import (
     SpatiotemporalPatchTokenizer5x5,
     build_tokenizer_5x5,
 )
-from .context_encoder import ContextEncoder5x5
+from .context_encoder import ContextEncoder5x5, DispersionConditionedContextEncoder5x5, build_context_encoder_5x5
 from .target_encoder import TargetEncoder5x5
 from .predictor import (
     Predictor5x5,
@@ -27,6 +27,8 @@ __all__ = [
     "SpatiotemporalPatchTokenizer5x5",
     "build_tokenizer_5x5",
     "ContextEncoder5x5",
+    "DispersionConditionedContextEncoder5x5",
+    "build_context_encoder_5x5",
     "TargetEncoder5x5",
     "Predictor5x5",
     "OperatorDiffusionPredictor5x5",

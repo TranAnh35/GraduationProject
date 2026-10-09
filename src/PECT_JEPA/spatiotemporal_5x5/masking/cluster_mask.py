@@ -571,7 +571,7 @@ def build_masker_5x5(config=None, **kwargs):
             bank_size=bank_size,
         )
 
-    if tokenizer_type in ("continuous_linear_field", "continuous_linear", "linear_field", "continuous_field", "waveform_agnostic_field", "continuous_dual_domain", "continuous_stf", "continuous_filterbank", "spatial_grid", "time_only", "dual_domain_attention", "dual_domain"):
+    if tokenizer_type in ("energy_adaptive_dual_domain", "energy_adaptive_field", "adaptive_dual_domain", "continuous_linear_field", "continuous_linear", "linear_field", "continuous_field", "waveform_agnostic_field", "continuous_dual_domain", "continuous_stf", "continuous_filterbank", "spatial_grid", "time_only", "dual_domain_attention", "dual_domain"):
         return ContiguousClusterMasker5x5(
             min_masked=config.min_masked,
             max_masked=config.max_masked,

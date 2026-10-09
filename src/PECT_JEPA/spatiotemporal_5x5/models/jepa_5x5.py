@@ -18,7 +18,7 @@ from .tokenizer_5x5 import (
     DualDomainAttentionTokenizer5x5,
     build_tokenizer_5x5,
 )
-from .context_encoder import ContextEncoder5x5
+from .context_encoder import ContextEncoder5x5, build_context_encoder_5x5
 from .target_encoder import TargetEncoder5x5
 from .predictor import (
     Predictor5x5,
@@ -93,19 +93,7 @@ class PECT_JEPA_5x5(nn.Module):
         self.masker = build_masker_5x5(config)
 
         # 3. Context Encoder
-        self.context_encoder = ContextEncoder5x5(
-            embed_dim=config.embed_dim,
-            depth=config.encoder_depth,
-            num_heads=config.encoder_heads,
-            mlp_ratio=config.mlp_ratio,
-            dropout=config.dropout,
-            use_radial_attention_bias=getattr(config, "use_radial_attention_bias", False),
-            spatial_topology=getattr(config, "spatial_topology", "concentric_star"),
-            star_radii=getattr(config, "star_radii", (1, 3, 7)),
-            grid_size=config.grid_size,
-            diffusion_gamma_init=getattr(config, "diffusion_gamma_init", 0.05),
-            diffusion_alpha_init=getattr(config, "diffusion_alpha_init", 0.1),
-        )
+        self.context_encoder = build_context_encoder_5x5(config)
 
         # 4. Target Encoder (EMA)
         self.target_encoder = TargetEncoder5x5(
@@ -114,12 +102,15 @@ class PECT_JEPA_5x5(nn.Module):
             num_heads=config.encoder_heads,
             mlp_ratio=config.mlp_ratio,
             dropout=config.dropout,
+            encoder_type=getattr(config, "encoder_type", "dispersion_conditioned"),
             use_radial_attention_bias=getattr(config, "use_radial_attention_bias", False),
             spatial_topology=getattr(config, "spatial_topology", "concentric_star"),
             star_radii=getattr(config, "star_radii", (1, 3, 7)),
             grid_size=config.grid_size,
             diffusion_gamma_init=getattr(config, "diffusion_gamma_init", 0.05),
             diffusion_alpha_init=getattr(config, "diffusion_alpha_init", 0.1),
+            diffusion_alpha_x_init=getattr(config, "diffusion_alpha_x_init", 1.0),
+            diffusion_alpha_y_init=getattr(config, "diffusion_alpha_y_init", 1.0),
         )
         self._init_target_encoder()
 
@@ -254,17 +245,24 @@ class PECT_JEPA_5x5(nn.Module):
         target_tokens = tokens[batch_arange, target_indices]
         target_pos = pos[batch_arange, target_indices]
 
+        # Compute characteristic frequency early so context encoder, target encoder, and predictor share it
+        if freq_condition is None:
+            freq_condition = self.compute_characteristic_frequency(
+                x, num_bins=getattr(self.config, "num_freq_bins", 14), X_fft=last_fft
+            )
+
         # 4. Context Encoder (only sees visible context tokens)
-        H_ctx = self.context_encoder(context_tokens, context_pos, context_indices=context_indices)
+        H_ctx = self.context_encoder(
+            context_tokens,
+            context_pos,
+            context_indices=context_indices,
+            freq_condition=freq_condition,
+        )
 
         # 5. Predictor (Predicts target representation from context and target queries)
         is_physics_predictor = hasattr(self.predictor, "op_embedding")
         delta_pred = None
         if hasattr(self.predictor, "residual_head"):
-            if freq_condition is None:
-                freq_condition = self.compute_characteristic_frequency(
-                    x, num_bins=getattr(self.config, "num_freq_bins", 14), X_fft=last_fft
-                )
             H_pred, delta_pred, _ = self.predictor(
                 H_context=H_ctx,
                 target_pos=target_pos,
@@ -274,10 +272,6 @@ class PECT_JEPA_5x5(nn.Module):
                 return_residual=True,
             )
         elif is_physics_predictor:
-            if freq_condition is None:
-                freq_condition = self.compute_characteristic_frequency(
-                    x, num_bins=getattr(self.config, "num_freq_bins", 14), X_fft=last_fft
-                )
             H_pred = self.predictor(
                 H_context=H_ctx,
                 target_pos=target_pos,
@@ -292,13 +286,23 @@ class PECT_JEPA_5x5(nn.Module):
         use_target_ema = getattr(self.config, "use_target_ema", False)
         if use_target_ema:
             with torch.no_grad():
-                H_tgt = self.target_encoder(target_tokens, target_pos, target_indices=target_indices)
+                H_tgt = self.target_encoder(
+                    target_tokens,
+                    target_pos,
+                    target_indices=target_indices,
+                    freq_condition=freq_condition,
+                )
             H_rep_reg = H_ctx
         else:
             # Single Shared Encoder + Stop-Gradient Target (SimSiam/VICReg hybrid)
             # H_tgt_full has active gradients for VICReg representation regularization
             # H_tgt is detached for prediction loss to prevent chasing collapse
-            H_tgt_full = self.context_encoder(target_tokens, target_pos, context_indices=target_indices)
+            H_tgt_full = self.context_encoder(
+                target_tokens,
+                target_pos,
+                context_indices=target_indices,
+                freq_condition=freq_condition,
+            )
             H_tgt = H_tgt_full.detach()
             H_rep_reg = torch.cat([H_ctx, H_tgt_full], dim=1)
 
@@ -331,7 +335,12 @@ class PECT_JEPA_5x5(nn.Module):
             x_pert = torch.fft.irfft(x_pert_fft, n=self.config.in_channels, dim=-1).to(x.dtype)
             tokens_pert, _ = self.tokenizer(x_pert)
             context_tokens_pert = tokens_pert[batch_arange, context_indices]
-            H_ctx_pert = self.context_encoder(context_tokens_pert, context_pos)
+            H_ctx_pert = self.context_encoder(
+                context_tokens_pert,
+                context_pos,
+                context_indices=context_indices,
+                freq_condition=freq_condition,
+            )
 
         # 7b. Compute Energy-Weighted Spectral Phase for Phase-Depth Alignment (if phase_align_weight > 0)
         z_depth_tgt = None
@@ -401,7 +410,10 @@ class PECT_JEPA_5x5(nn.Module):
             x = x.unsqueeze(0)
         B = x.shape[0]
         tokens, pos = self.tokenizer(x)
-        H = self.context_encoder(tokens, pos)  # [B, N_total, D]
+        freq_cond = self.compute_characteristic_frequency(
+            x, num_bins=getattr(self.config, "num_freq_bins", 14)
+        )
+        H = self.context_encoder(tokens, pos, freq_condition=freq_cond)  # [B, N_total, D]
 
         # In topologies.py, (0, 0) is always placed at index 0 for all spatial topologies
         center_spatial_idx = 0
@@ -429,12 +441,15 @@ class PECT_JEPA_5x5(nn.Module):
         B = x.shape[0]
         device = x.device
 
-        # 1. Full tokenization
+        # 1. Full tokenization & frequency characteristic
         tokens, pos = self.tokenizer(x)
         N_total = tokens.shape[1]
+        freq_cond = self.compute_characteristic_frequency(
+            x, num_bins=getattr(self.config, "num_freq_bins", 14)
+        )
 
         # 2. Context features from visible tokens
-        H_full = self.context_encoder(tokens, pos)  # [B, N_total, D]
+        H_full = self.context_encoder(tokens, pos, freq_condition=freq_cond)  # [B, N_total, D]
 
         # In topologies.py, (0, 0) is always placed at index 0 for all spatial topologies
         center_spatial_idx = 0
@@ -479,13 +494,15 @@ class PECT_JEPA_5x5(nn.Module):
         ctx_pos = pos[batch_arange, ctx_idx]
         target_pos = pos[batch_arange, tgt_idx]
 
-        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+        H_ctx_masked = self.context_encoder(
+            ctx_tokens,
+            ctx_pos,
+            context_indices=ctx_idx,
+            freq_condition=freq_cond,
+        )
 
         # Predict center target tokens from surrounding context
         if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
-            freq_cond = self.compute_characteristic_frequency(
-                x, num_bins=getattr(self.config, "num_freq_bins", 14)
-            )
             H_pred = self.predictor(
                 H_context=H_ctx_masked,
                 target_pos=target_pos,
@@ -504,9 +521,19 @@ class PECT_JEPA_5x5(nn.Module):
         # Target representation
         target_tokens = tokens[batch_arange, tgt_idx]
         if getattr(self.config, "use_target_ema", False):
-            H_tgt = self.target_encoder(target_tokens, target_pos, target_indices=tgt_idx)
+            H_tgt = self.target_encoder(
+                target_tokens,
+                target_pos,
+                target_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
         else:
-            H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+            H_tgt = self.context_encoder(
+                target_tokens,
+                target_pos,
+                context_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
 
         # Coordinate-wise physical discrepancy: center target token at index 0
         use_relative = getattr(self.config, "relative_perturbation_target", False) or getattr(self.config, "scale_separated_prediction", False)
@@ -553,12 +580,15 @@ class PECT_JEPA_5x5(nn.Module):
         B = x.shape[0]
         device = x.device
 
-        # 1. Full tokenization
+        # 1. Full tokenization & frequency characteristic
         tokens, pos = self.tokenizer(x)
         N_total = tokens.shape[1]
+        freq_cond = self.compute_characteristic_frequency(
+            x, num_bins=getattr(self.config, "num_freq_bins", 14)
+        )
 
         # 2. Context features from visible tokens
-        H_full = self.context_encoder(tokens, pos)  # [B, N_total, D]
+        H_full = self.context_encoder(tokens, pos, freq_condition=freq_cond)  # [B, N_total, D]
 
         if getattr(self.config, "spatial_topology", "dense_5x5") in ("concentric_star", "star", "octagram"):
             center_spatial_idx = 0
@@ -602,13 +632,15 @@ class PECT_JEPA_5x5(nn.Module):
         ctx_pos = pos[batch_arange, ctx_idx]
         target_pos = pos[batch_arange, tgt_idx]
 
-        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+        H_ctx_masked = self.context_encoder(
+            ctx_tokens,
+            ctx_pos,
+            context_indices=ctx_idx,
+            freq_condition=freq_cond,
+        )
 
         # Predict center target tokens from surrounding context
         if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
-            freq_cond = self.compute_characteristic_frequency(
-                x, num_bins=getattr(self.config, "num_freq_bins", 14)
-            )
             H_pred = self.predictor(
                 H_context=H_ctx_masked,
                 target_pos=target_pos,
@@ -627,9 +659,19 @@ class PECT_JEPA_5x5(nn.Module):
         # Target representation
         target_tokens = tokens[batch_arange, tgt_idx]
         if getattr(self.config, "use_target_ema", False):
-            H_tgt = self.target_encoder(target_tokens, target_pos, target_indices=tgt_idx)
+            H_tgt = self.target_encoder(
+                target_tokens,
+                target_pos,
+                target_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
         else:
-            H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+            H_tgt = self.context_encoder(
+                target_tokens,
+                target_pos,
+                context_indices=tgt_idx,
+                freq_condition=freq_cond,
+            )
 
         # Coordinate-wise physical discrepancy
         use_relative = getattr(self.config, "relative_perturbation_target", False) or getattr(self.config, "scale_separated_prediction", False)
@@ -730,7 +772,10 @@ class PECT_JEPA_5x5(nn.Module):
 
         # 1. Full tokenization & Context Encoding
         tokens, pos = self.tokenizer(x)
-        H_full = self.context_encoder(tokens, pos)
+        freq_cond = self.compute_characteristic_frequency(
+            x, num_bins=getattr(self.config, "num_freq_bins", 14)
+        )
+        H_full = self.context_encoder(tokens, pos, freq_condition=freq_cond)
         center_spatial_idx = 0
         h_ctx_center = H_full[:, center_spatial_idx, :]  # [B, D]
 
@@ -760,13 +805,15 @@ class PECT_JEPA_5x5(nn.Module):
         ctx_pos = pos[batch_arange, ctx_idx]
         target_pos = pos[batch_arange, tgt_idx]
 
-        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+        H_ctx_masked = self.context_encoder(
+            ctx_tokens,
+            ctx_pos,
+            context_indices=ctx_idx,
+            freq_condition=freq_cond,
+        )
 
         # 3. Predictor center prediction
         if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
-            freq_cond = self.compute_characteristic_frequency(
-                x, num_bins=getattr(self.config, "num_freq_bins", 14)
-            )
             H_pred = self.predictor(
                 H_context=H_ctx_masked,
                 target_pos=target_pos,
@@ -784,7 +831,12 @@ class PECT_JEPA_5x5(nn.Module):
 
         # 4. Target representation & relative perturbation
         target_tokens = tokens[batch_arange, tgt_idx]
-        H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+        H_tgt = self.context_encoder(
+            target_tokens,
+            target_pos,
+            context_indices=tgt_idx,
+            freq_condition=freq_cond,
+        )
 
         H_base = H_ctx_masked.mean(dim=1, keepdim=True)
         phi_carrier = h_ctx_center  # [B, D]
@@ -827,7 +879,10 @@ class PECT_JEPA_5x5(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(0)
         tokens, pos = self.tokenizer(x)
-        H = self.context_encoder(tokens, pos)  # [B, N_total, D]
+        freq_cond = self.compute_characteristic_frequency(
+            x, num_bins=getattr(self.config, "num_freq_bins", 14)
+        )
+        H = self.context_encoder(tokens, pos, freq_condition=freq_cond)  # [B, N_total, D]
         if tokens.shape[1] == 100:
             # Average 4 temporal stages for each of the 25 spatial points
             return H.view(-1, 25, 4, H.shape[-1]).mean(dim=2)  # [B, 25, D]
@@ -846,7 +901,10 @@ class PECT_JEPA_5x5(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(0)
         tokens, pos = self.tokenizer(x)
-        _, attn = self.context_encoder(tokens, pos, return_attention=True)
+        freq_cond = self.compute_characteristic_frequency(
+            x, num_bins=getattr(self.config, "num_freq_bins", 14)
+        )
+        _, attn = self.context_encoder(tokens, pos, return_attention=True, freq_condition=freq_cond)
         return attn
 
     @torch.no_grad()
@@ -871,6 +929,9 @@ class PECT_JEPA_5x5(nn.Module):
         tokens, pos = self.tokenizer(x)
         N_total = tokens.shape[1]
         center_spatial_idx = 0  # in concentric_star or standard topology, center is index 0
+        freq_cond = self.compute_characteristic_frequency(
+            x, num_bins=getattr(self.config, "num_freq_bins", 14)
+        )
         
         masker_type = getattr(self.config, "masker_type", "center_only")
         radial_mode = getattr(self.config, "radial_mask_mode", "inward_core")
@@ -898,12 +959,14 @@ class PECT_JEPA_5x5(nn.Module):
         target_pos = pos[batch_arange, tgt_idx]
         target_tokens = tokens[batch_arange, tgt_idx]
         
-        H_ctx_masked = self.context_encoder(ctx_tokens, ctx_pos, context_indices=ctx_idx)
+        H_ctx_masked = self.context_encoder(
+            ctx_tokens,
+            ctx_pos,
+            context_indices=ctx_idx,
+            freq_condition=freq_cond,
+        )
         
         if hasattr(self.predictor, "residual_head") or hasattr(self.predictor, "op_embedding"):
-            freq_cond = self.compute_characteristic_frequency(
-                x, num_bins=getattr(self.config, "num_freq_bins", 14)
-            )
             H_pred = self.predictor(
                 H_context=H_ctx_masked,
                 target_pos=target_pos,
@@ -919,7 +982,12 @@ class PECT_JEPA_5x5(nn.Module):
                 target_indices=tgt_idx,
             )
             
-        H_tgt = self.context_encoder(target_tokens, target_pos, context_indices=tgt_idx)
+        H_tgt = self.context_encoder(
+            target_tokens,
+            target_pos,
+            context_indices=tgt_idx,
+            freq_condition=freq_cond,
+        )
         
         use_relative = getattr(self.config, "relative_perturbation_target", False) or getattr(self.config, "scale_separated_prediction", False)
         if use_relative:

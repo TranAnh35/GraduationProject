@@ -60,6 +60,7 @@ class Spatiotemporal5x5Config:
     spatial_calibration: bool = True    # EXP-29: Zero-center full C-scan features by spatial median to eliminate 10x sensor/waveform DC drift
     embed_dim: int = 64                 # D (64 provides optimal capacity for 1.46M samples/epoch, 4 heads with dk=16)
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
+    encoder_type: str = "dispersion_conditioned" # 'dispersion_conditioned' (EXP-36) | 'standard' (baseline)
     encoder_depth: int = 4
     encoder_heads: int = 4
     predictor_type: str = "continuous_helmholtz" # 'continuous_helmholtz' (EXP-18/19: 3D Continuous Helmholtz Diffusion World Model) | 'operator_diffusion'

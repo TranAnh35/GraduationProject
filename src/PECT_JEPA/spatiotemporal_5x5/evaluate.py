@@ -344,6 +344,13 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
         else:
             config.predictor_type = "standard"
 
+    # If encoder_type was not specified in checkpoint config, infer from state_dict
+    if not (isinstance(cfg_dict, dict) and "encoder_type" in cfg_dict):
+        if "context_encoder.final_ada_ln.1.weight" in state_dict or any("ada_ln" in k for k in state_dict.keys()):
+            config.encoder_type = "dispersion_conditioned"
+        else:
+            config.encoder_type = "standard"
+
     # Infer embed_dim from encoder positional embedding if needed
     if "encoder.pos_embed" in state_dict:
         actual_dim = state_dict["encoder.pos_embed"].shape[-1]
@@ -358,7 +365,7 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda") -> PE
     epoch_info = ckpt.get("epoch", "?")
     step_info = ckpt.get("global_step", "?")
     print(f"Loaded checkpoint from {checkpoint_path} (epoch: {epoch_info}, step: {step_info})")
-    print(f"  Model config: tokenizer_type={config.tokenizer_type}, predictor_type={config.predictor_type}, embed_dim={config.embed_dim}, C={config.in_channels}")
+    print(f"  Model config: tokenizer_type={config.tokenizer_type}, encoder_type={getattr(config, 'encoder_type', 'standard')}, predictor_type={config.predictor_type}, embed_dim={config.embed_dim}, C={config.in_channels}")
     return model
 
 
@@ -1693,6 +1700,7 @@ def main():
         "checkpoint": args.checkpoint,
         "model_architecture": {
             "tokenizer_type": getattr(model.config, "tokenizer_type", "unknown"),
+            "encoder_type": getattr(model.config, "encoder_type", "standard"),
             "predictor_type": getattr(model.config, "predictor_type", "unknown"),
             "embed_dim": model.config.embed_dim,
             "encoder_depth": model.config.encoder_depth,
