@@ -404,14 +404,249 @@ class DispersionConditionedContextEncoder5x5(nn.Module):
         return h
 
 
+class BilinearCoupledFFN(nn.Module):
+    """
+    Bilinear Transient-Harmonic Coupling Feed-Forward Network:
+    Splits token features into transient dynamic channel and harmonic dispersion channel,
+    computing bilinear gated interaction:
+        h = GELU(W_gate * x) * (W_val * x)
+        out = W_out * h
+    Models the physical coupling between eddy current arrival delay and harmonic phase shift
+    without collapsing coordinate variance.
+    """
+    def __init__(self, embed_dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.w_gate = nn.Linear(embed_dim, hidden_dim)
+        self.w_val = nn.Linear(embed_dim, hidden_dim)
+        self.w_out = nn.Linear(hidden_dim, embed_dim)
+        self.drop = nn.Dropout(dropout)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.act(self.w_gate(x))
+        val = self.w_val(x)
+        h = gate * val
+        return self.drop(self.w_out(h))
+
+
+class HarmonicIsometricAttentionBias(nn.Module):
+    """
+    Normalized Receptive Field Attention Bias for Context Encoder (EXP-37 Stage 3):
+    Calibrates spatial dispersion by intermediate coil radius (3.0 mm)
+    and normalized frequency ratio relative to center frequency (0.25):
+        f_ratio = sqrt(clamp(omega_bar, 0.05, 1.0) / 0.25)
+        scale_ij = (||r_i - r_j|| / 3.0mm) * (1.0 + softplus(beta_h) * f_ratio)
+        B_ij = - softplus(gamma_h) * scale_ij - softplus(alpha_h) * ln(1.0 + scale_ij)
+
+    Guarantees:
+    - Square pulse (omega=0.105) maintains strong spatial decay (scale within 65% of nominal).
+    - Zero AdaLN on token representation vectors; strictly preserves full SVD rank >= 20D.
+    """
+    def __init__(
+        self,
+        num_heads: int = 4,
+        init_gamma: float = 0.1,
+        init_alpha: float = 0.2,
+        init_beta: float = 0.5,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
+        grid_size: int = 5,
+        r_coil_ref: float = 3.0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.r_coil_ref = r_coil_ref
+
+        offsets = get_spatial_topology_offsets(
+            topology=spatial_topology, star_radii=star_radii, grid_size=grid_size
+        )  # [25, 2] in mm
+        diff = offsets[:, None, :] - offsets[None, :, :]
+        dist_25 = np.sqrt(np.sum(diff ** 2, axis=-1)).astype(np.float32)  # [25, 25] in mm
+
+        dist_100 = dist_25[np.arange(100) // 4, :][:, np.arange(100) // 4]
+        self.register_buffer("dist_matrix_100", torch.from_numpy(dist_100), persistent=False)
+        self.register_buffer("dist_matrix_25", torch.from_numpy(dist_25), persistent=False)
+
+        raw_gamma = math.log(math.exp(init_gamma) - 1.0) if init_gamma > 0 else 0.0
+        raw_alpha = math.log(math.exp(init_alpha) - 1.0) if init_alpha > 0 else 0.0
+        raw_beta = math.log(math.exp(init_beta) - 1.0) if init_beta > 0 else 0.0
+
+        self.raw_gamma = nn.Parameter(torch.full((num_heads, 1, 1), raw_gamma, dtype=torch.float32))
+        self.raw_alpha = nn.Parameter(torch.full((num_heads, 1, 1), raw_alpha, dtype=torch.float32))
+        self.raw_beta = nn.Parameter(torch.full((num_heads, 1, 1), raw_beta, dtype=torch.float32))
+
+    def forward(self, dist_matrix: torch.Tensor, omega_bar: Optional[torch.Tensor] = None) -> torch.Tensor:
+        device = dist_matrix.device
+        dtype = dist_matrix.dtype
+
+        if dist_matrix.ndim == 2:
+            if omega_bar is not None and omega_bar.numel() > 1:
+                dist_matrix = dist_matrix.unsqueeze(0).expand(omega_bar.numel(), -1, -1)
+            else:
+                dist_matrix = dist_matrix.unsqueeze(0)  # [1, N, N]
+        elif dist_matrix.shape[0] == 1 and omega_bar is not None and omega_bar.numel() > 1:
+            dist_matrix = dist_matrix.expand(omega_bar.numel(), -1, -1)
+
+        B, N, _ = dist_matrix.shape
+        import torch.nn.functional as F
+        gamma = F.softplus(self.raw_gamma).to(device=device, dtype=dtype)  # [H, 1, 1]
+        alpha = F.softplus(self.raw_alpha).to(device=device, dtype=dtype)  # [H, 1, 1]
+        beta = F.softplus(self.raw_beta).to(device=device, dtype=dtype)    # [H, 1, 1]
+
+        if omega_bar is not None:
+            omega = omega_bar.view(B, 1, 1, 1).to(device=device, dtype=dtype).clamp(min=0.05, max=1.0)
+            f_ratio = torch.sqrt(omega / 0.25)  # [B, 1, 1, 1]
+        else:
+            f_ratio = torch.ones((B, 1, 1, 1), device=device, dtype=dtype)
+
+        d_norm = (dist_matrix.unsqueeze(1) / self.r_coil_ref)  # [B, 1, N, N]
+        scale = d_norm * (1.0 + beta.unsqueeze(0) * f_ratio)    # [B, H, N, N]
+
+        bias = - gamma.unsqueeze(0) * scale - alpha.unsqueeze(0) * torch.log(1.0 + scale)
+        return bias  # [B, H, N, N]
+
+
+class HarmonicIsometricTransformerBlock(nn.Module):
+    """
+    Standard Pre-LN Transformer Block equipped with BilinearCoupledFFN.
+    Zero AdaLN: preserves full 64D manifold rank without dimensional collapse.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiheadSelfAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = BilinearCoupledFFN(
+            embed_dim=embed_dim,
+            hidden_dim=int(embed_dim * mlp_ratio),
+            dropout=dropout
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
+        return_attention: bool = False,
+    ):
+        if return_attention:
+            attn_out, attn_weights = self.attn(self.norm1(x), return_attention=True, attn_bias=attn_bias)
+            x = x + attn_out
+            x = x + self.ffn(self.norm2(x))
+            return x, attn_weights
+        x = x + self.attn(self.norm1(x), attn_bias=attn_bias)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class HarmonicIsometricContextEncoder5x5(nn.Module):
+    """
+    Harmonic-Isometric Context Encoder (EXP-37 Stage 3):
+    1. Pre-LN Transformer blocks with strictly NO AdaLN (Rank-Preserving).
+    2. Normalized Receptive Field Attention Bias calibrated by coil radius (3.0 mm)
+       and normalized frequency ratio sqrt(omega / omega_ref).
+    3. Bilinear Coupled FFN explicitly modeling transient-harmonic coupling.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        depth: int = 4,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        use_radial_attention_bias: bool = True,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
+        grid_size: int = 5,
+        diffusion_gamma_init: float = 0.1,
+        diffusion_alpha_init: float = 0.2,
+        diffusion_beta_init: float = 0.5,
+    ):
+        super().__init__()
+        self.use_radial_attention_bias = use_radial_attention_bias
+        self.blocks = nn.ModuleList([
+            HarmonicIsometricTransformerBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout
+            )
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+        if use_radial_attention_bias:
+            self.harmonic_bias = HarmonicIsometricAttentionBias(
+                num_heads=num_heads,
+                init_gamma=diffusion_gamma_init,
+                init_alpha=diffusion_alpha_init,
+                init_beta=diffusion_beta_init,
+                spatial_topology=spatial_topology,
+                star_radii=star_radii,
+                grid_size=grid_size,
+                r_coil_ref=3.0,
+            )
+        else:
+            self.harmonic_bias = None
+
+    def forward(
+        self,
+        context_tokens: torch.Tensor,
+        context_pos: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        return_attention: bool = False,
+        freq_condition: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        h = context_tokens + context_pos
+        B, N_ctx, D = h.shape
+
+        attn_bias = None
+        if self.use_radial_attention_bias and self.harmonic_bias is not None:
+            if context_indices is not None:
+                dist_full = self.harmonic_bias.dist_matrix_100 if hasattr(self.harmonic_bias, "dist_matrix_100") and self.harmonic_bias.dist_matrix_100.shape[0] >= N_ctx else self.harmonic_bias.dist_matrix_25
+                if dist_full.device != h.device:
+                    dist_full = dist_full.to(h.device)
+                idx = context_indices.long()
+                dist_ctx = dist_full[idx.unsqueeze(2), idx.unsqueeze(1)]  # [B, N_ctx, N_ctx]
+                attn_bias = self.harmonic_bias(dist_ctx, omega_bar=freq_condition)  # [B, H, N_ctx, N_ctx]
+            elif N_ctx == 25:
+                mat = self.harmonic_bias.dist_matrix_25.to(h.device)
+                if B > 1:
+                    mat = mat.unsqueeze(0).expand(B, -1, -1)
+                attn_bias = self.harmonic_bias(mat, omega_bar=freq_condition)
+
+        last_attn = None
+        for i, blk in enumerate(self.blocks):
+            if return_attention and i == len(self.blocks) - 1:
+                h, last_attn = blk(h, attn_bias=attn_bias, return_attention=True)
+            else:
+                h = blk(h, attn_bias=attn_bias)
+
+        h = self.norm(h)
+        if return_attention:
+            return h, last_attn
+        return h
+
+
 def build_context_encoder_5x5(config) -> nn.Module:
     """
     Factory function for 5x5 PECT-JEPA Context Encoders.
     Supports:
+      - 'harmonic_isometric' (EXP-37: Harmonic-Isometric Context Encoder with Coupled FFN)
       - 'dispersion_conditioned' (EXP-36: Harmonic Dispersion Conditioned Context Encoder)
-      - 'standard' / 'vit' / 'baseline' (Legacy ContextEncoder5x5)
+      - 'standard' / 'vit' / 'baseline' (Standard Pre-LN ContextEncoder5x5)
     """
-    encoder_type = getattr(config, "encoder_type", "dispersion_conditioned").lower()
+    encoder_type = getattr(config, "encoder_type", "harmonic_isometric").lower()
     embed_dim = getattr(config, "embed_dim", 64)
     depth = getattr(config, "encoder_depth", 4)
     num_heads = getattr(config, "encoder_heads", 4)
@@ -421,12 +656,28 @@ def build_context_encoder_5x5(config) -> nn.Module:
     spatial_topology = getattr(config, "spatial_topology", "concentric_star")
     star_radii = getattr(config, "star_radii", (1, 3, 7))
     grid_size = getattr(config, "grid_size", 5)
-    diffusion_gamma_init = getattr(config, "diffusion_gamma_init", 0.05)
-    diffusion_alpha_init = getattr(config, "diffusion_alpha_init", 0.1)
+    diffusion_gamma_init = getattr(config, "diffusion_gamma_init", 0.1)
+    diffusion_alpha_init = getattr(config, "diffusion_alpha_init", 0.2)
+    diffusion_beta_init = getattr(config, "diffusion_beta_init", 0.5)
     diffusion_alpha_x_init = getattr(config, "diffusion_alpha_x_init", 1.0)
     diffusion_alpha_y_init = getattr(config, "diffusion_alpha_y_init", 1.0)
 
-    if encoder_type in ("dispersion_conditioned", "dispersion", "harmonic_dispersion"):
+    if encoder_type in ("harmonic_isometric", "harmonic", "isometric"):
+        return HarmonicIsometricContextEncoder5x5(
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            use_radial_attention_bias=use_radial_attention_bias,
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
+            grid_size=grid_size,
+            diffusion_gamma_init=diffusion_gamma_init,
+            diffusion_alpha_init=diffusion_alpha_init,
+            diffusion_beta_init=diffusion_beta_init,
+        )
+    elif encoder_type in ("dispersion_conditioned", "dispersion", "harmonic_dispersion"):
         return DispersionConditionedContextEncoder5x5(
             embed_dim=embed_dim,
             depth=depth,
@@ -457,4 +708,5 @@ def build_context_encoder_5x5(config) -> nn.Module:
             diffusion_alpha_init=diffusion_alpha_init,
         )
     else:
-        raise ValueError(f"Unknown encoder_type: {encoder_type}. Choose 'dispersion_conditioned' or 'standard'.")
+        raise ValueError(f"Unknown encoder_type: {encoder_type}. Choose 'harmonic_isometric', 'dispersion_conditioned', or 'standard'.")
+

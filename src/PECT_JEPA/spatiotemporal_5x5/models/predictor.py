@@ -1432,16 +1432,268 @@ class FrequencyConditionedDiffusionPredictor5x5(nn.Module):
         return H_pred
 
 
+class AnalyticalHelmholtzCarrierPropagator(nn.Module):
+    """
+    Analytical Zero-Parameter Helmholtz Green's Propagator for Eddy Current Carrier Field:
+    Solves boundary-to-interior quasi-static Helmholtz diffusion:
+        w_{ij} = softmax( - r_{ij} / delta_eff )
+        H_carrier,i = sum_j w_{ij} * H_ctx,j
+    where:
+        r_{ij} = ||pos_tgt,i - pos_ctx,j||_2
+        delta_eff = r_coil_ref * sqrt(0.25 / max(omega_bar, 0.01))
+    """
+    def __init__(self, r_coil_ref: float = 3.0):
+        super().__init__()
+        self.r_coil_ref = r_coil_ref
+
+    def forward(
+        self,
+        pos_tgt: torch.Tensor,       # [B, N_tgt, 2]
+        pos_ctx: torch.Tensor,       # [B, N_ctx, 2]
+        H_context: torch.Tensor,     # [B, N_ctx, D]
+        freq_val: Optional[torch.Tensor] = None, # [B] or [B, 1]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        delta_r = pos_tgt.unsqueeze(2) - pos_ctx.unsqueeze(1)  # [B, N_tgt, N_ctx, 2]
+        dist_r = torch.sqrt(torch.sum(delta_r ** 2, dim=-1) + 1e-6)  # [B, N_tgt, N_ctx]
+
+        B = pos_tgt.shape[0]
+        device = pos_tgt.device
+        if freq_val is None:
+            f_val = torch.full((B, 1, 1), 0.25, device=device, dtype=torch.float32)
+        else:
+            f_val = freq_val.view(B, 1, 1).clamp(min=1e-4)
+
+        delta_eff = self.r_coil_ref * torch.sqrt(0.25 / f_val)  # [B, 1, 1]
+        logits = - dist_r / delta_eff.clamp(min=1e-3)  # [B, N_tgt, N_ctx]
+        weights = F.softmax(logits, dim=-1)  # [B, N_tgt, N_ctx]
+
+        H_carrier = torch.bmm(weights, H_context)  # [B, N_tgt, D]
+        return H_carrier, dist_r, delta_eff, delta_r
+
+
+class DipolarAttentionBias(nn.Module):
+    """
+    Learnable Maxwell Dipolar Scattering Cross-Attention Bias:
+    Models magnetic field diversion around defects in conductive media:
+        M_{ij}^{(h)} = - softplus(gamma_h) * (r_{ij} / delta_eff)
+                       + kappa_h * cos(2 * theta_{ij})
+                       - softplus(alpha_h) * ln(1 + r_{ij})
+    where:
+        theta_{ij} = atan2(Delta y_{ij}, Delta x_{ij})
+        cos(2*theta_{ij}) reflects dipolar field perturbation symmetry
+    """
+    def __init__(
+        self,
+        num_heads: int = 4,
+        init_gamma: float = 1.0,
+        init_alpha: float = 0.5,
+        init_kappa: float = 0.2,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        inv_softplus_gamma = math.log(math.exp(init_gamma) - 1.0) if init_gamma > 0 else 0.0
+        inv_softplus_alpha = math.log(math.exp(init_alpha) - 1.0) if init_alpha > 0 else 0.0
+        self.gamma_raw = nn.Parameter(torch.full((num_heads,), inv_softplus_gamma, dtype=torch.float32))
+        self.alpha_raw = nn.Parameter(torch.full((num_heads,), inv_softplus_alpha, dtype=torch.float32))
+        self.kappa = nn.Parameter(torch.full((num_heads,), init_kappa, dtype=torch.float32))
+
+    def forward(
+        self,
+        dist_r: torch.Tensor,       # [B, N_tgt, N_ctx]
+        delta_eff: torch.Tensor,    # [B, 1, 1]
+        delta_r: torch.Tensor,      # [B, N_tgt, N_ctx, 2]
+    ) -> torch.Tensor:
+        theta = torch.atan2(delta_r[..., 1], delta_r[..., 0])  # [B, N_tgt, N_ctx]
+
+        gamma = F.softplus(self.gamma_raw).view(1, self.num_heads, 1, 1)
+        alpha = F.softplus(self.alpha_raw).view(1, self.num_heads, 1, 1)
+        kappa = self.kappa.view(1, self.num_heads, 1, 1)
+
+        dist_exp = dist_r.unsqueeze(1)  # [B, 1, N_tgt, N_ctx]
+        delta_exp = delta_eff.unsqueeze(1)  # [B, 1, 1, 1]
+        theta_exp = theta.unsqueeze(1)  # [B, 1, N_tgt, N_ctx]
+
+        decay_term = - gamma * (dist_exp / delta_exp.clamp(min=1e-3))
+        dipole_term = kappa * torch.cos(2.0 * theta_exp)
+        geom_term = - alpha * torch.log(1.0 + dist_exp)
+
+        bias = decay_term + dipole_term + geom_term
+        return bias  # [B, num_heads, N_tgt, N_ctx]
+
+
+class DipolarScatteringPredictor5x5(nn.Module):
+    """
+    Dipolar Scattering World Model Predictor (EXP-37 Stage 4):
+    Co-designed with HarmonicIsometricContextEncoder5x5.
+
+    Key Innovations:
+      1. Analytical Helmholtz Carrier Propagator: Computes the continuous nominal
+         incident carrier field H_carrier analytically from visible boundary context tokens.
+         Eliminates the dead-weight base_head collapse (norm 0.152 -> 0) observed in EXP-35.
+      2. Dipolar Scattering Cross-Attention Bias: Injects Maxwell dipolar perturbation physics
+         (-gamma * r/delta + kappa * cos(2*theta) - alpha * ln(1+r)) into cross-attention.
+      3. Dedicated Flaw Scattering Head: 100% of predictor capacity focuses on predicting
+         the localized scattering disturbance Delta H_scat.
+      4. Full-Rank Output: H_pred = H_carrier + Delta H_scat.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        depth: int = 2,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        spatial_topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
+        grid_size: int = 5,
+        r_coil_ref: float = 3.0,
+        diffusion_gamma_init: float = 1.0,
+        diffusion_alpha_init: float = 0.5,
+        dipolar_kappa_init: float = 0.2,
+        relative_perturbation_target: bool = True,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.relative_perturbation_target = relative_perturbation_target
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        self.carrier_propagator = AnalyticalHelmholtzCarrierPropagator(r_coil_ref=r_coil_ref)
+        self.dipolar_bias = DipolarAttentionBias(
+            num_heads=num_heads,
+            init_gamma=diffusion_gamma_init,
+            init_alpha=diffusion_alpha_init,
+            init_kappa=dipolar_kappa_init,
+        )
+
+        self.blocks = nn.ModuleList([
+            PredictorBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+            )
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # Dedicated Scattering Head (100% capacity)
+        self.scattering_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        # Residual head alias for downstream inspection and compatibility
+        self.residual_head = self.scattering_head
+
+        # Spatial coordinates buffer [25, 2] in mm
+        offsets = get_spatial_topology_offsets(
+            topology=spatial_topology, star_radii=star_radii, grid_size=grid_size
+        )
+        self.register_buffer("coords_25", torch.from_numpy(offsets).float(), persistent=False)
+
+        # Cached monitoring stats
+        self.last_h_base: Optional[torch.Tensor] = None
+        self.last_delta_pred: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        H_context: torch.Tensor,
+        target_pos: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+        freq_condition: Optional[torch.Tensor] = None,
+        diffusion_operator: Optional[torch.Tensor] = None,
+        return_residual: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        B, N_tgt, D = target_pos.shape
+        device = target_pos.device
+
+        # Resolve probe coordinates
+        if context_indices is not None and target_indices is not None and hasattr(self, "coords_25"):
+            coords = self.coords_25.to(device)
+            c_idx = torch.clamp(context_indices.long(), 0, coords.shape[0] - 1)
+            t_idx = torch.clamp(target_indices.long(), 0, coords.shape[0] - 1)
+            pos_tgt = coords[t_idx]  # [B, N_tgt, 2]
+            pos_ctx = coords[c_idx]  # [B, N_ctx, 2]
+        else:
+            # Default fallback: 9 core target probes, 16 outer context probes
+            coords = self.coords_25.to(device) if hasattr(self, "coords_25") else torch.zeros(25, 2, device=device)
+            default_tgt_idx = torch.tensor([6, 7, 8, 11, 12, 13, 16, 17, 18], device=device).unsqueeze(0).expand(B, -1)
+            default_ctx_idx = torch.tensor([0, 1, 2, 3, 4, 5, 9, 10, 14, 15, 19, 20, 21, 22, 23, 24], device=device).unsqueeze(0).expand(B, -1)
+            pos_tgt = coords[default_tgt_idx]
+            pos_ctx = coords[default_ctx_idx]
+
+        # 1. Analytical Helmholtz Carrier Propagation
+        H_carrier, dist_r, delta_eff, delta_r = self.carrier_propagator(
+            pos_tgt=pos_tgt,
+            pos_ctx=pos_ctx,
+            H_context=H_context,
+            freq_val=freq_condition,
+        )  # H_carrier: [B, N_tgt, D]
+
+        # 2. Maxwell Dipolar Scattering Cross-Attention Bias
+        attn_bias = self.dipolar_bias(
+            dist_r=dist_r,
+            delta_eff=delta_eff,
+            delta_r=delta_r,
+        )  # [B, num_heads, N_tgt, N_ctx]
+
+        # 3. Target Query Formulation: initial carrier + query prior + spatial position
+        queries = H_carrier + self.mask_token.expand(B, N_tgt, -1) + target_pos
+
+        # 4. Predictor Transformer Refinement
+        q = queries
+        for blk in self.blocks:
+            q = blk(target_queries=q, H_context=H_context, attn_bias=attn_bias)
+        q = self.norm(q)
+
+        # 5. Dedicated Flaw Scattering Output
+        delta_pred = self.scattering_head(q)  # [B, N_tgt, D]
+
+        if self.relative_perturbation_target:
+            h_carrier_base = H_carrier - H_context.mean(dim=1, keepdim=True)
+        else:
+            h_carrier_base = H_carrier
+
+        H_pred = h_carrier_base + delta_pred
+
+        self.last_h_base = h_carrier_base
+        self.last_delta_pred = delta_pred
+
+        if return_residual:
+            return H_pred, delta_pred, h_carrier_base
+        return H_pred
+
+
 def build_predictor_5x5(config) -> nn.Module:
     """
     Factory function to construct Predictor based on config.
     Defaults to ContinuousHelmholtzPredictor5x5 or ResidualDiffusionPredictor5x5.
     """
-    predictor_type = getattr(config, "predictor_type", "freq_conditioned_diffusion")
+    predictor_type = getattr(config, "predictor_type", "dipolar_scattering")
     spatial_topology = getattr(config, "spatial_topology", "concentric_star")
     star_radii = getattr(config, "star_radii", (1, 3, 7))
 
-    if predictor_type in ("freq_conditioned_diffusion", "frequency_conditioned_diffusion", "frequency_diffusion"):
+    if predictor_type in ("dipolar_scattering", "dipolar", "dipolar_diffusion"):
+        return DipolarScatteringPredictor5x5(
+            embed_dim=config.embed_dim,
+            depth=config.predictor_depth,
+            num_heads=config.predictor_heads,
+            mlp_ratio=config.mlp_ratio,
+            dropout=config.dropout,
+            spatial_topology=spatial_topology,
+            star_radii=star_radii,
+            grid_size=config.grid_size,
+            r_coil_ref=getattr(config, "r_coil_ref", 3.0),
+            diffusion_gamma_init=getattr(config, "diffusion_gamma_init", 1.0),
+            diffusion_alpha_init=getattr(config, "diffusion_alpha_init", 0.5),
+            dipolar_kappa_init=getattr(config, "dipolar_kappa_init", 0.2),
+            relative_perturbation_target=getattr(config, "relative_perturbation_target", True),
+        )
+    elif predictor_type in ("freq_conditioned_diffusion", "frequency_conditioned_diffusion", "frequency_diffusion"):
         return FrequencyConditionedDiffusionPredictor5x5(
             embed_dim=config.embed_dim,
             depth=config.predictor_depth,

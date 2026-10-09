@@ -7,13 +7,19 @@ from .tokenizer_5x5 import (
     SpatiotemporalPatchTokenizer5x5,
     build_tokenizer_5x5,
 )
-from .context_encoder import ContextEncoder5x5, DispersionConditionedContextEncoder5x5, build_context_encoder_5x5
+from .context_encoder import (
+    ContextEncoder5x5,
+    DispersionConditionedContextEncoder5x5,
+    HarmonicIsometricContextEncoder5x5,
+    build_context_encoder_5x5,
+)
 from .target_encoder import TargetEncoder5x5
 from .predictor import (
     Predictor5x5,
     OperatorDiffusionPredictor5x5,
     ParabolicDiffusionPredictor5x5,
     ResidualDiffusionPredictor5x5,
+    DipolarScatteringPredictor5x5,
     build_predictor_5x5,
 )
 from .jepa_5x5 import PECT_JEPA_5x5
@@ -28,12 +34,14 @@ __all__ = [
     "build_tokenizer_5x5",
     "ContextEncoder5x5",
     "DispersionConditionedContextEncoder5x5",
+    "HarmonicIsometricContextEncoder5x5",
     "build_context_encoder_5x5",
     "TargetEncoder5x5",
     "Predictor5x5",
     "OperatorDiffusionPredictor5x5",
     "ParabolicDiffusionPredictor5x5",
     "ResidualDiffusionPredictor5x5",
+    "DipolarScatteringPredictor5x5",
     "build_predictor_5x5",
     "PECT_JEPA_5x5",
 ]

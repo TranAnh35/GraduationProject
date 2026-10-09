@@ -60,10 +60,10 @@ class Spatiotemporal5x5Config:
     spatial_calibration: bool = True    # EXP-29: Zero-center full C-scan features by spatial median to eliminate 10x sensor/waveform DC drift
     embed_dim: int = 64                 # D (64 provides optimal capacity for 1.46M samples/epoch, 4 heads with dk=16)
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
-    encoder_type: str = "standard" # 'standard' (EXP-35 accepted baseline) | 'dispersion_conditioned' (EXP-36 rejected)
+    encoder_type: str = "standard" # 'standard' (EXP-35 accepted baseline) | 'harmonic_isometric' (EXP-37 Stage 3) | 'dispersion_conditioned' (EXP-36 rejected)
     encoder_depth: int = 4
     encoder_heads: int = 4
-    predictor_type: str = "continuous_helmholtz" # 'continuous_helmholtz' (EXP-18/19: 3D Continuous Helmholtz Diffusion World Model) | 'operator_diffusion'
+    predictor_type: str = "continuous_helmholtz" # 'continuous_helmholtz' | 'freq_conditioned_diffusion' | 'dipolar_scattering' (EXP-37 Stage 4)
     predictor_depth: int = 2
     predictor_heads: int = 4
     diffusion_gamma_init: float = 1.0   # Spatial diffusion attenuation rate gamma for Green's attention bias
@@ -73,6 +73,8 @@ class Spatiotemporal5x5Config:
     diffusion_alpha_y_init: float = 1.0 # EXP-20: Lateral Y anisotropy init
     diffusion_d_scale_init: float = 1.5 # EXP-18/19: Physical depth scale init in mm for continuous 3D Helmholtz kernel
     diffusion_d_scale_min: float = 1.0  # EXP-19: Physical depth scale lower bound in mm (prevents shortcut collapse)
+    r_coil_ref: float = 3.0             # EXP-37: Characteristic coil reference radius in mm
+    dipolar_kappa_init: float = 0.2     # EXP-37: Initial dipolar cross-attention coupling coefficient kappa
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     use_target_ema: bool = False        # False: Unified Single Encoder + Stop-Gradient Target (SimSiam/VICReg); True: Legacy EMA Target Encoder

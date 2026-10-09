@@ -131,14 +131,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Minimum target L2 norm of representations (default: 1.0)")
     p.add_argument("--subspace_perturbation_weight", type=float, default=1.0,
                    help="Latent Subspace Residual Perturbation Loss weight (EXP-22, default: 1.0)")
-    p.add_argument("--tokenizer_type", type=str, default="continuous_linear_field",
+    p.add_argument("--tokenizer_type", type=str, default="energy_adaptive_dual_domain",
                    choices=["energy_adaptive_dual_domain", "energy_adaptive_field", "adaptive_dual_domain", "continuous_linear_field", "continuous_linear", "continuous_field", "waveform_agnostic_field", "uncrushed_diffusion", "snr_tapered_diffusion", "dual_scale_diffusion", "dual_domain_attention", "spatio_spectral", "skin_depth", "spatiotemporal_patch", "st_patch", "continuous_stf", "continuous_filterbank", "dual_domain", "time_only", "spatial_grid"],
-                   help="Tokenizer architecture: 'energy_adaptive_dual_domain' (EXP-35: Energy-Adaptive Dual-Domain Tokenizer), 'continuous_linear_field' (EXP-28/34), etc.")
+                   help="Tokenizer architecture: 'energy_adaptive_dual_domain' (EXP-35: Energy-Adaptive Dual-Domain Tokenizer, default), 'continuous_linear_field' (EXP-28/34), etc.")
     p.add_argument("--num_scales", type=int, default=4,
                    help="Number of physical skin-depth scales for spatio_spectral tokenizer (default: 4)")
-    p.add_argument("--masker_type", type=str, default="auto",
+    p.add_argument("--masker_type", type=str, default="radial_diffusion",
                    choices=["auto", "radial_diffusion", "radial_inward", "complementary_st", "spatiotemporal_diffusion", "contiguous_cluster"],
-                   help="Masker strategy: 'radial_diffusion' (EXP-34: Physics-Grounded Radial Diffusion Masker), 'auto', 'contiguous_cluster', etc.")
+                   help="Masker strategy: 'radial_diffusion' (EXP-34: Physics-Grounded Radial Diffusion Masker, default), 'auto', 'contiguous_cluster', etc.")
     p.add_argument("--radial_mask_mode", type=str, default="inward_core",
                    choices=["inward_core", "inward_center", "ring_stratified"],
                    help="Radial diffusion mask mode: 'inward_core' (Core 9 probes target, Ring 2+3 context, default) or 'inward_center'")
@@ -147,8 +147,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cst_mask_mode", type=str, default="cluster", choices=["cluster", "surface_to_bulk", "surface_to_depth", "causal", "random"],
                    help="Masking partition mode: 'cluster' (EXP-19 symmetric dual-cluster, default), 'surface_to_bulk', 'surface_to_depth', 'causal', or 'random'")
     p.add_argument("--predictor_type", type=str, default="freq_conditioned_diffusion",
-                   choices=["freq_conditioned_diffusion", "frequency_conditioned_diffusion", "neural_field_subspace", "subspace_field_operator", "anisotropic_diffusion", "continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
-                   help="Predictor architecture: 'freq_conditioned_diffusion' (EXP-28: Frequency-Conditioned Diffusion World Model, default), 'neural_field_subspace', etc.")
+                   choices=["freq_conditioned_diffusion", "frequency_conditioned_diffusion", "dipolar_scattering", "dipolar", "dipolar_diffusion", "neural_field_subspace", "subspace_field_operator", "anisotropic_diffusion", "continuous_helmholtz", "operator_diffusion", "standard", "residual_diffusion", "residual", "parabolic_diffusion"],
+                   help="Predictor architecture: 'dipolar_scattering' (EXP-37: Co-Designed Dipolar World Model), 'freq_conditioned_diffusion' (EXP-28/35), etc.")
     p.add_argument("--use_target_ema", type=lambda v: v.lower() == "true", default=False,
                    help="Use EMA target encoder (default: False for Single Shared Encoder + Stop-Gradient Target)")
     p.add_argument("--adaptive_disturbance_weight", type=float, default=0.0,
@@ -159,6 +159,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Initial spatial diffusion attenuation coefficient gamma for Green's attention bias (default: 1.0)")
     p.add_argument("--diffusion_alpha_init", type=float, default=0.5,
                    help="Initial geometric dispersion scale alpha for Parabolic Green's attention bias (default: 0.5)")
+    p.add_argument("--dipolar_kappa_init", type=float, default=0.2,
+                   help="Initial dipolar cross-attention coupling coefficient kappa for Dipolar Predictor (EXP-37, default: 0.2)")
+    p.add_argument("--r_coil_ref", type=float, default=3.0,
+                   help="Characteristic coil reference radius in mm (EXP-37, default: 3.0)")
     p.add_argument("--diffusion_beta_init", type=float, default=0.5,
                    help="Initial cross-scale vertical diffusion barrier beta for legacy operator diffusion (default: 0.5)")
     p.add_argument("--diffusion_alpha_x_init", type=float, default=1.0,
@@ -194,8 +198,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
     p.add_argument("--embed_dim", type=int, default=64, help="Latent embedding dimension D (default: 64)")
     p.add_argument("--encoder_type", type=str, default="standard",
-                   choices=["standard", "dispersion_conditioned", "vit"],
-                   help="Context Encoder architecture: 'standard' (EXP-35 baseline) or 'dispersion_conditioned' (EXP-36)")
+                   choices=["standard", "harmonic_isometric", "dispersion_conditioned", "vit"],
+                   help="Context Encoder architecture: 'standard' (EXP-35 baseline), 'harmonic_isometric' (EXP-37 Stage 3), or 'dispersion_conditioned' (EXP-36)")
     p.add_argument("--encoder_depth", type=int, default=4, help="Context/Target encoder Transformer depth")
     p.add_argument("--predictor_depth", type=int, default=2, help="Predictor Transformer depth")
     p.add_argument("--use_radial_attention_bias", type=lambda v: v.lower() == "true", default=True,
@@ -330,6 +334,7 @@ def main():
         lowpass_cutoff=args.lowpass_cutoff,
         lowpass_order=args.lowpass_order,
         embed_dim=args.embed_dim,
+        encoder_type=args.encoder_type,
         encoder_depth=args.encoder_depth,
         use_target_ema=args.use_target_ema,
         use_radial_attention_bias=args.use_radial_attention_bias,
@@ -344,6 +349,8 @@ def main():
         warmup_epochs=args.warmup_epochs,
         predictor_type=args.predictor_type,
         predictor_depth=args.predictor_depth,
+        r_coil_ref=args.r_coil_ref,
+        dipolar_kappa_init=args.dipolar_kappa_init,
         diffusion_gamma_init=args.diffusion_gamma_init,
         diffusion_alpha_init=args.diffusion_alpha_init,
         diffusion_beta_init=args.diffusion_beta_init,
