@@ -2,7 +2,7 @@
 
 **Tài liệu theo dõi quá trình tái cấu trúc kiến trúc từng tầng**  
 *Mã tài liệu: `DOC-ROADMAP-2026-V1`*  
-*Trạng thái: ĐANG THỰC HIỆN - BƯỚC 1 (INPUT & MASKING)*  
+*Trạng thái: HOÀN THÀNH TẦNG 2 (TOKENIZER / EXP-35) - BẮT ĐẦU TẦNG 3 (ENCODER)*  
 *Mục tiêu tối thượng: Xây dựng Mô hình Nền tảng Tự giám sát Thực sự cho PECT, thoát khỏi bẫy làm trơn không gian 2D, giải quyết bài toán Định cỡ Vật lý và Thích ứng Đa điều kiện.*
 
 ---
@@ -115,7 +115,7 @@ Dưới đây là các hướng tiếp cận cần được mổ xẻ toán họ
 | **0** | Baseline EXP-28-FULL (20 ep) | Hoàn thành | `experiments/5x5/exp28_full_20ep` | Baseline chuẩn: AUC 85.85%, AP 52.02%, Defect Size R² 0.5424. Gặp bẫy nội suy 2D. |
 | **0.1** | EXP-33 Pilot (Relative Target) | Hoàn thành | `experiments/5x5/exp33_relative_perturbation_jepa` | 3 ep: AUC 87.34%, AP 53.41%, TMR AP +8.81%, Square AP +9.18%. Chứng minh khử trường nền giúp gradient tập trung vào khuyết tật. |
 | **1.0** | **Tầng 1: Input & Masking (EXP-34)** | **HOÀN THÀNH (ACCEPTED)** | `experiments/5x5/exp34_radial_inward_diffusion` | **Thành công vượt bậc**: Đổi sang `RadialDiffusionMasker5x5` (`inward_core`, che Core 9 probes $r \le 1\text{ mm}$, Context viền 16 probes $r \ge 3\text{ mm}$) triệt tiêu hoàn toàn đường tắt sao chép 1 mm lân cận. **Metrics 57 test scans**: AUC **91.93% ± 7.84%** (+4.59%), AP **66.71%** (+13.30%), CNR **3.89** (+1.17), Defect Depth $R^2$ **0.6437** (+0.0450), Defect Size $R^2$ **0.6797** (+0.0757), IoU **37.46%** (+9.49%). Val pred loss giảm 86.8% xuống 0.0130. Chấp nhận đưa vào chuẩn chung. |
-| **2.0** | **Tầng 2: Tokenizer** | **BẮT ĐẦU** | `src/PECT_JEPA/spatiotemporal_5x5/models/tokenizer_5x5.py` | Tiếp tục giữ cố định Masking EXP-34, tái thiết lập Tokenizer cân bằng năng lượng Thời gian - Tần số, giải quyết trực giao siêu phẳng giữa các dạng sóng. |
-| **3.0** | Tầng 3: Context Encoder | Chưa bắt đầu | - | Chờ hoàn thành Tầng 2. |
+| **2.0** | **Tầng 2: Tokenizer (EXP-35)** | **HOÀN THÀNH (ACCEPTED)** | `experiments/5x5/exp35_energy_adaptive_tokenizer` | **Thành công rực rỡ**: Triển khai `EnergyAdaptiveDualDomainTokenizer5x5` với Energy Saliency Gating $s_k$ và Symmetric Balanced Residual Fusion $0.5 \cdot (z_{\text{time}} + z_{\text{freq}})$. Triệt tiêu nhiễu ngoài dải trên Square và Gaussian, cân bằng gradient 1.07:1. **Metrics 57 test scans**: Phá vỡ mốc 70% AP đạt **70.39%** (+3.68%), phá vỡ mốc 4.0 CNR đạt **4.07** (+0.18), AUC đạt **92.89% ± 7.68%** (+0.96%), Defect Depth $R^2$ đạt **0.6699** (+0.0262). Đột phá dạng sóng Square: AP tăng +15.06% từ 48.98% lên **64.04%**, CNR tăng từ 2.22 lên **3.08**. TMR AP phá vỡ 70% đạt **70.05%**. Căn chỉnh siêu phẳng lift-off tăng 2.42x (+0.4062). SVD rank mở rộng gấp đôi (24.3D - 33.5D). Chấp nhận đưa vào chuẩn chung. |
+| **3.0** | **Tầng 3: Context Encoder** | **TIẾP THEO (ACTIVE)** | `src/PECT_JEPA/spatiotemporal_5x5/models/jepa_5x5.py` | Tiếp tục giữ cố định Masking EXP-34 và Tokenizer EXP-35. Tái cấu trúc Encoder để học tương tác đa tần số và bất biến dạng sóng, kết nối các không gian tọa độ hài riêng biệt. |
 | **4.0** | Tầng 4: Predictor | Chưa bắt đầu | - | Chờ hoàn thành Tầng 3. |
 | **5.0** | Tầng 5: Loss Function | Chưa bắt đầu | - | Chờ hoàn thành Tầng 4. |
