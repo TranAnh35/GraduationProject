@@ -193,9 +193,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ema_momentum_end", type=float, default=0.999,
                    help="Target encoder final EMA momentum cap (default: 0.999; never 1.0 to keep targets dynamic)")
     p.add_argument("--embed_dim", type=int, default=64, help="Latent embedding dimension D (default: 64)")
-    p.add_argument("--encoder_type", type=str, default="dispersion_conditioned",
-                   choices=["dispersion_conditioned", "standard", "vit"],
-                   help="Context Encoder architecture: 'dispersion_conditioned' (EXP-36: Harmonic Dispersion Conditioned Context Encoder) or 'standard'")
+    p.add_argument("--encoder_type", type=str, default="standard",
+                   choices=["standard", "dispersion_conditioned", "vit"],
+                   help="Context Encoder architecture: 'standard' (EXP-35 baseline) or 'dispersion_conditioned' (EXP-36)")
     p.add_argument("--encoder_depth", type=int, default=4, help="Context/Target encoder Transformer depth")
     p.add_argument("--predictor_depth", type=int, default=2, help="Predictor Transformer depth")
     p.add_argument("--use_radial_attention_bias", type=lambda v: v.lower() == "true", default=True,

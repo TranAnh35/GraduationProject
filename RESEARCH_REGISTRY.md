@@ -51,6 +51,9 @@ This document permanently tracks all completed, rejected, and active research hy
 | **EXP-PILOT-PHASE2** | Pilot Phase 2 Benchmark on EXP-28 Baseline | `scripts/run_pilot_phase2_benchmark.py` | 20 ep (eval) | HallAir: AUC 81.8% (Lin 79.0%) \| TMR: AUC 84.3% (Lin 92.5%) \| HallPot: AUC 83.8% (Lin 91.5%) | **Evaluated / Not Detected** | First evaluation under v1.0-RC1 protocol with 40+16 independent sham grid. G2 (stripe) passed cleanly (R² < 0.002). G-N1 failed on all 3 scans (R²_pos 80-97%), proving uncalibrated latent error is confounded by 2D background plate gradient. Ridge regression on 24 outer probes outperformed JEPA on TMR and HallPot (Δ_s < 0, 95% CI [-0.15, -0.025]). Concluded: NOT DETECTED. |
 | **EXP-33** | Relative Perturbation Target JEPA ($\Delta H_{\text{tgt}} = H_{\text{tgt}} - H_{\text{base}}$) | `configs/config.py`: `relative_perturbation_target=True` + `models/jepa_5x5.py` | 3 ep (pilot) | AUC: 87.34% ± 9.91% (+1.49%) \| AP: 53.41% (+1.39%) \| Size R²: 0.6040 (+0.0616) \| Two-NN: 15.26D \| TMR AP: 55.07% (+8.81%) \| Square AP: 51.67% (+9.18%) | **Accepted SOTA Benchmark** | Directly addresses carrier dominance (5.5V) and 2D spatial tilt confounding by training predictor to estimate relative flaw perturbation ΔH against surround context mean H_base. Across all 57 held-out test scans, outperformed 20-epoch EXP-28 baseline in just 3 epochs (+1.49% AUC, +1.39% AP, +0.0616 Size R²). Massive surges on high-sensitivity TMR sensor (+8.81% AP) and Square pulses (+9.18% AP). |
 | **EXP-34** | Radial Inward Diffusion Masking (Stage 1 Re-foundation) | `masking/radial_mask.py`: `RadialDiffusionMasker5x5` (`inward_core`) | 3 ep (pilot) | AUC: 91.93% ± 7.84% (+4.59%) \| AP: 66.71% (+13.30%) \| CNR: 3.89 (+1.17) \| Depth R²: 0.6437 (+0.0450) \| Size R²: 0.6797 (+0.0757) \| IoU: 37.46% (+9.49%) \| Dice: 51.82% (+11.06%) \| Two-NN: 9.3D | **Accepted SOTA Benchmark** | First model to break 90% AUC (91.93%) and 65% AP (66.71%) across all 57 compound OOD test scans. Eliminates 1 mm adjacent pixel copying and 2D spatial interpolation by masking Core 9 probes (r <= 1mm) and conditioning on Outer 16 boundary probes (r >= 3mm). Val pred loss dropped to 0.0130 (-86.8%). SOTA across all 3 sensors (Hall Pot AP 76.5%, Hall Air AP 63.9%, TMR AP 62.9%) and Chirp AP 76.7%. Stage 1 successfully accepted. |
+| **EXP-35** | Energy-Adaptive Dual-Domain Tokenizer (Stage 2 Re-foundation) | `tokenizer_5x5.py`: `EnergyAdaptiveDualDomainTokenizer5x5` | 3 ep (pilot) | AUC: 92.89% ± 7.68% (+0.96%) \| AP: 70.39% (+3.68%) \| CNR: 4.07 (+0.18) \| Depth R²: 0.6699 (+0.0262) \| Square AP: 64.04% (+15.06%) \| TMR AP: 70.05% (+7.18%) \| Lift-Off Cos: +0.6913 (+0.4062) \| SVD Rank: 24.3D - 33.5D | **Accepted SOTA Benchmark** | Grounded breakthrough resolving spectral noise contamination. Energy saliency gating s_k zeroes inactive harmonic noise (>500x); balanced residual highway 0.5*(z_time + z_freq) equalizes gradient contribution (1.07:1). Breaks 70% AP (70.39%) and 4.0 CNR (4.07) across all 57 test scans. Square AP surges +15.06% (48.98% -> 64.04%) and CNR surges +38.7% (2.22 -> 3.08). Lift-off decision boundary alignment surges 2.42x (+0.4062). Stage 2 successfully accepted. |
+| **EXP-36** | Harmonic Dispersion Conditioned Context Encoder (Stage 3 Re-foundation) | `context_encoder.py`: `DispersionConditionedContextEncoder5x5` (AdaLN + Skin-Depth Bias) | 3 ep (pilot) | AUC: 87.43% ± 10.12% (-5.46%) \| AP: 54.53% (-15.86%) \| CNR: 2.70 (-1.37) \| Depth R²: 0.5637 (-0.1062) \| Square AP: 35.14% (-28.90%) \| SVD Rank: 1.4D - 1.9D (Catastrophic Collapse) | **Rejected** | Catastrophic downstream regression across all 57 test scans (Mean AP dropped 70.39% -> 54.53%, Square AP crashed 64.04% -> 35.14%, Square CNR halved 3.08 -> 1.46). Deep latent autopsy revealed SVD effective rank collapsed from ~25-33D down to 1.4D-1.9D because AdaLN learned a degenerate shortcut: exploding 1-2 dimensions to satisfy VICReg variance hinge while zeroing the rest. Square attention spread uniformly due to low omega bar (0.105), washing out localized flaw gradients. EXP-36 permanently rejected; standard Pre-LN Transformer Context Encoder retained. |
+
 
 
 
@@ -1609,3 +1612,75 @@ This document permanently tracks all completed, rejected, and active research hy
 - **Stage 2 Conclusion**:
   - `EnergyAdaptiveDualDomainTokenizer5x5` is **ACCEPTED** as the new standard tokenizer for PECT-JEPA.
   - Stage 2 of the systematic re-foundation protocol is officially completed. Proceeding directly to Stage 3 (Encoder).
+
+### EXP-36: Harmonic Dispersion Conditioned Context Encoder (Stage 3 Re-foundation Pilot)
+- **Run Directory**: `experiments/5x5/exp36_dispersion_conditioned_encoder`
+- **Configuration**:
+  - Masking: `RadialDiffusionMasker5x5` (`inward_core`, Core 9 target, Outer 16 context) — Stage 1 Accepted.
+  - Tokenizer: `EnergyAdaptiveDualDomainTokenizer5x5` ($s_k$ saliency gating, symmetric 50/50 highway) — Stage 2 Accepted.
+  - Context Encoder: `DispersionConditionedContextEncoder5x5` (4 layers, 4 heads, $D=64$, AdaLN modulation conditioned on $\sqrt{\bar{\omega}}$ + `AnisotropicSkinDepthAttentionBias` $\xi_{ij}^2 = (\alpha_x \Delta x^2 + \alpha_y \Delta y^2) \cdot \bar{\omega}$).
+  - Predictor: `ContinuousHelmholtzPredictor5x5` (Stage 0 baseline).
+  - Loss: Relative Target JEPA + In-Scan Centered VICReg ($\text{var\_weight}=1.0, \text{cov\_weight}=1.0$).
+- **Hypothesis**:
+  - Conditioning the Context Encoder on characteristic excitation frequency $\sqrt{\bar{\omega}}$ via AdaLN and scaling attention receptive field by skin depth $\delta(\bar{\omega}) \propto 1/\sqrt{\bar{\omega}}$ would rotate and align representation manifolds across disparate waveforms, eliminating cross-waveform latent orthogonality.
+- **Controlled 3-Epoch Pretraining Trajectory**:
+  - Epoch 1: `train_loss = 0.9080`, `val_loss_pred = 0.0886`, `Two-NN = 3.12D`, `time = 621.5s`
+  - Epoch 2 (Best Checkpoint): `train_loss = 0.6385`, `val_loss_pred = 0.0331`, `Two-NN = 2.59D`, `time = 540.2s`
+  - Epoch 3: `train_loss = 0.5898`, `val_loss = 0.5813`, `val_loss_pred = 0.0345`, `Two-NN = 2.45D`, `time = 535.8s`
+- **Comprehensive Multi-Metric Benchmark Across ALL 57 Held-Out Test Scans**:
+  - **Supervised Linear Probe (Severe Degradation)**:
+    - Mean AUC-ROC: **87.43% ± 10.12%** (vs 92.89% ± 7.68% in EXP-35, **-5.46% regression**).
+    - Mean AP: **54.53%** (vs 70.39% in EXP-35, **-15.86% absolute collapse**).
+    - Mean CNR: **2.70** (vs 4.07 in EXP-35, **-1.37 collapse**, -33.6% relative drop).
+    - Mean IoU (Jaccard): **24.36%** (vs 39.03% in EXP-35, **-14.67% collapse**).
+    - Mean Dice F1: **36.86%** (vs 53.80% in EXP-35, **-16.94% collapse**).
+  - **Defect Sizing (Conditional $y > 0$)**:
+    - Defect Depth $R^2$: **0.5637** (vs 0.6699 in EXP-35, **-0.1062 regression**).
+    - Plate Depth MAE: **0.1068 mm** (106.8 μm).
+    - Defect Flaw Size $R^2$: **0.5891** (vs 0.6573 in EXP-35, **-0.0682 regression**).
+  - **Unsupervised Anomaly Detection**:
+    - Mean Mahalanobis AUC: **55.70%** (vs 56.11% in EXP-35).
+    - Mean Mahalanobis AP: **2.47%** (vs 3.04% in EXP-35).
+  - **Zero-Shot Cross-File OOD Transfer**:
+    - Mean AUC-ROC: **49.55%** (vs 53.32% in EXP-35, regressed to random guessing ~0.50).
+- **Multi-Slice Disaggregation Matrix (57 Files)**:
+  - **Square Waveform Catastrophic Drop**:
+    - Square AUC: **79.97%** (vs 91.27% in EXP-35, **-11.30% absolute crash**, lost the 90% threshold).
+    - Square AP: **35.14%** (vs 64.04% in EXP-35, **-28.90% absolute collapse**, nearly halved!).
+    - Square CNR: **1.46** (vs 3.08 in EXP-35, **-1.62 drop**, -52.6% relative collapse).
+    - Square IoU: **12.55%** (vs 31.26% in EXP-35, **-18.71% drop**).
+    - Square Depth $R^2$: **0.5031** (vs 0.6054 in EXP-35, **-0.1023 regression**).
+  - **Chirp Waveform**:
+    - Chirp AUC: **89.56%** (vs 94.44%, -4.88%).
+    - Chirp AP: **59.93%** (vs 75.13%, -15.20%).
+    - Chirp CNR: **2.97** (vs 4.76, -1.79).
+    - Chirp Depth $R^2$: **0.5781** (vs 0.7139, -0.1358).
+  - **Gaussian Waveform**:
+    - Gaussian AUC: **91.04%** (vs 91.71%, -0.67%).
+    - Gaussian AP: **64.20%** (vs 68.23%, -4.03%).
+    - Gaussian CNR: **3.46** (vs 3.84, -0.38).
+    - Gaussian Depth $R^2$: **0.5904** (vs 0.6551, -0.0647).
+  - **Sensors**:
+    - `TMR` (Held-Out Hardware): AUC = **89.18%** (vs 93.09%, -3.91%), AP = **57.57%** (vs 70.05%, **-12.48% collapse**), CNR = **3.06** (vs 4.04, -0.98).
+    - `Hall_Pot_Core`: AUC = **87.60%** (vs 96.10%, **-8.50%**), AP = **57.57%** (vs 79.52%, **-21.95% collapse**), CNR = **2.62** (vs 4.61, -1.99).
+    - `Hall_Air_Core`: AUC = **84.09%** (vs 89.31%, -5.22%), AP = **46.03%** (vs 61.89%, **-15.86%**), CNR = **2.16** (vs 3.01, -0.85).
+  - **Lift-off Levels**:
+    - `z1` (0.5 mm): AUC = 92.30% (-3.48%), AP = 68.06% (-11.62%), CNR = 3.77 (-1.51).
+    - `z2` (1.0 mm): AUC = 89.97% (-3.68%), AP = 59.10% (-13.05%), CNR = 2.91 (-1.28).
+    - `z3` (2.0 mm, Severe Lift-off): AUC = **83.31%** (vs 90.85%, **-7.54%**), AP = **44.48%** (vs 64.26%, **-19.78% collapse**), CNR = **2.00** (vs 3.33, -1.33).
+- **Causal Latent-Space Autopsy (The Mechanistic Root Cause of Collapse)**:
+  1. **Catastrophic SVD Effective Rank Collapse ($R_{\text{eff}} \sim 1.5\text{D}$)**:
+     - EXP-35: Chirp $z_1 = 24.26\text{D}$, Chirp $z_3 = 33.79\text{D}$, Gauss $z_3 = 20.31\text{D}$, Square $z_3 = 18.88\text{D}$.
+     - EXP-36: Chirp $z_1 = \mathbf{1.62\text{D}}$, Chirp $z_3 = \mathbf{1.68\text{D}}$, Gauss $z_3 = \mathbf{1.98\text{D}}$, Square $z_3 = \mathbf{1.43\text{D}}$.
+     - *Mechanistic Cause*: Characteristic frequency $\bar{\omega}$ is a single global scalar per patch ($5\times 5$). The AdaLN affine generator $\text{MLP}(\sqrt{\bar{\omega}}) \to (\gamma, \beta) \in \mathbb{R}^{2D}$ offered a degenerate optimization shortcut: it satisfied the VICReg coordinate-wise variance hinge ($\text{std}_d \ge 1.0$) by simply inflating $\gamma_d$ along 1 to 2 coordinates across batches while zeroing out or suppressing the remaining 62 coordinates. The representation space collapsed from a rich 25-33D physical manifold down to a trivial 1.5D line!
+  2. **Harmonic Centroid Drift & Half-Space Inversion**:
+     - Cosine similarity between Gauss and Chirp sound-metal centroids flipped from $+0.3701$ (EXP-35) down to **$-0.7358$** (EXP-36), segregating them into opposing half-spaces.
+     - Defect-to-sound Signal-to-Clutter Ratio (SCR) for Gaussian $z_3$ dropped from 1.16 down to **0.10**, drowning flaw perturbations entirely in sound-metal noise.
+  3. **Anisotropic Attention Kernel Span Distortion**:
+     - $\xi_{ij}^2 = \Delta r^2 \cdot \bar{\omega}$. For Square pulses ($\bar{\omega} = 0.105$), the attenuation penalty was 3.5x weaker than Chirp ($\bar{\omega} = 0.344$). As a result, Square attention spread uniformly across all 25 probes without spatial locality, washing out localized flaw gradients and triggering the catastrophic -28.9% AP crash.
+- **Stage 3 Verdict**:
+  - **PERMANENTLY REJECT EXP-36 Context Encoder AdaLN Dispersion Conditioning**.
+  - Retain `ContextEncoder5x5` (Standard Pre-LN Transformer with Euclidean radial attention bias) as the Stage 3 baseline.
+  - Stage 3 closed. The code default `encoder_type="standard"` is restored.
+  - Proceed directly to **Stage 4: Predictor (World Model)**.
+
