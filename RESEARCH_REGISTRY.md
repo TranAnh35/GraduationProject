@@ -1936,74 +1936,81 @@ This document permanently tracks all completed, rejected, and active research hy
 
 ### EXP-41: Autonomous Dual-Domain Tokenizer & Pre-Registration Phase 1 Foundation
 - **Run Directory**: `experiments/5x5/exp41_autonomous_dual_domain`
-- **Pre-Registration Phase 1 Invariants**:
-  - Resolves two critical architectural failures identified during peer review:
-    1. **Flat Corrosion Blindness**: EXP-40's $x_{\text{ref}} = \operatorname{median}(x_{\text{grid}})$ subtracted the 25-probe median across the local $14\text{ mm}$ window. On $40 \times 40\text{ mm}$ flaws, all 25 probes sit inside the defect, causing $x_{\text{grid}} \approx x_{\text{ref}} \implies \Delta x \to 0, \Delta \hat{Z} \to 0$, blinding the model to plate thickness reduction at the flaw center.
-    2. **Software Differential Probing Violation**: Subtracting probe signals within the grid acts as a software differential coil/Laplacian filter, violating Invariant 3.
+- **Pre-Registration Phase 1 Architectural Audits**:
+  - **CAD Mask Geometry Verification**:
+    - Measured via Euclidean distance transform on ground-truth CAD masks: `Corrosion` flaw radii are $\le 5.0\text{ mm}$ (diameters $2\text{--}10\text{ mm}$), max distance from boundary is $5.10\text{ mm}$. Pixels with distance $\ge 7.0\text{ mm}$ from flaw boundary: **0 (0.00%)**.
+    - For an array radius of $7.0\text{ mm}$, the outer ring always resides in sound metal. The prior hypothesis that 25 probes were submerged inside a $40 \times 40\text{ mm}$ flaw was disproven by CAD geometry.
+    - True algorithmic rationale for removing local median subtraction: Autonomous single-probe tokenization eliminates artificial spatial filtering/pseudo-differential probing, preserving absolute transient field dynamics and multi-frequency phase delay across sweeps.
   - **Modular Implementation**:
     - `AutonomousDualDomainTokenizer5x5` in `src/PECT_JEPA/spatiotemporal_5x5/models/tokenizer_5x5.py`.
     - Every probe is processed autonomously: instance-normalized 1D temporal shape, absolute envelope, physical transient anchors ($t_p, V_{pp}, E_{\text{time}}$), uncrushed 14-harmonic Fourier decomposition, energy saliency gating $s(f)$, dual-polarity phase ($\theta, |\theta|$), and continuous spectral moments.
     - Decoupled condition calibration: Unsupervised Scan-Level Calibration (Mode M1) implemented in `src/PECT_JEPA/spatiotemporal_5x5/evaluation/calibration.py`, strictly separating global plate reference extraction from local probe tokenization.
-- **Empirical Validation Gates**:
-  - **Uniform Flaw Response Test**: Simulating a $40 \times 40\text{ mm}$ uniform corroded plate vs sound metal plate:
-    - EXP-40: $\|\Delta Z\| = 3.1516$, Cosine Similarity $= 0.9969$ (severe blindness).
-    - EXP-41 Autonomous: $\|\Delta Z\| = 20.6374$, Cosine Similarity $= 0.8669$.
-    - Contrast Gain: **6.55x** increase in flaw discriminability!
-  - **Validation Gate C5 (Position-Only under Spatial Block CV)**:
-    - Target: $\text{AUC} \in [0.45, 0.55]$.
-    - Measured: Corrosion $= 0.5192$, Rivet_v1 $= 0.5304$, Mixed $= 0.5523$ (Mean $= \mathbf{0.5340}$).
-    - **Gate Status: VERIFIED PASS**.
-- **Optimization & Status**:
+- **Validation Gate C5 (Position-Only under Spatial Block CV)**:
+  - Target: $\text{AUC} \in [0.45, 0.55]$.
+  - Measured: Corrosion $= 0.5192$, Rivet_v1 $= 0.5304$, Mixed $= 0.5523$ (Mean $= \mathbf{0.5340}$).
+  - *Gate Audit*: Passed on Corrosion and Rivet_v1; marginal upper-bound breach on Mixed ($0.5523 > 0.5500$) due to periodic fastener layout.
+- **Training Protocol & Baseline Equivalence**:
   - Single Shared Transformer Encoder (64D, 4L, 4H, Pre-LN) + Dipolar Scattering Predictor + Inward Core Radial Diffusion Masking.
-  - 3-epoch pilot ablation (Seed 42) completed:
-    - Epoch 1: Train Loss 1.0333 (Pred 0.1071) | Val Pred 0.2055 | Two-NN 11.7D | LiftOff-Sim 0.92
-    - Epoch 2: Train Loss 0.8184 (Pred 0.1012) | Val Pred 0.0609 | Two-NN 15.6D | LiftOff-Sim 0.97
-    - Epoch 3: Train Loss 0.6937 (Pred 0.0601) | Val Pred 0.0345 | Two-NN 10.6D | LiftOff-Sim 0.96
-- **Downstream Master Benchmark (57 Held-Out Test Files)**:
-  - Within-File Aggregate: AUC = **93.12% ± 7.23%**, AP = **70.63%**, CNR = **4.12**, IoU = **40.00%**, Dice = **54.53%**.
-  - Defect Depth Regression: Defect-Only $R^2 = \mathbf{0.6679}$ (MAE $= \mathbf{0.1063\text{ mm}}$), Flaw Size $R^2 = \mathbf{0.6536}$.
-  - Flat Corrosion Recovery on `Corrosion`: Defect-Only Depth $R^2 = \mathbf{0.9080}$ (MAE $= \mathbf{0.0931\text{ mm}}$, $93.1\,\mu\text{m}$ precision, recovered from broken $-63.18$ baseline), AUC = **91.08%**, AP = **68.96%**, CNR = **3.34**. Conclusively proves flat corrosion blindness is solved!
+  - Pretrained on identical 20 files, 4 val, 57 held-out test, exactly 3 epochs (identical protocol and data split to EXP-40, making EXP-40 an exact controlled T0 baseline with local median vs EXP-41 T1 autonomous).
 - **Fastener Confounding Forensic Audit on Specimen `Mixed` (19 Held-Out Test Files)**:
   - Object-level discrimination (25 corroded vs 6 clean rivets):
     - EXP-41 JEPA: **$71.19\% \pm 14.35\%$**
     - Random Untrained Encoder (C1, Seed 999): **$71.54\% \pm 13.07\%$**
     - Raw Energy RMS (C4): **$64.53\% \pm 10.71\%$**
-  - Forensic Conclusion: Confirms Ground-Truth Finding 2; JEPA latent features achieve statistical parity with Random Encoder on fastener geometry without condition adaptation.
-- **Pre-Registration Baseline C7 (Predictor Error Audit)**:
-  - Smooth L1 on independent validation set:
-    - Zero Prediction ($H_{\text{pred}} = 0$): $0.174825$
-    - Static Dataset Mean ($H_{\text{pred}} = \bar{\Delta H}$): $0.147504$
-    - Trained EXP-41 JEPA Predictor: $\mathbf{0.001292}$
-    - Random Untrained Model Predictor: $0.052345$
-  - Relative Error Reduction: $\mathbf{+99.26\%}$ vs Zero, $\mathbf{+99.12\%}$ vs Static Mean ($40\times$ superior to random).
-- **Pre-Registration Phase 1 Master Benchmark (Tasks G1, G2, G3 across Modes M0, M1, M2)**:
-  - **Task G1 (In-Condition Anomaly Detection)**:
-    - JEPA M1: Mean AUC $= 55.57\%$, Mean AP $= 2.00\%$
-    - C1 (Random Enc): Mean AUC $= 54.42\%$, Mean AP $= 1.79\%$
-    - C4 (Raw Energy RMS): Mean AUC $= 62.29\%$, Mean AP $= 2.70\%$
-  - **Task G2 (Cross-Sensor 3-Fold LOSO: Air ↔ Pot ↔ TMR)**:
-    - Mode M0 (Zero-Shot Direct Transfer): JEPA AP $= 2.14\%$ vs C1 $= 2.20\%$ vs C4 $= 1.80\%$
-    - Mode M1 (Unsupervised Self-Calibration): JEPA AP $= 2.55\%$ vs C1 $= 2.27\%$ vs C4 $= 2.70\%$
+  - Confirms Ground-Truth Finding 2: JEPA latent features achieve statistical parity with Random Encoder on fastener geometry without condition adaptation.
+- **Predictor Error Forensic Audit (Contrast Ratio & Residual Anomaly)**:
+  - Predictor Smooth L1 loss: Sound metal $= 0.002070$, Defect $= 0.002081$.
+  - Defect / Sound Contrast Ratio: $\mathbf{1.005\times \approx 1.01\times}$.
+  - The -99% loss drop reflects smooth-metal spatial interpolation shortcut, not Helmholtz scattering learning.
+  - Predictor Residual Anomaly Detection ($s = \|\hat{H}_{\text{pred}} - H_{\text{tgt}}\|_2$):
+    - Corrosion: AUC $= 65.85\%$, AP $= \mathbf{2.41\%}$ (Prevalence: $1.24\%$) vs Raw RMS: AP $= 1.06\%$.
+    - Rivet_v1: AUC $= 84.15\%$, AP $= \mathbf{18.78\%}$ (Prevalence: $0.75\%$) vs Raw RMS: AP $= 1.55\%$.
+    - Mixed: AUC $= 58.14\%$, AP $= \mathbf{3.38\%}$ (Prevalence: $2.89\%$) vs Raw RMS: AP $= 5.73\%$.
+- **Strictly Disjoint Phase 1 Master Benchmark (Tasks G1, G2, G3 across Modes M0, M1, M2)**:
+  - *Task G1 (In-Condition Zero-Shot Mahalanobis Anomaly Detection)*:
+    - JEPA M1: Mean AUC $= 55.57\%$, Mean AP $= \mathbf{2.00\%}$
+    - C1 (Random Enc): Mean AUC $= 54.42\%$, Mean AP $= 2.05\%$
+    - C4 (Raw Energy RMS): Mean AUC $= 62.29\%$, Mean AP $= \mathbf{2.70\%}$
+    - *Status*: FAILED. Latent Mahalanobis distance fails to beat raw signal RMS due to scanner drift.
+  - *Task G2 (Cross-Sensor 3-Fold LOSO: Air ↔ Pot ↔ TMR; Strictly Disjoint Support vs Eval)*:
+    - Mode M0 (Zero-Shot Direct Transfer):
+      - JEPA: Pixel AP $2.82\% \pm 2.42\%$, Obj AP $6.50\% \pm 3.95\%$
+      - C1 (Random Enc): Pixel AP $1.77\% \pm 1.26\%$, Obj AP $5.57\% \pm 2.21\%$
+      - C4 (Raw Energy RMS): Pixel AP $\mathbf{5.59\% \pm 8.70\%}$, Obj AP $\mathbf{13.69\% \pm 12.99\%}$
+    - Mode M1 (Unsupervised Self-Calibration):
+      - JEPA: Pixel AP $2.72\% \pm 2.32\%$, Obj AP $6.30\% \pm 2.51\%$
+      - C1 (Random Enc): Pixel AP $2.71\% \pm 2.15$, Obj AP $6.48\% \pm 2.25\%$
+      - C4 (Raw Energy RMS): Pixel AP $\mathbf{5.62\% \pm 8.92\%}$, Obj AP $\mathbf{14.30\% \pm 14.35\%}$
     - Mode M2 (Few-Shot Supervised Calibration, $K=3$ Flaw Objects):
-      - JEPA: $\mathbf{12.41\% \pm 14.21\%}$
-      - C1 (Random Enc): $6.72\% \pm 8.25\%$
-      - C2 (Tokenizer Output): $1.74\% \pm 1.05\%$
-      - C3 (PCA-64 Waveforms): $1.83\% \pm 2.70\%$
-      - C4 (Raw Energy RMS): $1.31\% \pm 0.94\%$
-      - $\Delta \text{AP}_{\text{JEPA vs Best Base}} = \mathbf{+5.69\%} \ge 0.05$
-      - 95% Paired Bootstrap CI: $[\mathbf{+0.74\%}, \mathbf{+12.29\%}]$ (**GATE STATUS: PASSED**)
-  - **Task G3 (Cross-Lift-Off 3-Fold: $z_1, z_2, z_3$)**:
-    - Mode M0: JEPA AP $= 2.75\%$ vs C1 $= 4.20\%$ vs C4 $= 2.70\%$
-    - Mode M1: JEPA AP $= 4.18\%$ vs C1 $= 4.20\%$ vs C4 $= 2.70\%$
+      - JEPA: Pixel AP $3.51\% \pm 6.90\%$, Obj AP $9.49\% \pm 13.51\%$
+      - C1 (Random Enc): Pixel AP $\mathbf{4.76\% \pm 8.54\%}$, Obj AP $\mathbf{9.59\% \pm 13.12\%}$
+      - C2 (Tokenizer Output): Pixel AP $1.81\% \pm 1.43\%$, Obj AP $5.61\% \pm 2.59\%$
+      - C3 (PCA-128 Waveforms): Pixel AP $2.25\% \pm 1.90\%$, Obj AP $6.06\% \pm 4.91\%$
+      - C4 (Raw Energy RMS): Pixel AP $\mathbf{6.25\% \pm 7.58\%}$, Obj AP $\mathbf{11.28\% \pm 7.69\%}$
+      - $\Delta\text{AP}_{\text{JEPA vs Best Base}} = -0.10\%$ vs C1, $-1.79\%$ vs C4.
+      - **GATE STATUS: NOT MET / FAILED**.
+  - *Task G3 (Cross-Lift-Off 3-Fold: $z_1, z_2, z_3$; Strictly Disjoint Support vs Eval)*:
+    - Mode M0 (Zero-Shot Direct Transfer):
+      - JEPA: Pixel AP $6.78\% \pm 8.33\%$, Obj AP $9.66\% \pm 10.58\%$
+      - C1 (Random Enc): Pixel AP $7.08\% \pm 10.08\%$, Obj AP $9.69\% \pm 10.56\%$
+      - C4 (Raw Energy RMS): Pixel AP $\mathbf{6.89\% \pm 10.75\%}$, Obj AP $\mathbf{16.58\% \pm 14.31\%}$
+    - Mode M1 (Unsupervised Self-Calibration):
+      - JEPA: Pixel AP $6.23\% \pm 6.53\%$, Obj AP $9.79\% \pm 4.47\%$
+      - C1 (Random Enc): Pixel AP $\mathbf{7.53\% \pm 9.03\%}$, Obj AP $11.36\% \pm 9.92\%$
+      - C4 (Raw Energy RMS): Pixel AP $7.27\% \pm 10.94\%$, Obj AP $\mathbf{17.69\% \pm 15.32\%}$
     - Mode M2 (Few-Shot Supervised Calibration, $K=3$ Flaw Objects):
-      - JEPA: $\mathbf{12.41\% \pm 14.21\%}$
-      - C1 (Random Enc): $6.72\% \pm 8.25\%$
-      - $\Delta \text{AP}_{\text{JEPA vs Best Base}} = \mathbf{+5.69\%} \ge 0.05$
-      - 95% Paired Bootstrap CI: $[\mathbf{+0.71\%}, \mathbf{+12.51\%}]$ (**GATE STATUS: PASSED**)
-- **Comprehensive Scientific Takeaways**:
-  1. The pre-registration value criterion is **officially satisfied** on Tasks G2 and G3 under Adaptation Mode M2 ($K=3$ defects). JEPA representations deliver double the precision of untrained representations ($12.41\%$ vs $6.72\%$, $p < 0.05$) and almost $10\times$ the precision of raw signals ($1.31\%$).
-  2. Pure unsupervised zero-centering (Mode M1) without defect supervision is insufficient to lift uncalibrated representations above raw RMS noise floors due to the extreme 98.8% sound-metal imbalance.
-  3. Ground-truth peer-review findings (fastener confounding parity with random encoder and spatial leakage containment) are 100% verified and reproducible.
+      - JEPA: Pixel AP $2.49\% \pm 3.17\%$, Obj AP $4.96\% \pm 1.33\%$
+      - C1 (Random Enc): Pixel AP $3.00\% \pm 5.73\%$, Obj AP $4.76\% \pm 0.02\%$
+      - C2 (Tokenizer Output): Pixel AP $1.73\% \pm 0.95\%$, Obj AP $5.40\% \pm 2.55\%$
+      - C3 (PCA-128 Waveforms): Pixel AP $1.58\% \pm 0.89\%$, Obj AP $4.76\% \pm 0.00\%$
+      - C4 (Raw Energy RMS): Pixel AP $\mathbf{4.75\% \pm 6.48\%}$, Obj AP $\mathbf{12.54\% \pm 15.50\%}$
+      - $\Delta\text{AP}_{\text{JEPA vs C1}} = +0.20\%$, vs C4 $= -7.58\%$.
+      - **GATE STATUS: NOT MET / FAILED**.
+- **Comprehensive Forensic Scientific Takeaways**:
+  1. The previously reported $12.41\%$ M2 performance was an artifact of within-file few-shot sampling across the 57 test files, not cross-condition adaptation. Under strict out-of-file hold-out protocol, G2 and G3 yield distinct results, neither of which meets the pre-registration value margin ($\Delta\text{AP} \ge 5.0\%$).
+  2. In cross-domain transfer without extensive supervised target calibration, raw signal energy RMS remains more robust than 128D latent representations, which suffer from cross-condition sensor transfer function drift.
+  3. Predictor error reduction (-99%) is an interpolation effect on smooth sound metal, not defect scattering learning.
+
 
 
 
