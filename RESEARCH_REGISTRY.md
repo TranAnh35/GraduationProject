@@ -58,7 +58,7 @@ This document permanently tracks all completed, rejected, and active research hy
 | **EXP-38** | Self-Calibrated Impedance Deconvolution Tokenizer (Dodd-Deeds Sensor Invariance) | `tokenizer_5x5.py`: `ImpedanceDeconvolutionTokenizer5x5` | 3 ep (pilot) | Val Zero-Shot AUC: 86.76% (+19.87%) \| Val Zero-Shot AP: 11.35% (2.7x) \| Val CNR: 1.78 (4.0x) \| Test TMR AUC: 64.71% (+9.27%) \| Test Zero-Shot Depth R²: -0.5313 (vs -63.18, 100x err reduction) \| Test Within-File AUC: 93.40% \| Test Within-File AP: 71.92% | **Accepted SOTA Benchmark** | Grounded physics breakthrough: Dodd-Deeds spectral impedance deconvolution $\Delta \hat{Z}(f) = \Delta \hat{V}(f) / \hat{V}_{\text{sound}}(f)$ intrinsically cancels coil transfer function $T(f)$ and excitation waveform $I(f)$ across disparate hardware. Surged Zero-Shot Val AUC from 66.89% to 86.76%, Zero-Shot CNR from 0.44 to 1.78, and IoU from 3.11% to 11.40%. For the first time, successfully transfers to held-out TMR sensor in Zero-Shot (AUC 64.71%, Depth R² error reduced 155x from -133.58 to -0.86). Within-File Test AP also increased to project-record 71.92% (CNR 4.86). |
 | **EXP-39** | Cross-File Manifold Alignment Regularization ($\mathcal{L}_{\text{cross\_align}}$ Variance Matching) | `losses/jepa_loss.py`: `cross_file_manifold_alignment_loss` (`weight=0.5`) | 3 ep (pilot) | Val Zero-Shot AUC: 73.97% (+7.08%) \| Test Zero-Shot AUC: 57.20% (-1.53%) \| Test Zero-Shot AP: 3.01% (-0.25%) \| Test Within-File AUC: 92.15% (-1.05%) \| Test Within-File AP: 67.82% (-2.77%) \| Test TMR Zero-Shot AUC: 50.89% | **Evaluated / Regressed** | Batch-level coordinate variance alignment across disparate training files yielded moderate in-domain transfer gain (Val Zero-Shot AUC 66.89% -> 73.97%), but failed on held-out compound OOD test (AUC regressed to 57.20%, TMR zero-shot collapsed to 50.89%). Imposing global variance matching penalizes legitimate physical contrast differences between flaw geometries, creating negative interference that degraded Within-File AP from 70.59% down to 67.82%. Fails to resolve sensor transfer function $T(f)$ on unseen hardware. |
 | **EXP-40** | Energy-Stabilized Deconvolution Tokenizer (Tikhonov Regularization Floor & Dual-Polarity Envelopes) | `tokenizer_5x5.py`: `EnergyStabilizedDeconvTokenizer5x5` | 3 ep (pilot) | Test Zero-Shot AUC: 61.01% (New Peak, +2.28% vs Base) \| Val Zero-Shot AUC: 87.25% (+20.36%) \| Chirp Zero-Shot AUC: 57.74% (+6.54% recovery) \| Test Inverted Scans: 10/57 (vs 21/57 EXP-38) \| Lift-off z3 Zero-Shot AUC: 65.30% (+6.48%) \| Unsup Maha AUC: 71.32% \| Within-File Test AP: 71.01% (CNR: 4.74) | **Accepted SOTA Breakthrough** | Successfully cured the Chirp frequency division noise explosion and drastically reduced polarity inversion rate (inverted scans cut by >52% from 21 down to 10; inverted Chirp scans dropped from 18 to 5). Chirp Zero-Shot AUC surged from 51.20% to 57.74% (CNR 3.4x from 0.14 to 0.47). Established project-record Test Zero-Shot AUC of 61.01% across all 57 held-out files and 65.30% on z3 lift-off, while maintaining Val Zero-Shot AUC at 87.25% (IoU 12.17%, Dice 21.36%) and Within-File Test AP at 71.01% (CNR 4.74). |
-| **EXP-41** | Autonomous Dual-Domain Tokenizer & Pre-registration Phase 1 Foundation | `tokenizer_5x5.py`: `AutonomousDualDomainTokenizer5x5` + `evaluation/calibration.py` | 3 ep (pilot) | Within-File Test AUC: 93.12% ± 7.23% \| AP: 70.63% \| CNR: 4.12 \| Defect Depth R²: 0.6679 (Corrosion R²: 0.9080, 93.1 um) \| G2/G3 M2 Few-Shot Value Gate: ΔAP = +5.69% (95% CI: [+0.74%, +12.29%], PASSED) | **Accepted Pre-Reg Foundation** | Resolves flat corrosion blindness and software differential probing violation. Processes 25 probes autonomously without local patch median subtraction; separates scan-level calibration (M1) from probe tokenization. Unit tests confirmed 6.55x contrast gain on uniform flaws. Baseline C5 under Spatial Block CV passed validation gate (mean AUC = 0.5340 in [0.45, 0.55]). Pre-registration Phase 1 value criterion officially satisfied on Tasks G2 & G3 under Mode M2 (Few-Shot K=3 defects, ΔAP = +5.69%, p < 0.05). |
+| **EXP-41** | Autonomous Dual-Domain Tokenizer & Pre-registration Phase 1 Foundation | `tokenizer_5x5.py`: `AutonomousDualDomainTokenizer5x5` + `evaluation/calibration.py` | 3 ep (pilot) | Within-File Test AUC: 93.12% ± 7.23% \| AP: 70.63% \| G2/G3 Strictly Disjoint Value Gate: NOT MET (ΔAP < 0, 95% CI contains 0) \| Predictor $R^2_{\text{pos}} = 99.93\%$ (Positional embedding artifact) | **Audited / Pre-Reg Halted (DEVIATION-01)** | Resolves flat corrosion blindness and software differential probing violation. However, deep forensic audit proved that: (1) M2 few-shot pass was an artifact of within-file leakage; under strictly disjoint hold-out target evaluation, JEPA does not outperform Random Encoder / Raw RMS; (2) Predictor loss drop (-99%) was 100% an architectural artifact of `pos_embed` ($R^2_{\text{pos}} = 99.93\%$, dropping to 0.02% without `pos_embed`), with static position lookup table beating trained predictor by 5.3x; (3) On `Mixed`, neither JEPA nor RMS discriminates clean vs corroded rivets (AUC ~45-52%). Full 81-file pretraining halted under DEVIATION-01 until objective reformulation passes pre-flight gates. |
 
 
 
@@ -2013,30 +2013,45 @@ This document permanently tracks all completed, rejected, and active research hy
 
 ---
 
-### DEVIATION-01: Degenerate Radial Position Bias in Relative Perturbation Target & Objective Reformulation
+### DEVIATION-01: Degenerate Architectural Position Bias in Relative Target & Pre-Registration Pre-Flight Gating
 - **Date**: 2026-10-11
 - **Status**: FORMALLY LOGGED (Pre-Registration Phase 1 Gate Audit)
 - **Luận điểm (Empirical Ground-Truth Finding)**:
-  - Mục tiêu dự đoán $\Delta H = H_{\text{tgt}} - H_{\text{base}}$ (trong đó $H_{\text{base}} = \text{mean}(H_{\text{ctx}})$) là một **mục tiêu suy biến hình học (geometrically degenerate target)**.
-  - Phép đo trực tiếp chứng minh: **$99.61\%$ phương sai của $\Delta H$ được giải thích thuần túy bởi chỉ số vị trí đầu dò $p$ (probe position index)**.
+  - Mục tiêu dự đoán $\Delta H = H_{\text{tgt}} - H_{\text{base}}$ là một **mục tiêu suy biến kiến trúc (architecturally degenerate target)**.
+  - Phép đo trực tiếp chứng minh: **$99.93\%$ phương sai của $\Delta H$ trong không gian biểu diễn đến từ `self.tokenizer.pos_embed`**. Khi tắt `pos_embed`, $R^2_{\text{pos}}$ sụp đổ về $0.02\%$. Bản thân tín hiệu vật lý thô có $R^2_{\text{pos}} = 0.03\%$. Mức giảm loss $99\%$ của Predictor trong quá trình huấn luyện hoàn toàn là học bảng tra tĩnh giữa các vector nhúng vị trí.
 - **Minh chứng giải phẫu định lượng (Quantitative Empirical Evidence)**:
-  1. *So sánh Smooth L1 Loss trên tập dữ liệu kiểm chứng*:
-     - Đoán bằng 0 ($H_{\text{pred}} = 0$): **$0.172836$**
-     - Đoán bằng Vector Trung bình Toàn cục ($\bar{\Delta H}_{\text{global}} \in \mathbb{R}^D$): **$0.145726$**
-     - **Đoán bằng Vector Trung bình theo Vị trí Đầu dò ($\bar{\Delta H}(p) \in \mathbb{R}^D$)**: **$\mathbf{0.000610}$** (giảm **$99.58\%$** sai số)
-     - Random Untrained Predictor (Seed 999): **$0.229668$**
-     - Trained EXP-41 Predictor: **$0.003249$**
-  2. *Hệ quả bản chất*: Trained Predictor có sai số ($0.003249$) thực tế **cao gấp $5.3\times$** so với một bảng tra tĩnh vector trung bình theo vị trí đầu dò ($0.000610$). Toàn bộ mức giảm loss $99\%$ của Predictor trong quá trình huấn luyện thực chất chỉ là học lại độ lệch hình học tĩnh giữa vành ngoài ($r=7\text{ mm}$) và lõi trong ($r=0, 1, 3\text{ mm}$), hoàn toàn không học tán xạ khuyết tật.
-  3. *Giải thích mâu thuẫn điểm Residual Anomaly Detection*:
-     - Trên `Corrosion` (ăn mòn phẳng, không đinh tán): Trained Predictor đạt AUC $65.85\%$ (AP $2.41\%$) trong khi Untrained Random Predictor đạt AUC **$63.87\%$** (AP $1.93\%$). Việc huấn luyện Predictor hầu như không bổ sung thêm năng lực phân biệt vật lý (+1.98% AUC).
-     - Trên `Rivet_v1`: Residual đạt AUC $84.15\%$ (AP $18.78\%$) vì $100\%$ đinh tán đều bị ăn mòn nhân tạo và đầu đinh tán tạo ra nhiễu loạn hình học cực lớn.
-     - Trên `Mixed` (gồm 25 đinh tán lỗi và 6 đinh tán sạch): Residual sụt giảm về AUC $58.14\%$ (AP $3.38\%$, sát tỷ lệ nền $2.89\%$), thua xa Raw RMS (AUC $68.40\%$, AP $5.73\%$).
-  4. *Bóc tách Specimen trên Tác vụ Chuyển miền G2/G3*:
-     - Raw Energy RMS vượt trội ở bảng tổng hợp là do ăn mòn đinh tán trên `Mixed` (Object AP của RMS đạt $20.39\text{--}26.37\%$, trong khi JEPA chỉ đạt $5.03\text{--}10.10\%$).
-     - Trên `Corrosion` độc lập: Cả JEPA và Random Encoder đều vượt Raw RMS (G3 M0: $13.42\%$ và $15.32\%$ vs $6.71\%$), nhưng JEPA không vượt được Random Encoder.
-- **Hành động & Quyết định Điều hành (Operational Decision)**:
-  - Tạm hoãn việc huấn luyện quy mô lớn Phase 1 (81 files $\times$ 20 epochs $\times$ 5 seeds) trên mục tiêu $\Delta H$ hiện tại để tránh lãng phí tài nguyên tính toán vào một bài toán đã được chứng minh là suy biến hình học.
-  - Tái cấu trúc mục tiêu JEPA trước khi huấn luyện: Thiết kế mục tiêu dự đoán loại bỏ thành phần độ lệch vị trí tĩnh (ví dụ: dự đoán độ trễ pha tán xạ đa tần Dodd-Deeds hoặc vi sai chuẩn hóa theo phương vị) sao cho mục tiêu có độ nhạy gradient thực sự trên khuyết tật.
+  1. *Phép kiểm Cắt bỏ Positional Embedding (`scratch/audit_peer_review_deep_followup.py`)*:
+     - Trained Model CÓ `pos_embed`: $R^2_{\text{pos}} = \mathbf{99.93\%}$ (Loss bảng tra vị trí: $0.000124$, Loss toàn cục: $0.155187$).
+     - Untrained Random Model (Seed 999) CÓ `pos_embed`: $R^2_{\text{pos}} = \mathbf{94.04\%}$ (Loss bảng tra vị trí: $0.000006$).
+     - Trained Model TẮT `pos_embed` (`pos_embed = 0`): $R^2_{\text{pos}} = \mathbf{0.02\%}$ (Loss bảng tra: $0.000001$).
+     - Untrained Random Model TẮT `pos_embed`: $R^2_{\text{pos}} = \mathbf{0.02\%}$.
+     - Raw Tokenizer dH (Trước Transformer Encoder): $R^2_{\text{pos}} = \mathbf{0.03\%}$.
+     - *Kết luận*: Bác bỏ hoàn toàn giả thuyết "trường vật lý suy giảm theo bán kính". Đây là 100% hiện tượng kiến trúc do tham số học được của positional embedding.
+  2. *So sánh Anomaly Detection: Predictor Residual $s_{\text{pred}}$ vs Bảng tra tĩnh thuần túy $s_{\text{table}}$*:
+     - `Corrosion`: $s_{\text{pred}}$ AUC $65.85\%$ (AP $2.41\%$) vs $s_{\text{table}}$ AUC $43.71\%$ (AP $1.06\%$).
+     - `Rivet_v1`: $s_{\text{pred}}$ AUC $84.15\%$ (AP $18.78\%$) vs $s_{\text{table}}$ AUC $67.36\%$ (AP $1.18\%$).
+     - `Mixed`: $s_{\text{pred}}$ AUC $58.14\%$ (AP $3.38\%$) vs $s_{\text{table}}$ AUC $\mathbf{60.07\%}$ (AP $\mathbf{3.60\%}$). Predictor residual kém hơn cả bảng tra tĩnh thuần túy không có mạng nơ-ron!
+  3. *Thất bại phân biệt Cấp Object trên `Mixed` (25 đinh tán ăn mòn vs 6 đinh tán sạch, N=155)*:
+     - Predictor Residual AUC (Corroded vs Clean): **$44.56\%$** (tệ hơn đoán ngẫu nhiên $50\%$).
+     - Static Table Residual AUC (Corroded vs Clean): **$47.35\%$** (ngẫu nhiên).
+     - Raw Energy RMS AUC (Corroded vs Clean): **$52.29\%$** (ngẫu nhiên).
+     - *Kết luận*: Cả JEPA lẫn RMS đều hoàn toàn mù trước ăn mòn quanh đinh tán. RMS đạt AP cao trên `Mixed` thuần túy vì phát hiện kim loại của đinh tán, không phải khuyết tật.
+  4. *Phân tích Shortcut Domain / File trên phần dư $\Delta H' = \Delta H - \bar{\Delta H}(p)$*:
+     - Phương sai giải thích bởi File ID: $R^2_{\text{file}} = 15.57\%$
+     - Phương sai giải thích bởi Loại cảm biến: $R^2_{\text{sensor}} = 15.44\%$
+     - Phương sai giải thích bởi Nhấc đầu dò: $R^2_{\text{liftoff}} = 13.40\%$
+  5. *Kiểm toán G2 / G3 Strictly Disjoint (Bootstrap CI 5,000 resamples)*:
+     - G2 M1: JEPA $6.51\%$ vs RMS $11.14\%$ ($\Delta\text{AP} = -4.63\%$, CI: $[-8.30\%, -1.44\%]$) -> **NOT MET**.
+     - G2 M2: JEPA $9.63\%$ vs RMS $10.53\%$ ($\Delta\text{AP} = -0.90\%$, CI: $[-4.50\%, +3.04\%]$) -> **NOT MET**.
+     - G3 M1: JEPA $11.82\%$ vs RMS $14.83\%$ ($\Delta\text{AP} = -3.01\%$, CI: $[-7.11\%, +0.98\%]$) -> **NOT MET**.
+     - G3 M2: JEPA $5.66\%$ vs RMS $10.88\%$ ($\Delta\text{AP} = -5.22\%$, CI: $[-9.24\%, -2.03\%]$) -> **NOT MET**.
+- **Hành động & Khung kiểm duyệt Tiền khởi động (Pre-flight Gating Protocol)**:
+  - Tạm hoãn việc huấn luyện quy mô lớn Phase 1 (81 files $\times$ 20 epochs $\times$ 5 seeds).
+  - Trước khi khởi động chạy lớn, mục tiêu mới bắt buộc phải vượt qua 4 cổng trên nhánh pilot (3 epochs, 20 files, 5 seeds):
+    * **G-Pre-1**: $R^2_{\text{pos}}(\Delta H_{\text{new}}) < 50.0\%$.
+    * **G-Pre-2**: $\mathcal{L}_{\text{trained}}(\hat{H}_{\text{pred}}) \le 0.50 \times \mathcal{L}_{\text{table}}(\bar{\Delta H}(p))$.
+    * **G-Pre-3**: $\text{AUC}_{\text{disc}}(\text{Corroded Rivet vs Clean Rivet}) \ge 75.0\%$.
+    * **G-Pre-4**: $\Delta\text{AP} \ge +5.0\%$ so với C1 (Random) và C4 (Raw RMS) trên Zero-shot OOD Transfer qua 5 seeds.
 
 
 
