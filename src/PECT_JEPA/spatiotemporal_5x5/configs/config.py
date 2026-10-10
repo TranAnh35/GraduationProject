@@ -58,6 +58,7 @@ class Spatiotemporal5x5Config:
     phase_noise_floor: float = 0.05     # Signal magnitude threshold for phase tapering
     adaptive_phase_floor: bool = True   # EXP-29: Scale SNR phase noise floor adaptively by mean harmonic magnitude
     spatial_calibration: bool = True    # EXP-29: Zero-center full C-scan features by spatial median to eliminate 10x sensor/waveform DC drift
+    tikhonov_gamma: float = 0.05        # EXP-40: Adaptive 5% peak excitation floor for Dodd-Deeds spectral deconvolution
     embed_dim: int = 64                 # D (64 provides optimal capacity for 1.46M samples/epoch, 4 heads with dk=16)
     pos_embed_type: str = "learnable_2d" # 'learnable_2d' | 'sinusoidal_2d'
     encoder_type: str = "standard" # 'standard' (EXP-35 accepted baseline) | 'harmonic_isometric' (EXP-37 Stage 3) | 'dispersion_conditioned' (EXP-36 rejected)

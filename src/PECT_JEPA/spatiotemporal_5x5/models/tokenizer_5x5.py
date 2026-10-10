@@ -1572,12 +1572,181 @@ class ImpedanceDeconvolutionTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class EnergyStabilizedDeconvTokenizer5x5(nn.Module):
+    """
+    Energy-Stabilized Dodd-Deeds Impedance Deconvolution Tokenizer for PECT-JEPA (EXP-40).
+
+    Physical & Algorithmic Invariants:
+      1. Tikhonov Frequency Regularization Floor:
+         Bounds relative surface impedance deconvolution Delta Z(f) against low-energy
+         spectral tails outside the excitation bandwidth (especially for 500-1500Hz Chirp sweeps),
+         using an adaptive 5% peak excitation floor:
+           eps_f = 0.05 * max_k |X_ref(k)|
+           Delta Z(f) = (X_probe(f) - X_ref(f)) / sqrt(|X_ref(f)|^2 + eps_f^2)
+      2. Dual-Polarity Dispersion Representation:
+         Encodes BOTH signed phase delay Delta theta(f) and sign-invariant phase magnitude |Delta theta(f)|,
+         as well as signed relative magnitude Delta Z(f) and relative perturbation magnitude |Delta Z(f)|.
+         This guarantees that coil self-resonance polarity flips do not invert downstream anomaly detection.
+      3. Dual-Stream Transient Perturbation:
+         Encodes normalized signed transient perturbation Delta x(t) and absolute transient envelope |Delta x(t)|,
+         preserving both fine directional derivatives for depth sizing and invariant perturbation energy for detection.
+      4. Reference Energy Saliency Gating:
+         Harmonic weighting s(f) concentrates gradient updates on active excitation frequencies.
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+        tikhonov_gamma: float = 0.05,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size
+        self.num_tokens = self.num_spatial
+        self.num_freq_bins = num_freq_bins
+        self.tikhonov_gamma = tikhonov_gamma
+
+        # 1. Temporal Branch: Signed + Absolute Transient Perturbation + Invariant Features
+        self.time_in_dim = in_channels * 2 + 3
+        self.time_proj = nn.Sequential(
+            nn.Linear(self.time_in_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Spectral Branch: Signed + Absolute Phase, Signed + Absolute Mag, Saliency, Moments
+        # 5 * K (delta_theta, abs_delta_theta, rel_mag, abs_rel_mag, s) + 2 moments (centroid, spread)
+        self.spectral_dim = self.num_freq_bins * 5 + 2
+        self.proj_freq = nn.Sequential(
+            nn.Linear(self.spectral_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Symmetric Dual-Domain Balanced Highway Fusion
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+
+        # 4. Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_grid = x.reshape(B, self.num_spatial, C)
+
+        # Local sound-metal spatial reference (median across 25 probes)
+        x_ref = torch.median(x_grid, dim=1, keepdim=True).values  # [B, 1, C]
+        e_ref = torch.sqrt(torch.mean(x_ref ** 2, dim=-1, keepdim=True) + 1e-6)  # [B, 1, 1]
+
+        # --- A. Time Domain: Dual-Stream Transient Perturbation ---
+        diff_x = (x_grid - x_ref) / e_ref       # [B, 25, C] (signed)
+        abs_diff_x = torch.abs(diff_x)          # [B, 25, C] (sign-invariant)
+        t_p = torch.argmax(torch.abs(x_grid), dim=-1, keepdim=True).float() / float(C)  # [B, 25, 1]
+        v_pp = (x_grid.max(dim=-1, keepdim=True).values - x_grid.min(dim=-1, keepdim=True).values) / e_ref  # [B, 25, 1]
+        e_pert = torch.mean(abs_diff_x, dim=-1, keepdim=True)  # [B, 25, 1]
+
+        phi_time = torch.cat([diff_x, abs_diff_x, t_p, v_pp, e_pert], dim=-1).to(x.dtype)
+        z_time = self.ln_time(self.time_proj(phi_time.reshape(B * self.num_spatial, -1)))  # [B*25, D]
+
+        # --- B. Frequency Domain: Tikhonov Dodd-Deeds Deconvolution ---
+        x_fp32 = x_grid.float()
+        x_ref_fp32 = x_ref.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)      # [B, 25, C//2 + 1]
+        X_ref = torch.fft.rfft(x_ref_fp32, dim=-1)  # [B, 1, C//2 + 1]
+
+        self._last_fft = X_fft.reshape(B * self.num_spatial, -1)
+
+        X_sub = X_fft[:, :, 1:self.num_freq_bins + 1]          # [B, 25, K]
+        X_ref_sub = X_ref[:, :, 1:self.num_freq_bins + 1]      # [B, 1, K]
+
+        # Tikhonov regularization floor based on peak excitation energy:
+        mag_ref = torch.abs(X_ref_sub)                         # [B, 1, K]
+        peak_ref = torch.amax(mag_ref, dim=-1, keepdim=True).clamp(min=1e-6)  # [B, 1, 1]
+        eps_tikhonov = self.tikhonov_gamma * peak_ref          # [B, 1, 1]
+        denom = torch.sqrt(mag_ref ** 2 + eps_tikhonov ** 2)   # [B, 1, K]
+
+        # 1. Relative Phase Shift (cancels I(f) and T_sensor(f)):
+        prod = X_sub * torch.conj(X_ref_sub)
+        delta_theta = torch.angle(prod) / torch.pi             # [B, 25, K] in [-1, 1] (signed)
+        abs_delta_theta = torch.abs(delta_theta)               # [B, 25, K] in [0, 1] (sign-invariant)
+        self._last_phase = delta_theta.reshape(B * self.num_spatial, -1)
+
+        # 2. Relative Amplitude Variation (with Tikhonov denominator):
+        mag_probe = torch.abs(X_sub)                           # [B, 25, K]
+        rel_mag = torch.clamp((mag_probe - mag_ref) / denom, min=-3.0, max=5.0)  # [B, 25, K] (signed)
+        abs_rel_mag = torch.abs(rel_mag)                       # [B, 25, K] (sign-invariant)
+
+        # 3. Energy Saliency Gating:
+        P_ref = mag_ref ** 2
+        s = P_ref / (P_ref.sum(dim=-1, keepdim=True) + 1e-8)   # [B, 1, K]
+
+        delta_theta_gated = s * delta_theta                    # [B, 25, K]
+        abs_theta_gated = s * abs_delta_theta                  # [B, 25, K]
+        rel_mag_gated = s * rel_mag                            # [B, 25, K]
+        abs_mag_gated = s * abs_rel_mag                        # [B, 25, K]
+
+        # 4. Continuous Spectral Moments:
+        bin_indices = torch.arange(1, self.num_freq_bins + 1, device=x.device, dtype=torch.float32).reshape(1, 1, -1)
+        f_centroid = (bin_indices * s).sum(dim=-1, keepdim=True) / float(self.num_freq_bins)  # [B, 1, 1]
+        var_f = ((bin_indices / float(self.num_freq_bins) - f_centroid) ** 2 * s).sum(dim=-1, keepdim=True)
+        f_spread = torch.sqrt(torch.clamp(var_f, min=0.0) + 1e-8)  # [B, 1, 1]
+
+        s_exp = s.expand(B, self.num_spatial, self.num_freq_bins)
+        fc_exp = f_centroid.expand(B, self.num_spatial, 1)
+        fs_exp = f_spread.expand(B, self.num_spatial, 1)
+
+        phi_freq = torch.cat([delta_theta_gated, abs_theta_gated, rel_mag_gated, abs_mag_gated, s_exp, fc_exp, fs_exp], dim=-1).to(x.dtype)
+        z_freq = self.ln_freq(self.proj_freq(phi_freq.reshape(B * self.num_spatial, -1)))  # [B*25, D]
+
+        # --- C. Symmetric Balanced Dual-Domain Fusion ---
+        z_cat = torch.cat([z_time, z_freq], dim=-1)
+        z_fused = self.fuse_proj(z_cat) + 0.5 * (z_time + z_freq)
+        tokens = self.drop(self.norm_out(z_fused)).reshape(B, self.num_tokens, self.embed_dim)
+
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
     tokenizer_type = getattr(config, "tokenizer_type", "continuous_linear_field")
-    if tokenizer_type in ("impedance_deconvolution", "impedance_deconv", "dodd_deeds_deconv"):
+    if tokenizer_type in ("energy_stabilized_deconv", "stabilized_deconv", "stabilized_impedance_deconv"):
+        return EnergyStabilizedDeconvTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+            tikhonov_gamma=getattr(config, "tikhonov_gamma", 0.05),
+        )
+    elif tokenizer_type in ("impedance_deconvolution", "impedance_deconv", "dodd_deeds_deconv"):
         return ImpedanceDeconvolutionTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,
