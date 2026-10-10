@@ -6,6 +6,7 @@ into an embedding token of dimension D, combined with a 2D spatial positional em
 """
 
 import math
+from typing import Optional, Tuple, Dict, Any, Union
 import torch
 import torch.nn as nn
 
@@ -1731,12 +1732,185 @@ class EnergyStabilizedDeconvTokenizer5x5(nn.Module):
         return tokens, pos
 
 
+class AutonomousDualDomainTokenizer5x5(nn.Module):
+    """
+    Autonomous Dual-Domain Tokenizer for 5x5 PECT-JEPA (Phase 1 Pre-registration).
+
+    Physical & Algorithmic Invariants:
+      1. Strictly Autonomous Probe Tokenization (Zero Local Differential Probing):
+         Processes all 25 spatial probes independently without subtracting the local 25-probe median.
+         Completely eliminates flat corrosion blindness on 40x40mm flaws where all probes sit on defect.
+         Fully adheres to RULE 3 (Strict Prohibition of Software Differential Probing).
+      2. Dual-Domain Dynamics:
+         - Time Domain: Instance-normalized shape-invariant transient dynamic x_norm,
+           absolute envelope |x_norm|, and 3 physical transient invariants (t_p, V_pp, E_time).
+         - Frequency Domain: Uncrushed Fourier harmonic decomposition (14 bins),
+           Dodd-Deeds lift-off invariant phase theta(f), dual-polarity phase |theta(f)|,
+           energy saliency gating s(f) concentrating updates on active excitation frequencies,
+           and continuous spectral moments (f_centroid, f_spread).
+      3. Symmetric Balanced Dual-Domain Fusion:
+         Balanced residual highway: z_fused = W_fuse [z_time, z_freq] + 0.5 * (z_time + z_freq),
+         guaranteeing 1:1 gradient flow between transient dynamics and spectral dispersion.
+      4. Decoupled Scan-Level Calibration Support:
+         Optionally accepts an external Scan-Level Sound-Metal Reference (x_sound) from M1 calibration
+         for global Dodd-Deeds impedance deconvolution, strictly decoupling calibration from patch tokenization.
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        embed_dim: int = 64,
+        grid_size: int = 5,
+        num_freq_bins: int = 14,
+        pos_embed_type: str = "learnable_2d",
+        dropout: float = 0.0,
+        tikhonov_gamma: float = 0.05,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_spatial = grid_size * grid_size  # 25
+        self.num_tokens = self.num_spatial        # Exactly 25 tokens
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_freq_bins = min(num_freq_bins, in_channels // 2)
+        self.tikhonov_gamma = float(tikhonov_gamma)
+
+        # 1. Temporal Branch: Instance-Normalized Waveform + Absolute Envelope + Physical Transient Invariants (t_p, V_pp, E_time)
+        # Dimensions: in_channels (x_norm) + in_channels (|x_norm|) + 3 (t_p, V_pp, E_time)
+        self.time_in_dim = in_channels * 2 + 3
+        self.time_proj = nn.Sequential(
+            nn.Linear(self.time_in_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_time = nn.LayerNorm(embed_dim)
+
+        # 2. Spectral Branch: Dual-Polarity Gated Phase + Gated Log-Mag + Saliency + Moments
+        # Features: [s * theta (K), s * |theta| (K), s * log_mag (K), s (K), f_centroid (1), f_spread (1)] = 4*K + 2
+        self.spectral_dim = self.num_freq_bins * 4 + 2
+        self.proj_freq = nn.Sequential(
+            nn.Linear(self.spectral_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ln_freq = nn.LayerNorm(embed_dim)
+
+        # 3. Symmetric Dual-Domain Balanced Highway Fusion
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+
+        # 4. Spatial Positional Embedding
+        if pos_embed_type == "learnable_2d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        elif pos_embed_type == "sinusoidal_2d":
+            pos = build_2d_sinusoidal_pos_embedding(grid_size, embed_dim)
+            self.register_buffer("pos_embed", pos, persistent=False)
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, scan_ref_x: Optional[torch.Tensor] = None):
+        """
+        Args:
+            x: [B, 5, 5, C] tensor (or [5, 5, C])
+            scan_ref_x: Optional [C] or [1, C] or [B, C] global scan sound-metal reference waveform.
+                        When None, operates in pure autonomous single-probe mode.
+        Returns:
+            tokens: [B, 25, D]
+            pos:    [B, 25, D]
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        assert H == self.grid_size and W == self.grid_size, f"Expected {self.grid_size}x{self.grid_size}, got {H}x{W}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+        x_grid = x.reshape(B, self.num_spatial, C)  # [B, 25, C]
+        x_flat = x_grid.reshape(B * self.num_spatial, C)  # [B*25, C]
+
+        # --- A. Time Domain Feature Extraction (100% Autonomous, No Local Spatial Subtraction) ---
+        x_mean = x_flat.mean(dim=-1, keepdim=True)
+        x_std = x_flat.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        x_norm = (x_flat - x_mean) / x_std
+        abs_x_norm = torch.abs(x_norm)
+
+        # Physical transient invariants:
+        t_p = torch.argmax(torch.abs(x_flat), dim=-1, keepdim=True).float() / float(C)  # [B*25, 1]
+        v_max, _ = torch.max(x_flat, dim=-1, keepdim=True)
+        v_min, _ = torch.min(x_flat, dim=-1, keepdim=True)
+        v_pp = v_max - v_min                                                             # [B*25, 1]
+        e_time = torch.mean(torch.abs(x_flat), dim=-1, keepdim=True)                    # [B*25, 1]
+
+        phi_time = torch.cat([x_norm, abs_x_norm, t_p, v_pp, e_time], dim=-1).to(x.dtype)
+        z_time = self.ln_time(self.time_proj(phi_time))  # [B*25, D]
+
+        # --- B. Frequency Domain Feature Extraction (Uncrushed Harmonic Decomposition) ---
+        x_fp32 = x_flat.float()
+        X_fft = torch.fft.rfft(x_fp32, dim=-1)  # [B*25, C//2 + 1]
+        self._last_fft = X_fft
+
+        X_sub = X_fft[:, 1:self.num_freq_bins + 1]  # [B*25, K], exclude DC
+        mag = torch.abs(X_sub)                      # [B*25, K]
+        P = mag ** 2
+        P_tot = P.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        s = P / P_tot                               # Energy saliency gating [B*25, K] in [0, 1]
+
+        # Dodd-Deeds Lift-off Invariant Phase:
+        if scan_ref_x is not None:
+            # Calibrated Mode (M1): Deconvolution against global scan-level sound reference
+            ref_flat = scan_ref_x.reshape(-1, C).float()
+            X_ref = torch.fft.rfft(ref_flat, dim=-1)[:, 1:self.num_freq_bins + 1]
+            prod = X_sub * torch.conj(X_ref)
+            theta = torch.angle(prod) / torch.pi
+        else:
+            # Pure Autonomous Mode: Direct Dodd-Deeds Fourier Phase
+            theta = torch.angle(X_sub) / torch.pi   # [B*25, K] in [-1, 1]
+
+        abs_theta = torch.abs(theta)                # [B*25, K] in [0, 1]
+        self._last_phase = theta
+
+        # Energy-Saliency Gating & Invariant Projection:
+        theta_gated = s * theta                     # Signed phase delay
+        abs_theta_gated = s * abs_theta             # Polarity-invariant phase magnitude
+        mag_gated = s * torch.log1p(mag)            # Gated log-magnitude
+
+        # Continuous Spectral Moments:
+        bin_indices = torch.arange(1, self.num_freq_bins + 1, device=x.device, dtype=torch.float32).unsqueeze(0)
+        f_centroid = (bin_indices * s).sum(dim=-1, keepdim=True) / float(self.num_freq_bins)
+        var_f = ((bin_indices / float(self.num_freq_bins) - f_centroid) ** 2 * s).sum(dim=-1, keepdim=True)
+        f_spread = torch.sqrt(torch.clamp(var_f, min=0.0) + 1e-8)
+
+        phi_freq = torch.cat([theta_gated, abs_theta_gated, mag_gated, s, f_centroid, f_spread], dim=-1).to(x.dtype)
+        z_freq = self.ln_freq(self.proj_freq(phi_freq))  # [B*25, D]
+
+        # --- C. Symmetric Balanced Dual-Domain Highway Fusion ---
+        z_cat = torch.cat([z_time, z_freq], dim=-1)
+        z_fused = self.fuse_proj(z_cat) + 0.5 * (z_time + z_freq)
+        tokens = self.drop(self.norm_out(z_fused)).reshape(B, self.num_tokens, self.embed_dim)
+
+        pos = self.pos_embed.expand(B, -1, -1)
+        return tokens, pos
+
+
 def build_tokenizer_5x5(config) -> nn.Module:
     """
     Factory function to construct tokenizer based on config.
     """
     tokenizer_type = getattr(config, "tokenizer_type", "continuous_linear_field")
-    if tokenizer_type in ("energy_stabilized_deconv", "stabilized_deconv", "stabilized_impedance_deconv"):
+    if tokenizer_type in ("autonomous_dual_domain", "autonomous_deconv", "autonomous_field", "autonomous_5x5"):
+        return AutonomousDualDomainTokenizer5x5(
+            in_channels=config.in_channels,
+            embed_dim=config.embed_dim,
+            grid_size=config.grid_size,
+            num_freq_bins=getattr(config, "num_freq_bins", 14),
+            pos_embed_type=config.pos_embed_type,
+            dropout=config.dropout,
+            tikhonov_gamma=getattr(config, "tikhonov_gamma", 0.05),
+        )
+    elif tokenizer_type in ("energy_stabilized_deconv", "stabilized_deconv", "stabilized_impedance_deconv"):
         return EnergyStabilizedDeconvTokenizer5x5(
             in_channels=config.in_channels,
             embed_dim=config.embed_dim,

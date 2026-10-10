@@ -58,6 +58,7 @@ This document permanently tracks all completed, rejected, and active research hy
 | **EXP-38** | Self-Calibrated Impedance Deconvolution Tokenizer (Dodd-Deeds Sensor Invariance) | `tokenizer_5x5.py`: `ImpedanceDeconvolutionTokenizer5x5` | 3 ep (pilot) | Val Zero-Shot AUC: 86.76% (+19.87%) \| Val Zero-Shot AP: 11.35% (2.7x) \| Val CNR: 1.78 (4.0x) \| Test TMR AUC: 64.71% (+9.27%) \| Test Zero-Shot Depth R²: -0.5313 (vs -63.18, 100x err reduction) \| Test Within-File AUC: 93.40% \| Test Within-File AP: 71.92% | **Accepted SOTA Benchmark** | Grounded physics breakthrough: Dodd-Deeds spectral impedance deconvolution $\Delta \hat{Z}(f) = \Delta \hat{V}(f) / \hat{V}_{\text{sound}}(f)$ intrinsically cancels coil transfer function $T(f)$ and excitation waveform $I(f)$ across disparate hardware. Surged Zero-Shot Val AUC from 66.89% to 86.76%, Zero-Shot CNR from 0.44 to 1.78, and IoU from 3.11% to 11.40%. For the first time, successfully transfers to held-out TMR sensor in Zero-Shot (AUC 64.71%, Depth R² error reduced 155x from -133.58 to -0.86). Within-File Test AP also increased to project-record 71.92% (CNR 4.86). |
 | **EXP-39** | Cross-File Manifold Alignment Regularization ($\mathcal{L}_{\text{cross\_align}}$ Variance Matching) | `losses/jepa_loss.py`: `cross_file_manifold_alignment_loss` (`weight=0.5`) | 3 ep (pilot) | Val Zero-Shot AUC: 73.97% (+7.08%) \| Test Zero-Shot AUC: 57.20% (-1.53%) \| Test Zero-Shot AP: 3.01% (-0.25%) \| Test Within-File AUC: 92.15% (-1.05%) \| Test Within-File AP: 67.82% (-2.77%) \| Test TMR Zero-Shot AUC: 50.89% | **Evaluated / Regressed** | Batch-level coordinate variance alignment across disparate training files yielded moderate in-domain transfer gain (Val Zero-Shot AUC 66.89% -> 73.97%), but failed on held-out compound OOD test (AUC regressed to 57.20%, TMR zero-shot collapsed to 50.89%). Imposing global variance matching penalizes legitimate physical contrast differences between flaw geometries, creating negative interference that degraded Within-File AP from 70.59% down to 67.82%. Fails to resolve sensor transfer function $T(f)$ on unseen hardware. |
 | **EXP-40** | Energy-Stabilized Deconvolution Tokenizer (Tikhonov Regularization Floor & Dual-Polarity Envelopes) | `tokenizer_5x5.py`: `EnergyStabilizedDeconvTokenizer5x5` | 3 ep (pilot) | Test Zero-Shot AUC: 61.01% (New Peak, +2.28% vs Base) \| Val Zero-Shot AUC: 87.25% (+20.36%) \| Chirp Zero-Shot AUC: 57.74% (+6.54% recovery) \| Test Inverted Scans: 10/57 (vs 21/57 EXP-38) \| Lift-off z3 Zero-Shot AUC: 65.30% (+6.48%) \| Unsup Maha AUC: 71.32% \| Within-File Test AP: 71.01% (CNR: 4.74) | **Accepted SOTA Breakthrough** | Successfully cured the Chirp frequency division noise explosion and drastically reduced polarity inversion rate (inverted scans cut by >52% from 21 down to 10; inverted Chirp scans dropped from 18 to 5). Chirp Zero-Shot AUC surged from 51.20% to 57.74% (CNR 3.4x from 0.14 to 0.47). Established project-record Test Zero-Shot AUC of 61.01% across all 57 held-out files and 65.30% on z3 lift-off, while maintaining Val Zero-Shot AUC at 87.25% (IoU 12.17%, Dice 21.36%) and Within-File Test AP at 71.01% (CNR 4.74). |
+| **EXP-41** | Autonomous Dual-Domain Tokenizer & Pre-registration Phase 1 Foundation | `tokenizer_5x5.py`: `AutonomousDualDomainTokenizer5x5` + `evaluation/calibration.py` | 3 ep (pilot / active) | Contrast Gain: 6.55x on 40x40mm flaw \| C5 Gate: 0.5340 [PASS] | **In-Progress / Pre-registration Phase 1** | Resolves flat corrosion blindness and software differential probing violation. Processes 25 probes autonomously without local patch median subtraction; separates scan-level calibration (M1) from probe tokenization. Unit tests confirmed 6.55x contrast gain on uniform flaws. Baseline C5 under Spatial Block CV passed validation gate (mean AUC = 0.5340 in [0.45, 0.55]). |
 
 
 
@@ -1930,5 +1931,31 @@ This document permanently tracks all completed, rejected, and active research hy
   - Tikhonov regularization floor effectively prevents numerical noise divergence outside the active Chirp bandwidth, preserving stable impedance features.
   - The dual-polarity envelope architecture successfully clamped the scan inversion count from 21 down to 10 files, and directly lifted Chirp Zero-Shot AUC from 51.20% to 57.74% with a 3.4x boost in CNR.
   - Overall Test Zero-Shot AUC broke the 61% milestone (61.01%) for the first time in the project, proving that physics-grounded deconvolution and polarity stabilization form the correct foundation for cross-domain NDT zero-shot generalization.
+
+---
+
+### EXP-41: Autonomous Dual-Domain Tokenizer & Pre-Registration Phase 1 Foundation
+- **Run Directory**: `experiments/5x5/exp41_autonomous_dual_domain`
+- **Pre-Registration Phase 1 Invariants**:
+  - Resolves two critical architectural failures identified during peer review:
+    1. **Flat Corrosion Blindness**: EXP-40's $x_{\text{ref}} = \operatorname{median}(x_{\text{grid}})$ subtracted the 25-probe median across the local $14\text{ mm}$ window. On $40 \times 40\text{ mm}$ flaws, all 25 probes sit inside the defect, causing $x_{\text{grid}} \approx x_{\text{ref}} \implies \Delta x \to 0, \Delta \hat{Z} \to 0$, blinding the model to plate thickness reduction at the flaw center.
+    2. **Software Differential Probing Violation**: Subtracting probe signals within the grid acts as a software differential coil/Laplacian filter, violating Invariant 3.
+  - **Modular Implementation**:
+    - `AutonomousDualDomainTokenizer5x5` in `src/PECT_JEPA/spatiotemporal_5x5/models/tokenizer_5x5.py`.
+    - Every probe is processed autonomously: instance-normalized 1D temporal shape, absolute envelope, physical transient anchors ($t_p, V_{pp}, E_{\text{time}}$), uncrushed 14-harmonic Fourier decomposition, energy saliency gating $s(f)$, dual-polarity phase ($\theta, |\theta|$), and continuous spectral moments.
+    - Decoupled condition calibration: Unsupervised Scan-Level Calibration (Mode M1) implemented in `src/PECT_JEPA/spatiotemporal_5x5/evaluation/calibration.py`, strictly separating global plate reference extraction from local probe tokenization.
+- **Empirical Validation Gates**:
+  - **Uniform Flaw Response Test**: Simulating a $40 \times 40\text{ mm}$ uniform corroded plate vs sound metal plate:
+    - EXP-40: $\|\Delta Z\| = 3.1516$, Cosine Similarity $= 0.9969$ (severe blindness).
+    - EXP-41 Autonomous: $\|\Delta Z\| = 20.6374$, Cosine Similarity $= 0.8669$.
+    - Contrast Gain: **6.55x** increase in flaw discriminability!
+  - **Validation Gate C5 (Position-Only under Spatial Block CV)**:
+    - Target: $\text{AUC} \in [0.45, 0.55]$.
+    - Measured: Corrosion $= 0.5192$, Rivet_v1 $= 0.5304$, Mixed $= 0.5523$ (Mean $= \mathbf{0.5340}$).
+    - **Gate Status: VERIFIED PASS**.
+- **Optimization & Status**:
+  - Single Shared Transformer Encoder (64D, 4L, 4H, Pre-LN) + Dipolar Scattering Predictor + Inward Core Radial Diffusion Masking.
+  - 3-epoch pilot ablation training launched with seed 42. Status: **In-Progress**.
+
 
 
