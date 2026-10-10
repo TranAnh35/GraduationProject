@@ -2011,6 +2011,34 @@ This document permanently tracks all completed, rejected, and active research hy
   2. In cross-domain transfer without extensive supervised target calibration, raw signal energy RMS remains more robust than 128D latent representations, which suffer from cross-condition sensor transfer function drift.
   3. Predictor error reduction (-99%) is an interpolation effect on smooth sound metal, not defect scattering learning.
 
+---
+
+### DEVIATION-01: Degenerate Radial Position Bias in Relative Perturbation Target & Objective Reformulation
+- **Date**: 2026-10-11
+- **Status**: FORMALLY LOGGED (Pre-Registration Phase 1 Gate Audit)
+- **Luận điểm (Empirical Ground-Truth Finding)**:
+  - Mục tiêu dự đoán $\Delta H = H_{\text{tgt}} - H_{\text{base}}$ (trong đó $H_{\text{base}} = \text{mean}(H_{\text{ctx}})$) là một **mục tiêu suy biến hình học (geometrically degenerate target)**.
+  - Phép đo trực tiếp chứng minh: **$99.61\%$ phương sai của $\Delta H$ được giải thích thuần túy bởi chỉ số vị trí đầu dò $p$ (probe position index)**.
+- **Minh chứng giải phẫu định lượng (Quantitative Empirical Evidence)**:
+  1. *So sánh Smooth L1 Loss trên tập dữ liệu kiểm chứng*:
+     - Đoán bằng 0 ($H_{\text{pred}} = 0$): **$0.172836$**
+     - Đoán bằng Vector Trung bình Toàn cục ($\bar{\Delta H}_{\text{global}} \in \mathbb{R}^D$): **$0.145726$**
+     - **Đoán bằng Vector Trung bình theo Vị trí Đầu dò ($\bar{\Delta H}(p) \in \mathbb{R}^D$)**: **$\mathbf{0.000610}$** (giảm **$99.58\%$** sai số)
+     - Random Untrained Predictor (Seed 999): **$0.229668$**
+     - Trained EXP-41 Predictor: **$0.003249$**
+  2. *Hệ quả bản chất*: Trained Predictor có sai số ($0.003249$) thực tế **cao gấp $5.3\times$** so với một bảng tra tĩnh vector trung bình theo vị trí đầu dò ($0.000610$). Toàn bộ mức giảm loss $99\%$ của Predictor trong quá trình huấn luyện thực chất chỉ là học lại độ lệch hình học tĩnh giữa vành ngoài ($r=7\text{ mm}$) và lõi trong ($r=0, 1, 3\text{ mm}$), hoàn toàn không học tán xạ khuyết tật.
+  3. *Giải thích mâu thuẫn điểm Residual Anomaly Detection*:
+     - Trên `Corrosion` (ăn mòn phẳng, không đinh tán): Trained Predictor đạt AUC $65.85\%$ (AP $2.41\%$) trong khi Untrained Random Predictor đạt AUC **$63.87\%$** (AP $1.93\%$). Việc huấn luyện Predictor hầu như không bổ sung thêm năng lực phân biệt vật lý (+1.98% AUC).
+     - Trên `Rivet_v1`: Residual đạt AUC $84.15\%$ (AP $18.78\%$) vì $100\%$ đinh tán đều bị ăn mòn nhân tạo và đầu đinh tán tạo ra nhiễu loạn hình học cực lớn.
+     - Trên `Mixed` (gồm 25 đinh tán lỗi và 6 đinh tán sạch): Residual sụt giảm về AUC $58.14\%$ (AP $3.38\%$, sát tỷ lệ nền $2.89\%$), thua xa Raw RMS (AUC $68.40\%$, AP $5.73\%$).
+  4. *Bóc tách Specimen trên Tác vụ Chuyển miền G2/G3*:
+     - Raw Energy RMS vượt trội ở bảng tổng hợp là do ăn mòn đinh tán trên `Mixed` (Object AP của RMS đạt $20.39\text{--}26.37\%$, trong khi JEPA chỉ đạt $5.03\text{--}10.10\%$).
+     - Trên `Corrosion` độc lập: Cả JEPA và Random Encoder đều vượt Raw RMS (G3 M0: $13.42\%$ và $15.32\%$ vs $6.71\%$), nhưng JEPA không vượt được Random Encoder.
+- **Hành động & Quyết định Điều hành (Operational Decision)**:
+  - Tạm hoãn việc huấn luyện quy mô lớn Phase 1 (81 files $\times$ 20 epochs $\times$ 5 seeds) trên mục tiêu $\Delta H$ hiện tại để tránh lãng phí tài nguyên tính toán vào một bài toán đã được chứng minh là suy biến hình học.
+  - Tái cấu trúc mục tiêu JEPA trước khi huấn luyện: Thiết kế mục tiêu dự đoán loại bỏ thành phần độ lệch vị trí tĩnh (ví dụ: dự đoán độ trễ pha tán xạ đa tần Dodd-Deeds hoặc vi sai chuẩn hóa theo phương vị) sao cho mục tiêu có độ nhạy gradient thực sự trên khuyết tật.
+
+
 
 
 
