@@ -2070,3 +2070,67 @@ This document permanently tracks all completed, rejected, and active research hy
 
 
 
+
+
+---
+
+## PROTOCOL KHÓA PRE-REGISTRATION & ĐÁNH GIÁ HAI VÒNG CÓ GIỚI HẠN (2026-10-11)
+
+**Ngày khóa pre-registration:** 2026-10-11.
+Sau ngày khóa, ngưỡng và metric ở các mục 4-6 không được đổi; mọi thay đổi ghi vào Deviations (ngày, thay đổi, lý do) TRƯỚC khi chạy.
+
+### 1.3 Danh sách các kết luận CŨ đã bị sửa, KHÔNG được dùng lại
+1. "Mảng ăn mòn 40x40 mm làm trừ median xóa tín hiệu": sai (defect nhỏ hơn cửa sổ 14 mm).
+2. "M2 PASS, ΔAP = +5.69%": sai (là rò rỉ trong file; khi đánh giá strictly disjoint hold-out không đạt).
+3. "RMS mù với ăn mòn quanh đinh tán": sai khi gộp theo vật thể (RMS 84.2%).
+4. "Loss predictor giảm 99% nghĩa là đã học tán xạ": sai (học bảng tra vị trí tĩnh do pos_embed).
+5. "Trường suy giảm theo bán kính": sai (không có cơ sở vật lý, 25 điểm là cùng một sensor quét ở các thời điểm khác nhau).
+6. "Phase 1 thất bại": sai. Chỉ có pilot (20 file, 3 epoch, 1 seed) chạy; Phase 1 đã đăng ký (81 file, 20 epoch, 5 seed) chưa chạy.
+7. "Cơ chế đói gradient > 500:1": chưa đo (chỉ có tỉ số độ lớn ΔH; cấu hình ghi cả L1 lẫn Smooth L1).
+
+### 4. Định nghĩa dùng chung
+#### 4.1 Tiền điều kiện (kiểm tra trước, báo cáo một dòng mỗi mục)
+- Metadata lift-off: z1 = 1 mm, z2 = 2 mm, z3 = 3 mm đúng trong mọi file.
+- Kích thước mỗi fold: Hold-out Air/Pot: 30 hoặc 42 nguồn / 1 support / 14 đánh giá (theo mục 1.1); Hold-out TMR hoặc z3: 30 / 1 / 26. Support giao đánh giá = rỗng.
+- Cổng C5 (rò rỉ): position-only (x, y) dưới block CV có AUC trung bình trong [0.45, 0.55]; báo cáo riêng từng specimen.
+
+#### 4.2 Vật thể, điểm, chance
+- Điểm vật thể = trung bình điểm pixel trong đĩa bán kính 6.5 mm quanh tâm CAD. Negative = đĩa cùng bán kính có tâm cách mọi defect >= 8 mm; dùng đúng cách chọn đã có trong `benchmark_preregistration_g2_g3_strictly_disjoint.py` và ghi số lượng.
+- Chance của object AP = n_dương / (n_dương + n_âm), tính từ dữ liệu cho từng specimen. Mọi báo cáo dùng AP - chance. KHÔNG giả định 4.76%.
+- Mixed có hai bộ negative: (a) chỉ đĩa nền; (b) đĩa nền + 6 đinh tán sạch. Specimen QUYẾT ĐỊNH là Corrosion (không có đinh tán). Rivet_v1 và Mixed là thăm dò.
+- Gộp theo vật thể vật lý: điểm của mỗi vật thể = trung bình qua các file đánh giá của fold; cluster bootstrap lấy mẫu lại vật thể (dương và âm), 5.000 lần.
+
+#### 4.3 Các chế độ thích ứng
+- M0: không thích ứng.
+- M1: trừ/chuẩn hóa theo vùng tham chiếu của scan, chọn KHÔNG dùng nhãn: vùng giữa phân vị [Q25, Q75] của bản đồ năng lượng RMS thô. Độ nhạy: [Q10, Q90]. Áp dụng giống hệt cho JEPA, T0 và C1-C4.
+- M2: K = 3 vật thể defect có nhãn trong điều kiện đích. Rút 20 lần độc lập (file support và 3 vật thể đều ngẫu nhiên, loại khỏi tập đánh giá). Readout: LogisticRegressionCV (Cs = [0.01, 0.1, 1, 10, 100], cv = 3, class_weight = 'balanced') trên nguồn + support. Ghi riêng số lần chạy mà điểm số là hằng (std = 0 hoặc AP = chance) và điều tra trước khi tính trung bình.
+- Folds: G2 = giữ lại từng sensor (Air, Pot, TMR), G3 = giữ lại từng lift-off (z1, z2, z3). Báo cáo đủ 3+3 fold, kèm bảng gộp.
+
+#### 4.4 Các tập đặc trưng (cùng readout, cùng M0/M1/M2)
+- JEPA = Z_unified 128D = [h_center 64D, ΔH 64D]. Báo cáo thêm h_center-only và ΔH-only.
+- C1a: random hoàn toàn (tokenizer + encoder + predictor ngẫu nhiên), 5 seed {42, 100, 2024, 777, 999}.
+- C1b: tokenizer đã train + encoder ngẫu nhiên, 5 seed.
+- C2: đầu ra tokenizer (64D).
+- C3: PCA-128 của chuỗi thời gian thô (fit trên dữ liệu nguồn).
+- C4: RMS thô 25D.
+- C5: vị trí (x, y).
+- T0 (EXP-40): chỉ tham chiếu cận trên, không dùng làm comparator của cổng.
+- Nếu một checkpoint chỉ có 1 seed, ghi rõ "1 seed".
+
+#### 4.5 Probe có giám sát trong file
+Hồi quy logistic cân bằng, spatial block CV: 4 góc phần tư, đệm 14 mm, trên từng file, trung bình theo specimen. Báo cáo AUC, AP, AP - chance.
+
+### 6. Bốn cổng tiền khởi động (cho nhánh A)
+- **G-Pre-1 (không suy biến và có nội dung):** R2_pos(ΔH mới) < 50% và R2_file(ΔH mới) < 50% (mẫu cân bằng theo file, báo cáo thành phần); và AP - chance của probe có giám sát trên ΔH' (4.5, Corrosion) vượt C1a và C1b với cận dưới CI của hiệu > 0.
+- **G-Pre-2:** loss predictor (đơn vị đã chuẩn hóa) trên cửa sổ held-out <= 0.5 x baseline tĩnh mạnh nhất trong {zero, trung bình toàn cục, theo vị trí, theo file (oracle)}.
+- **G-Pre-3:** AUC (đinh tán ăn mòn vs sạch, Mixed, điểm residual) có cận dưới CI 95% > 0.5, bootstrap theo 31 vật thể. Báo cáo thêm điểm ước lượng và ΔAUC cặp so với RMS và T0 (chỉ để tham khảo).
+- **G-Pre-4:** Corrosion, G2 và G3 (đủ fold), M0 và M1: object AP - chance của JEPA lớn hơn mỗi comparator {C1a, C1b, C4} một lượng >= +0.03 tuyệt đối, với cận dưới CI Bonferroni 98.75% của ΔAP > 0, ở ít nhất một ô trong {G2, G3} x {M0, M1}.
+
+Pilot "qua cổng" khi cả bốn cổng đều đạt cho nhánh A. T0 và nhánh B không được dùng để đạt cổng.
+
+### 7. Quy tắc quyết định ở Vòng 2 (sau khi người dùng duyệt báo cáo vòng 1)
+- **Nhánh X (pilot qua cả bốn cổng):** Chạy Phase 1 đúng đăng ký với mục tiêu mới (nhánh A): pretrain 81 file không nhãn, 20 epoch, 5 seed. Đánh giá bằng bộ R1-1 (a)-(d). Chạy thêm nhánh Z (pretrain 20 file như cũ, chỉ M0, 3 seed) để giữ phép đo "cảm biến chưa từng thấy". Tiêu chí giá trị giữ nguyên như G-Pre-4. Dừng và báo cáo.
+- **Nhánh Y (pilot không qua ít nhất một cổng):** KHÔNG chạy Phase 1. Chuẩn bị gói kết luận âm tính + benchmark:
+  1. Chạy đánh giá của pipeline tốt nhất KHÔNG dùng JEPA (tokenizer T1 + readout M1/M2; RMS; T0 làm tham chiếu) trên G1-G3 với CI cụm.
+  2. Viết `FINAL_CLAIM_SHEET.md`: (i) kết quả kiểm toán rò rỉ và đối chứng; (ii) kết quả ablation JEPA (nhánh A, B, 20 epoch); (iii) danh sách claim được phép và claim bị cấm; (iv) các hạn chế (3 coupon, một tấm nhôm, 2 mức mỗi trục trong pretrain).
+  3. Đề xuất bố cục báo cáo/luận văn.
