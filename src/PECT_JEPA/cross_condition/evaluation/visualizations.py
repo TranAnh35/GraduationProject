@@ -158,3 +158,43 @@ def plot_training_curves(
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_segmentation_comparison(
+    prob_map: np.ndarray,
+    pred_mask: np.ndarray,
+    ground_truth_mask: np.ndarray,
+    file_title: str,
+    save_path: str,
+    metrics: Optional[Dict[str, float]] = None,
+    dpi: int = 150,
+) -> None:
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), dpi=dpi)
+
+    im0 = axes[0].imshow(prob_map, cmap="inferno", origin="upper", vmin=0.0, vmax=1.0)
+    axes[0].set_title(f"Predicted Probability Map\n{file_title}", fontsize=10, fontweight="bold")
+    axes[0].set_xlabel("X (pixels)")
+    axes[0].set_ylabel("Y (pixels)")
+    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+    im1 = axes[1].imshow(pred_mask, cmap="Greens", origin="upper", vmin=0, vmax=1)
+    axes[1].set_title("Binarized Segmentation Mask", fontsize=10, fontweight="bold")
+    axes[1].set_xlabel("X (pixels)")
+    axes[1].set_ylabel("Y (pixels)")
+    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+    im2 = axes[2].imshow(ground_truth_mask, cmap="Blues", origin="upper", vmin=0, vmax=1)
+    title_gt = "CAD Ground Truth Mask"
+    if metrics:
+        iou = metrics.get("iou", 0.0)
+        dice = metrics.get("dice", 0.0)
+        title_gt += f"\nIoU: {iou:.4f} | Dice: {dice:.4f}"
+    axes[2].set_title(title_gt, fontsize=10, fontweight="bold")
+    axes[2].set_xlabel("X (pixels)")
+    axes[2].set_ylabel("Y (pixels)")
+    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)

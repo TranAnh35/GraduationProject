@@ -1,10 +1,19 @@
 """
 Dataset splitting protocols and metadata parsing for PECT TDMS files.
+
+Protocols:
+1. Base Domain vs Held-out OOD Domain:
+   - Base Domain: Sensor in [Hall_Air_Core, Hall_Pot_Core], Waveform in [Square, Gaussian], Liftoff in [z1, z3], Specimen in [Corrosion, Rivet_v1] (16 files).
+   - Base Train Pool: 12-14 files.
+   - Base Val Pool: 2-4 files.
+   - Test (OOD) Domain: Remaining files (TMR sensor, Chirp waveform, z2 liftoff, Rivet_v2 specimen) -> 65-67 files.
+2. Helper functions to classify any file into split: 'train', 'val', 'test'.
 """
 
 import os
+import random
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 
 @dataclass
@@ -97,3 +106,39 @@ def filter_base_domain_files(file_list: List[str]) -> List[str]:
         if is_base_domain_file(meta):
             base_files.append(fp)
     return base_files
+
+
+def get_canonical_train_val_test_splits(
+    file_list: List[str],
+    val_files_count: int = 4,
+    seed: int = 42,
+) -> Dict[str, List[str]]:
+    """
+    Partitions full dataset into Train, Val, and Test splits:
+    - Base Domain (16 files): split deterministically into Train (12 files) and Val (4 files).
+    - Held-out Domain (65 files): all files with TMR, Chirp, z2, or Rivet_v2 -> Test.
+    """
+    base_files = []
+    test_files = []
+
+    for fp in file_list:
+        meta = extract_file_metadata(fp)
+        if is_base_domain_file(meta):
+            base_files.append(fp)
+        else:
+            test_files.append(fp)
+
+    rng = random.Random(seed)
+    shuffled_base = sorted(base_files)
+    rng.shuffle(shuffled_base)
+
+    n_val = min(val_files_count, len(shuffled_base) // 4)
+    val_files = sorted(shuffled_base[:n_val])
+    train_files = sorted(shuffled_base[n_val:])
+    test_files = sorted(test_files)
+
+    return {
+        "train": train_files,
+        "val": val_files,
+        "test": test_files,
+    }
