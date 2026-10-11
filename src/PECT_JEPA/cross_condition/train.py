@@ -2,14 +2,13 @@
 Official Training Entry Point for Cross-Condition PECT-JEPA.
 
 Features:
-- Structured run directory with timestamp: experiments/cross_condition/runs/<exp_name>_<YYYYMMDD_HHMMSS>/
-- Multi-tier logging: console output, run.log, config.json, git_info.json, metrics_epoch.csv.
-- Resume training support: --resume_checkpoint <path_to_checkpoint>.
-- Dynamic sample scaling: dense sampling of all 112 directed pairs.
+- Exhaustive Data Utilization: Traverses 100% of spatial coordinates (72,900 pixels) across all directed condition pairs without arbitrary dropping.
+- Structured Unified Experiment Directory: experiments/cross_condition/runs/<exp_name>_<YYYYMMDD_HHMMSS>/
+  - checkpoints/ (best_model.pt, latest_checkpoint.pt)
+  - evaluation_results/ (subsequent downstream evaluation stored in same experiment directory)
+  - visualizations/ (training loss & diagnostics curves)
+  - config.json, run.log, metrics_epoch.csv
 - Real-time unbuffered tqdm progress bar streaming.
-
-Usage:
-    python -m src.PECT_JEPA.cross_condition.train --epochs 40 --points_per_pair 4000
 """
 
 import os
@@ -30,8 +29,8 @@ def parse_args():
     parser.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True, help="Append timestamp to experiment directory")
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size per training step")
-    parser.add_argument("--points_per_pair", type=int, default=4000, help="Number of coordinate points sampled per condition pair per epoch (112 pairs * 4000 = ~448k samples)")
-    parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (overrides points_per_pair)")
+    parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100% all 72,900 pixels per scan)")
+    parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (default None: 100% exhaustive dataset traversal)")
     parser.add_argument("--lr", type=float, default=4e-4, help="Peak learning rate for Cosine schedule")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
@@ -46,7 +45,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Determine run directory and timestamp
+    # Determine unified experiment directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{args.exp_name}_{timestamp}" if args.add_timestamp else args.exp_name
     run_dir = os.path.join("experiments", "cross_condition", "runs", run_name)
@@ -57,6 +56,7 @@ def main():
         add_timestamp=args.add_timestamp,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        grid_stride=args.grid_stride,
         samples_per_epoch=args.samples_per_epoch,
         lr=args.lr,
         min_lr=args.min_lr,
@@ -64,8 +64,9 @@ def main():
         embed_dim=args.embed_dim,
         data_dir=args.data_dir,
         transform_csv=args.transform_csv,
+        exp_dir=run_dir,
         checkpoint_dir=os.path.join(run_dir, "checkpoints"),
-        results_dir=os.path.join(run_dir, "results"),
+        eval_dir=os.path.join(run_dir, "evaluation_results"),
         visualizations_dir=os.path.join(run_dir, "visualizations"),
         resume_checkpoint=args.resume_checkpoint,
     )
@@ -74,16 +75,15 @@ def main():
     logger = CrossConditionLogger(run_dir=run_dir, run_name=run_name, config=config)
     device = torch.device(args.device)
 
-    logger.info(f"Initialized Experiment Run: {run_name}")
-    logger.info(f"Experiment Directory: {run_dir}")
+    logger.info(f"Initialized Unified Experiment Directory: {run_dir}")
     logger.info(f"Configuration: {config}")
 
-    # Build Paired Dataset across all 112 directed pairs
-    logger.info(f"Loading Base Domain Dataset (16 files, all 112 directed pairs)...")
+    # Build Paired Dataset across all directed pairs
+    logger.info(f"Loading Base Domain Dataset (Exhaustive grid stride: {config.grid_stride})...")
     dataset = PairedPECTDataset(
         data_dir=config.data_dir,
+        grid_stride=config.grid_stride,
         samples_per_epoch=config.samples_per_epoch,
-        points_per_pair=args.points_per_pair,
         transform_csv=config.transform_csv,
     )
 
@@ -92,8 +92,8 @@ def main():
 
     # Start training
     best_ckpt = trainer.train(dataset=dataset, epochs=config.epochs)
-    logger.info(f"Training successfully finished! Checkpoint available at: {best_ckpt}")
-    print(f"\nExperiment Run Finished. All artifacts saved to:\n  {run_dir}\n")
+    logger.info(f"Training successfully finished! Checkpoint saved at: {best_ckpt}")
+    print(f"\nExperiment Run Finished. All checkpoints and logs saved to:\n  {run_dir}\n")
 
 
 if __name__ == "__main__":

@@ -8,10 +8,11 @@ Strict Global Readout Protocol:
   2. Val (In-Domain Validation)
   3. Test (Zero-Shot Out-of-Distribution Transfer across unseen waveforms, sensors, liftoff, and specimens)
 
-Directory Structure:
-  experiments/cross_condition/evaluations/<eval_name>_<timestamp>/
+Unified Experiment Storage:
+- Evaluation results are stored inside the SAME experiment directory as checkpoints:
+  <exp_dir>/evaluation_results/
     ├── 1_Anomaly_Detection/
-    │     ├── train/ (Mahalanobis maps, split_metrics.csv, split_summary.json)
+    │     ├── train/ (Trained Linear Probe Probability Maps, Mahalanobis Maps, Detection Summary)
     │     ├── val/
     │     └── test/
     ├── 2_Defect_Sizing/
@@ -19,7 +20,7 @@ Directory Structure:
     │     ├── val/
     │     └── test/
     ├── 3_Segmentation_IoU/
-    │     ├── train/ (Segmentation comparison plots, split_metrics.csv, split_summary.json)
+    │     ├── train/ (3-Panel CAD GT BBoxes vs Predicted BBoxes vs Overlap TP/FP/FN/TN Maps)
     │     ├── val/
     │     └── test/
     ├── master_benchmark_metrics.csv
@@ -54,10 +55,11 @@ from src.PECT_JEPA.cross_condition.data.split import (
 from src.PECT_JEPA.cross_condition.evaluation.cscan_extractor import CScanFeatureExtractor
 from src.PECT_JEPA.cross_condition.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
 from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
+    plot_probability_heatmap,
+    plot_detection_summary_map,
     plot_cscan_anomaly_map,
     plot_sizing_calibration,
-    plot_probability_heatmap,
-    plot_segmentation_comparison,
+    plot_defect_contours_and_iou,
 )
 
 
@@ -111,29 +113,70 @@ def build_corrosion_diameter_map(config: Dict[str, Any], grid_shape: Tuple[int, 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Official Downstream Benchmark Evaluation for Cross-Condition PECT-JEPA")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint")
+    parser.add_argument("--exp_dir", type=str, default=None, help="Unified experiment run directory containing checkpoints/ and configs")
     parser.add_argument("--data_dir", type=str, default="data", help="Root data directory containing TDMS files")
-    parser.add_argument("--eval_name", type=str, default="official_benchmark", help="Evaluation experiment tag")
-    parser.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True, help="Append timestamp to evaluation directory")
-    parser.add_argument("--out_dir", type=str, default=None, help="Explicit output directory (overrides default evaluations directory)")
+    parser.add_argument("--out_dir", type=str, default=None, help="Explicit override for output directory")
     parser.add_argument("--eval_splits", nargs="+", default=["train", "val", "test"], help="Splits to evaluate ('train', 'val', 'test')")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     parser.add_argument("--batch_size", type=int, default=4096, help="Batch size for feature extraction")
     return parser.parse_args()
 
 
+def resolve_paths(args) -> Tuple[str, str]:
+    """Resolves checkpoint path and evaluation output directory so they reside in the same experiment folder."""
+    # 1. If exp_dir is explicitly given
+    if args.exp_dir is not None:
+        exp_dir = os.path.abspath(args.exp_dir)
+        ckpt_candidates = [
+            os.path.join(exp_dir, "checkpoints", "best_cross_condition_jepa.pt"),
+            os.path.join(exp_dir, "checkpoints", "best_model.pt"),
+            os.path.join(exp_dir, "checkpoints", "latest_cross_condition_jepa.pt"),
+        ]
+        ckpt_path = None
+        for c in ckpt_candidates:
+            if os.path.exists(c):
+                ckpt_path = c
+                break
+        if ckpt_path is None:
+            # Look for any .pt inside checkpoints/
+            pts = glob.glob(os.path.join(exp_dir, "checkpoints", "*.pt"))
+            if pts:
+                ckpt_path = pts[0]
+            else:
+                raise FileNotFoundError(f"No checkpoint found inside: {os.path.join(exp_dir, 'checkpoints')}")
+
+        eval_out_dir = os.path.join(exp_dir, "evaluation_results") if args.out_dir is None else args.out_dir
+        return ckpt_path, eval_out_dir
+
+    # 2. If checkpoint is given
+    if args.checkpoint is not None:
+        ckpt_path = os.path.abspath(args.checkpoint)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+        if args.out_dir is not None:
+            eval_out_dir = args.out_dir
+        else:
+            # Check if checkpoint is inside a run directory structure (e.g. .../<run_dir>/checkpoints/<model>.pt)
+            parent = os.path.dirname(ckpt_path)
+            if os.path.basename(parent) == "checkpoints":
+                exp_dir = os.path.dirname(parent)
+                eval_out_dir = os.path.join(exp_dir, "evaluation_results")
+            else:
+                eval_out_dir = os.path.join(os.path.dirname(ckpt_path), "evaluation_results")
+
+        return ckpt_path, eval_out_dir
+
+    raise ValueError("Must provide either --exp_dir or --checkpoint")
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
 
-    # 1. Resolve output directory
-    if args.out_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_tag = f"{args.eval_name}_{timestamp}" if args.add_timestamp else args.eval_name
-        out_dir = os.path.join("experiments", "cross_condition", "evaluations", run_tag)
-    else:
-        out_dir = args.out_dir
-
+    # Resolve paths to unify checkpoints and evaluations in the same folder
+    ckpt_path, out_dir = resolve_paths(args)
     os.makedirs(out_dir, exist_ok=True)
 
     task_dirs = {
@@ -145,22 +188,30 @@ def main():
         for sp in ["train", "val", "test"]:
             os.makedirs(os.path.join(tdir, sp), exist_ok=True)
 
-    print("\n" + "=" * 70)
-    print("PECT-JEPA Official Multi-Task Benchmark Evaluation")
-    print(f"Checkpoint:       {args.checkpoint}")
+    print("\n" + "=" * 75)
+    print("PECT-JEPA Unified Downstream Benchmark Evaluation")
+    print(f"Checkpoint:       {ckpt_path}")
     print(f"Output Directory: {out_dir}")
     print(f"Compute Device:   {device}")
     print(f"Target Splits:    {args.eval_splits}")
-    print("=" * 70 + "\n", flush=True)
+    print("=" * 75 + "\n", flush=True)
 
-    # 2. Load Checkpoint and Initialize Model
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    config = ckpt.get("config", CrossConditionConfig())
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    raw_config = ckpt.get("config", None)
+    if isinstance(raw_config, CrossConditionConfig):
+        config = raw_config
+    else:
+        config = CrossConditionConfig()
+        if raw_config is not None:
+            source_dict = vars(raw_config) if hasattr(raw_config, "__dict__") else (raw_config if isinstance(raw_config, dict) else {})
+            for k, v in source_dict.items():
+                if hasattr(config, k):
+                    setattr(config, k, v)
     model = CrossConditionJEPA(config).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    # 3. Ground Truth Masks & Feature Extractor
+    # 2. Ground Truth Masks & Feature Extractor
     extractor = CScanFeatureExtractor(model=model, device=device, batch_size=args.batch_size)
     suite = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
     gt_masks = load_ground_truth_masks()
@@ -168,7 +219,7 @@ def main():
     if "Corrosion" in gt_masks and gt_masks["Corrosion"]["config"] is not None:
         corr_d_map = build_corrosion_diameter_map(gt_masks["Corrosion"]["config"])
 
-    # 4. Discover All TDMS Files & Canonical Partitioning
+    # 3. Discover All TDMS Files & Canonical Partitioning
     all_files = sorted(glob.glob(os.path.join(args.data_dir, "**", "*.tdms"), recursive=True))
     all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
 
@@ -178,10 +229,10 @@ def main():
     print(f"  - Val Split (Base Domain):       {len(splits['val'])} files")
     print(f"  - Test Split (Held-out OOD):     {len(splits['test'])} files\n", flush=True)
 
-    # 5. STEP 1: Fit Global Readout Probes Strictly on Train Pool
-    print("=" * 70)
+    # 4. STEP 1: Fit Global Readout Probes Strictly on Train Pool
+    print("=" * 75)
     print("STEP 1: Extracting Train Pool Latents & Fitting Global Readout Probes")
-    print("=" * 70, flush=True)
+    print("=" * 75, flush=True)
 
     cached_train_latents: Dict[str, np.ndarray] = {}
     train_det_x, train_det_y = [], []
@@ -241,10 +292,10 @@ def main():
     )
     print("  Global readouts successfully fitted and frozen!\n", flush=True)
 
-    # 6. STEP 2: Evaluate All Splits
-    print("=" * 70)
+    # 5. STEP 2: Multi-Task Evaluation across all splits
+    print("=" * 75)
     print("STEP 2: Evaluating All Splits (Train, Val, Test)")
-    print("=" * 70, flush=True)
+    print("=" * 75, flush=True)
 
     master_results: List[Dict[str, Any]] = []
     split_task_results: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
@@ -278,11 +329,15 @@ def main():
                 cscan = load_canonical_cscan_from_tdms(file_path=fp)
                 latents = extractor.extract_full_cscan(cscan)
 
-            # TASK 1: Anomaly Detection (Mahalanobis Distance & Global Linear Probe)
-            anom_res = suite.compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
+            # TASK 1: Anomaly Detection
+            # A) Supervised Trained Linear Probe
             det_res = suite.evaluate_global_detection(readouts=global_readouts, features=latents, labels=gt_mask)
+            prob_map = det_res["prob_map"]
 
-            # TASK 2: Defect Sizing Hurdle Protocol (Corrosion continuous diameter)
+            # B) Unsupervised Mahalanobis Distance
+            anom_res = suite.compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
+
+            # TASK 2: Defect Sizing Hurdle Protocol
             sizing_res = {"r2_score": 0.0, "mae_mm": 0.0, "rmse_mm": 0.0, "y_true": np.array([]), "y_pred": np.array([])}
             if specimen == "Corrosion" and corr_d_map is not None:
                 sizing_res = suite.evaluate_global_sizing(
@@ -292,10 +347,16 @@ def main():
                     focus_defects_only=True,
                 )
 
-            # TASK 3: Segmentation IoU (Using Linear Probe probability map)
-            prob_map = det_res["prob_map"]
-            iou_res = suite.benchmark_segmentation_iou(prob_map=prob_map, gt_mask=gt_mask, threshold=0.5)
-            pred_mask = (prob_map >= 0.5).astype(np.int64)
+            # TASK 3: Segmentation IoU & Bounding Box Overlap Map (spatiotemporal_5x5 standard)
+            seg_plot_path = os.path.join(task_dirs["segmentation"], split_name, f"{bname}_segmentation_iou.png")
+            iou_res = plot_defect_contours_and_iou(
+                prob_map=prob_map,
+                gt_mask=gt_mask,
+                save_path=seg_plot_path,
+                threshold=0.5,
+                min_defect_area=8,
+                title=f"[{split_name.upper()}] Defect Segmentation Bounding Boxes | {specimen} - {sensor} - {waveform}",
+            )
 
             # Record metrics row
             row = {
@@ -325,26 +386,48 @@ def main():
             master_results.append(row)
 
             # Save task-specific visualizations
-            # 1. Anomaly Heatmap
-            anom_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_anomaly.png")
+            # 1. Anomaly Detection: Trained Linear Probe Probability Heatmap (cmap='jet')
+            lp_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_linear_probe_prob.png")
+            plot_probability_heatmap(
+                prob_map=prob_map,
+                save_path=lp_plot_path,
+                title=f"Trained Linear Probe P(Defect | z) [{split_name.upper()}]\n{specimen} - {sensor} - {waveform} | AUC: {det_res['auc_roc']:.4f} | AP: {det_res['average_precision']:.4f}",
+                cmap="jet",
+            )
+
+            # Unsupervised Mahalanobis Anomaly Map (cmap='jet')
+            maha_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_mahalanobis.png")
             plot_cscan_anomaly_map(
                 anomaly_map=anom_res["anomaly_scores"],
                 ground_truth_mask=gt_mask,
                 file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform} | {liftoff}",
-                save_path=anom_plot_path,
+                save_path=maha_plot_path,
                 metrics=anom_res,
             )
+
+            # 3-Panel Detection Summary (Trained Linear Probe vs Mahalanobis vs CAD GT)
+            summary_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_detection_summary.png")
+            plot_detection_summary_map(
+                prob_map=prob_map,
+                anomaly_map=anom_res["anomaly_scores"],
+                ground_truth_mask=gt_mask,
+                file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform} | {liftoff}",
+                save_path=summary_plot_path,
+                metrics={"linear_probe_auc": det_res["auc_roc"], "linear_probe_ap": det_res["average_precision"], "mahalanobis_auc": anom_res["auc_roc"], "cnr": anom_res["cnr"]},
+            )
+
             split_task_results[split_name]["anomaly"].append({
                 "file": fname,
                 "specimen": specimen,
                 "sensor": sensor,
                 "waveform": waveform,
                 "liftoff": liftoff,
+                "linear_probe_auc": det_res["auc_roc"],
+                "linear_probe_ap": det_res["average_precision"],
+                "linear_probe_f1": det_res["f1_score"],
                 "mahalanobis_auc": anom_res["auc_roc"],
                 "mahalanobis_ap": anom_res["average_precision"],
                 "cnr": anom_res["cnr"],
-                "linear_probe_auc": det_res["auc_roc"],
-                "linear_probe_ap": det_res["average_precision"],
             })
 
             # 2. Sizing Scatter Plot (if applicable)
@@ -368,16 +451,7 @@ def main():
                     "sizing_rmse_mm": sizing_res["rmse_mm"],
                 })
 
-            # 3. Segmentation Comparison Plot
-            seg_plot_path = os.path.join(task_dirs["segmentation"], split_name, f"{bname}_segmentation.png")
-            plot_segmentation_comparison(
-                prob_map=prob_map,
-                pred_mask=pred_mask,
-                ground_truth_mask=gt_mask,
-                file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform}",
-                save_path=seg_plot_path,
-                metrics=iou_res,
-            )
+            # 3. Segmentation Metrics Record
             split_task_results[split_name]["segmentation"].append({
                 "file": fname,
                 "specimen": specimen,
@@ -397,10 +471,10 @@ def main():
                 "IoU": f"{iou_res['iou']:.4f}",
             })
 
-    # 7. STEP 3: Save Split-Specific Metrics & Task CSVs
-    print("\n" + "=" * 70)
+    # 6. STEP 3: Save Split-Specific Metrics & Task CSVs
+    print("\n" + "=" * 75)
     print("STEP 3: Saving Structured Output Hierarchy and Aggregated Reports")
-    print("=" * 70, flush=True)
+    print("=" * 75, flush=True)
 
     for sp in args.eval_splits:
         for tname in ["anomaly", "sizing", "segmentation"]:
@@ -413,7 +487,6 @@ def main():
                     writer.writerows(trows)
 
                 t_json = os.path.join(task_dirs[tname], sp, "split_summary.json")
-                # Compute numeric means
                 num_summary = {}
                 for k in trows[0].keys():
                     vals = [r[k] for r in trows if isinstance(r[k], (int, float))]
@@ -423,14 +496,13 @@ def main():
                 with open(t_json, "w", encoding="utf-8") as f:
                     json.dump({"split": sp, "task": tname, "count": len(trows), "metrics": num_summary}, f, indent=2)
 
-    # 8. STEP 4: Save Master Reports
+    # 7. STEP 4: Save Master Reports
     master_csv = os.path.join(out_dir, "master_benchmark_metrics.csv")
     with open(master_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(master_results[0].keys()))
         writer.writeheader()
         writer.writerows(master_results)
 
-    # Compute Master Hierarchical Summary
     def compute_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not rows:
             return {}
@@ -457,8 +529,9 @@ def main():
         }
 
     master_summary = {
-        "evaluation_name": args.eval_name,
-        "checkpoint": args.checkpoint,
+        "evaluation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "checkpoint": ckpt_path,
+        "output_directory": out_dir,
         "total_files": len(master_results),
         "overall": compute_stats(master_results),
         "by_split": {
@@ -490,9 +563,9 @@ def main():
     # Write Markdown Report
     md_path = os.path.join(out_dir, "EVALUATION_REPORT.md")
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write("# PECT-JEPA Official Downstream Benchmark Report\n\n")
-        f.write(f"- **Checkpoint**: `{args.checkpoint}`\n")
-        f.write(f"- **Evaluation Run**: `{run_tag}`\n")
+        f.write("# PECT-JEPA Unified Downstream Benchmark Report\n\n")
+        f.write(f"- **Checkpoint**: `{ckpt_path}`\n")
+        f.write(f"- **Evaluation Results Directory**: `{out_dir}`\n")
         f.write(f"- **Total Files Evaluated**: {len(master_results)}\n\n")
 
         f.write("## 1. Split Performance Breakdown\n\n")
@@ -522,19 +595,19 @@ def main():
             if st.get("count", 0) > 0:
                 f.write(f"| {lo} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
-    # 9. Terminal Output
-    print("\n" + "=" * 70)
+    # 8. Terminal Output
+    print("\n" + "=" * 75)
     print("MASTER BENCHMARK EVALUATION SUMMARY")
-    print("=" * 70)
+    print("=" * 75)
     for sp in args.eval_splits:
         st = master_summary["by_split"].get(sp, {})
         if st:
             print(f"[{sp.upper():5s}] ({st['count']} files) -> LP AUC: {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | LP AP: {st['linear_probe_ap_mean']:.4f} | CNR: {st['cnr_mean']:.2f} | Seg IoU: {st['segmentation_iou_mean']:.4f} | Sizing R²: {st['sizing_r2_mean']:.4f}")
-    print("-" * 70)
+    print("-" * 75)
     ov = master_summary["overall"]
     print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} ± {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")
     print(f"\nAll results saved to: {out_dir}")
-    print("=" * 70 + "\n", flush=True)
+    print("=" * 75 + "\n", flush=True)
 
 
 if __name__ == "__main__":

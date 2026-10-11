@@ -42,9 +42,9 @@ class CrossConditionConfig:
 
     # Training parameters
     batch_size: int = 256
-    # samples_per_epoch: if None, automatically calculated based on total pair combinations
-    # Default: 400,000 samples/epoch ensures dense exploration of all pairs and coordinates
-    samples_per_epoch: Optional[int] = 409600
+    # samples_per_epoch: if None, 100% exhaustive traversal over ALL coordinates across ALL directed pairs
+    samples_per_epoch: Optional[int] = None
+    grid_stride: int = 1        # 1 = all 72,900 pixels per C-scan; 2 = stride 2 subsample (18,225 px)
     epochs: int = 40
     lr: float = 4e-4
     min_lr: float = 1e-5
@@ -55,9 +55,10 @@ class CrossConditionConfig:
     grad_clip_norm: float = 1.0
     resume_checkpoint: Optional[str] = None
 
-    # Data and Paths
+    # Unified Experiment Directory Paths (All checkpoints & evaluations inside same folder)
     data_dir: str = "data"
     transform_csv: str = "data/ground_truth/raw_tdms_rotate_crop.csv"
-    checkpoint_dir: str = "experiments/cross_condition/checkpoints"
-    results_dir: str = "experiments/cross_condition/results"
-    visualizations_dir: str = "experiments/cross_condition/visualizations"
+    exp_dir: Optional[str] = None
+    checkpoint_dir: Optional[str] = None
+    eval_dir: Optional[str] = None
+    visualizations_dir: Optional[str] = None
