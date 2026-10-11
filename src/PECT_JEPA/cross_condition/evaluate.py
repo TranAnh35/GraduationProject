@@ -1,12 +1,18 @@
 """
 Official Evaluation Script for Cross-Condition PECT-JEPA across all 81 files.
 
-Evaluates:
-1. Mahalanobis Anomaly Detection (AUC-ROC, Average Precision, AP-chance, CNR).
-2. Fastener Collar Discrimination on Rivet specimens (Fastener AUC, Fastener AP).
-3. Conditional Calibrated Flaw Sizing on Corrosion specimen (Diameter R^2, MAE in mm, Pearson r).
-4. Multi-slice disaggregation across all 3 sensors, 3 waveforms, 3 liftoffs.
-5. Saves C-scan anomaly heatmaps and summary CSV/JSON reports.
+Evaluates all Downstream NDT Benchmark Tasks on Frozen Foundation Latents:
+1. Task 1: Binary Defect Detection Probe (Linear Probe & MLP 2-layer): AUC-ROC, Average Precision, F1, Accuracy.
+2. Task 1b: Boundary Contours & IoU (Jaccard Index), Dice coefficient.
+3. Task 2: Physical Flaw Sizing Hurdle Protocol (Defect Diameter R^2, MAE in mm, RMSE in mm).
+4. Task 3: Unsupervised Mahalanobis Anomaly Distance & Contrast-to-Noise Ratio (CNR).
+5. Fastener Collar Discrimination on Rivet specimens.
+
+Outputs:
+- Dedicated timestamped results folder: experiments/cross_condition/evaluations/<eval_name>_<YYYYMMDD_HHMMSS>/
+- High-resolution C-scan anomaly heatmaps.
+- Sizing calibration scatter plots.
+- Structured metrics CSV & Summary JSON.
 """
 
 import os
@@ -16,6 +22,7 @@ import glob
 import json
 import csv
 import argparse
+from datetime import datetime
 from typing import Dict, List, Any
 import numpy as np
 import torch
@@ -26,12 +33,12 @@ from .models.cross_condition_jepa import CrossConditionJEPA
 from .data.preprocessing import load_canonical_cscan_from_tdms
 from .data.split import extract_file_metadata
 from .evaluation.cscan_extractor import CScanFeatureExtractor
-from .evaluation.downstream_benchmarks import (
-    compute_anomaly_detection_metrics,
-    evaluate_fastener_classification,
-    evaluate_conditional_sizing,
+from .evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
+from .evaluation.visualizations import (
+    plot_cscan_anomaly_map,
+    plot_sizing_calibration,
+    plot_probability_heatmap,
 )
-from .evaluation.visualizations import plot_cscan_anomaly_map
 
 
 def load_ground_truth_masks() -> Dict[str, Any]:
@@ -83,10 +90,12 @@ def build_corrosion_diameter_map(config: Dict[str, Any], grid_shape=(270, 270)) 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Official Evaluation of Cross-Condition PECT-JEPA")
-    parser.add_argument("--checkpoint", type=str, default="experiments/cross_condition/checkpoints/best_cross_condition_jepa.pt", help="Path to checkpoint")
+    parser = argparse.ArgumentParser(description="Official Comprehensive Evaluation of Cross-Condition PECT-JEPA")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--data_dir", type=str, default="data", help="Root data directory containing TDMS files")
-    parser.add_argument("--out_dir", type=str, default="experiments/cross_condition/results", help="Directory to save evaluation reports")
+    parser.add_argument("--eval_name", type=str, default="benchmark_all_81", help="Evaluation experiment tag")
+    parser.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True, help="Append timestamp to evaluation directory")
+    parser.add_argument("--out_dir", type=str, default=None, help="Explicit output directory (overrides automatic runs directory)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
 
@@ -94,13 +103,25 @@ def parse_args():
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    os.makedirs(args.out_dir, exist_ok=True)
-    viz_dir = os.path.join(args.out_dir, "heatmaps")
+
+    # Resolve output directory with timestamp
+    if args.out_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_tag = f"{args.eval_name}_{timestamp}" if args.add_timestamp else args.eval_name
+        out_dir = os.path.join("experiments", "cross_condition", "evaluations", run_tag)
+    else:
+        out_dir = args.out_dir
+
+    viz_dir = os.path.join(out_dir, "heatmaps")
+    calib_dir = os.path.join(out_dir, "calibration")
+    os.makedirs(out_dir, exist_ok=True)
     os.makedirs(viz_dir, exist_ok=True)
+    os.makedirs(calib_dir, exist_ok=True)
 
     print(f"\n=======================================================")
-    print(f"Starting Cross-Condition JEPA Benchmark Evaluation")
+    print(f"Cross-Condition JEPA Full Multi-Task Benchmark Evaluation")
     print(f"Checkpoint: {args.checkpoint}")
+    print(f"Output Directory: {out_dir}")
     print(f"Device: {device}")
     print(f"=======================================================\n", flush=True)
 
@@ -111,8 +132,9 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    # 2. Initialize extractor and load ground truth
+    # 2. Initialize extractor, ground truth, and benchmark suite
     extractor = CScanFeatureExtractor(model=model, device=device, batch_size=4096)
+    suite = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
     gt_masks = load_ground_truth_masks()
     corr_d_map = None
     if "Corrosion" in gt_masks and gt_masks["Corrosion"]["config"] is not None:
@@ -124,7 +146,7 @@ def main():
     print(f"Total files discovered across all splits: {len(all_files)}\n", flush=True)
 
     results = []
-    pbar = tqdm(all_files, desc="Evaluating Inspection Files", file=sys.stdout, dynamic_ncols=True)
+    pbar = tqdm(all_files, desc="Evaluating All Inspection Files", file=sys.stdout, dynamic_ncols=True)
 
     for file_path in pbar:
         meta = extract_file_metadata(file_path)
@@ -142,23 +164,42 @@ def main():
         # Load canonical transformed C-scan
         cscan = load_canonical_cscan_from_tdms(file_path=file_path)
 
-        # Extract features
+        # Extract frozen representations
         latents = extractor.extract_full_cscan(cscan)
 
-        # Anomaly Detection Evaluation
-        anom_res = compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
+        # Task 1 & 4: Anomaly Detection (Mahalanobis distance)
+        anom_res = suite.compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
 
-        # Sizing Evaluation (Corrosion)
-        sizing_r2, sizing_mae, sizing_r = 0.0, 0.0, 0.0
+        # Task 1: Linear Probe & MLP 2-layer Probing
+        probe_res = suite.benchmark_binary_detection(features=latents, labels=gt_mask)
+        lp_auc = probe_res.get("linear_probe", {}).get("auc_roc", anom_res["auc_roc"])
+        lp_ap = probe_res.get("linear_probe", {}).get("average_precision", anom_res["average_precision"])
+        mlp_auc = probe_res.get("mlp_2layer", {}).get("auc_roc", 0.0)
+        mlp_ap = probe_res.get("mlp_2layer", {}).get("average_precision", 0.0)
+
+        # Task 1b: Segmentation IoU
+        # Normalize anomaly scores to [0, 1] probability proxy
+        norm_scores = (anom_res["anomaly_scores"] - np.min(anom_res["anomaly_scores"])) / (
+            np.ptp(anom_res["anomaly_scores"]) + 1e-6
+        )
+        iou_res = suite.benchmark_segmentation_iou(prob_map=norm_scores, gt_mask=gt_mask)
+
+        # Task 2: Physical Flaw Sizing Hurdle Protocol (Corrosion)
+        sizing_r2, sizing_mae, sizing_rmse = 0.0, 0.0, 0.0
+        mlp_sizing_r2, mlp_sizing_mae = 0.0, 0.0
         if specimen == "Corrosion" and corr_d_map is not None:
-            sizing_res = evaluate_conditional_sizing(
+            sizing_res = suite.benchmark_sizing_regression(
                 features=latents,
-                ground_truth_diameter_map=corr_d_map,
-                flaw_mask=gt_mask,
+                size_map=corr_d_map,
+                focus_defects_only=True,
             )
-            sizing_r2 = sizing_res["r2"]
-            sizing_mae = sizing_res["mae_mm"]
-            sizing_r = sizing_res["pearson_r"]
+            if "linear_probe" in sizing_res:
+                sizing_r2 = sizing_res["linear_probe"]["r2_score"]
+                sizing_mae = sizing_res["linear_probe"]["mae_mm"]
+                sizing_rmse = sizing_res["linear_probe"]["rmse_mm"]
+            if "mlp_2layer" in sizing_res:
+                mlp_sizing_r2 = sizing_res["mlp_2layer"]["r2_score"]
+                mlp_sizing_mae = sizing_res["mlp_2layer"]["mae_mm"]
 
         row = {
             "file": file_name,
@@ -166,13 +207,20 @@ def main():
             "specimen": specimen,
             "waveform": waveform,
             "liftoff": liftoff,
-            "auc_roc": anom_res["auc_roc"],
-            "average_precision": anom_res["average_precision"],
-            "ap_chance": anom_res["ap_chance"],
+            "mahalanobis_auc": anom_res["auc_roc"],
+            "mahalanobis_ap": anom_res["average_precision"],
             "cnr": anom_res["cnr"],
+            "linear_probe_auc": lp_auc,
+            "linear_probe_ap": lp_ap,
+            "mlp_probe_auc": mlp_auc,
+            "mlp_probe_ap": mlp_ap,
+            "segmentation_iou": iou_res["iou"],
+            "segmentation_dice": iou_res["dice"],
             "sizing_r2": sizing_r2,
             "sizing_mae_mm": sizing_mae,
-            "sizing_pearson_r": sizing_r,
+            "sizing_rmse_mm": sizing_rmse,
+            "mlp_sizing_r2": mlp_sizing_r2,
+            "mlp_sizing_mae_mm": mlp_sizing_mae,
         }
         results.append(row)
 
@@ -188,13 +236,13 @@ def main():
 
         pbar.set_postfix({
             "specimen": specimen[:4],
-            "AUC": f"{anom_res['auc_roc']:.4f}",
-            "AP": f"{anom_res['average_precision']:.4f}",
+            "LP_AUC": f"{lp_auc:.4f}",
+            "Mahal_AUC": f"{anom_res['auc_roc']:.4f}",
             "CNR": f"{anom_res['cnr']:.2f}",
         })
 
     # Save CSV Report
-    csv_path = os.path.join(args.out_dir, "benchmark_metrics.csv")
+    csv_path = os.path.join(out_dir, "benchmark_metrics.csv")
     fieldnames = list(results[0].keys())
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -202,24 +250,28 @@ def main():
         writer.writerows(results)
 
     # Compute Summary Statistics
-    auc_list = [r["auc_roc"] for r in results]
-    ap_list = [r["average_precision"] for r in results]
+    lp_auc_list = [r["linear_probe_auc"] for r in results]
+    lp_ap_list = [r["linear_probe_ap"] for r in results]
+    mahal_auc_list = [r["mahalanobis_auc"] for r in results]
     cnr_list = [r["cnr"] for r in results]
+    iou_list = [r["segmentation_iou"] for r in results]
 
     summary = {
         "num_files_evaluated": len(results),
-        "mean_auc": float(np.mean(auc_list)),
-        "std_auc": float(np.std(auc_list)),
-        "mean_ap": float(np.mean(ap_list)),
+        "mean_linear_probe_auc": float(np.mean(lp_auc_list)),
+        "std_linear_probe_auc": float(np.std(lp_auc_list)),
+        "mean_linear_probe_ap": float(np.mean(lp_ap_list)),
+        "mean_mahalanobis_auc": float(np.mean(mahal_auc_list)),
         "mean_cnr": float(np.mean(cnr_list)),
+        "mean_segmentation_iou": float(np.mean(iou_list)),
     }
 
     # Summary by Specimen
     for sp in ["Corrosion", "Rivet_v1", "Rivet_v2"]:
         sp_sub = [r for r in results if r["specimen"] == sp]
         if sp_sub:
-            summary[f"{sp}_mean_auc"] = float(np.mean([r["auc_roc"] for r in sp_sub]))
-            summary[f"{sp}_mean_ap"] = float(np.mean([r["average_precision"] for r in sp_sub]))
+            summary[f"{sp}_mean_linear_probe_auc"] = float(np.mean([r["linear_probe_auc"] for r in sp_sub]))
+            summary[f"{sp}_mean_mahalanobis_auc"] = float(np.mean([r["mahalanobis_auc"] for r in sp_sub]))
             summary[f"{sp}_mean_cnr"] = float(np.mean([r["cnr"] for r in sp_sub]))
             if sp == "Corrosion":
                 summary["Corrosion_mean_sizing_r2"] = float(np.mean([r["sizing_r2"] for r in sp_sub]))
@@ -229,31 +281,31 @@ def main():
     for wf in ["Chirp", "Gaussian", "Square"]:
         wf_sub = [r for r in results if r["waveform"] == wf]
         if wf_sub:
-            summary[f"waveform_{wf}_mean_auc"] = float(np.mean([r["auc_roc"] for r in wf_sub]))
-            summary[f"waveform_{wf}_mean_ap"] = float(np.mean([r["average_precision"] for r in wf_sub]))
+            summary[f"waveform_{wf}_mean_linear_probe_auc"] = float(np.mean([r["linear_probe_auc"] for r in wf_sub]))
+            summary[f"waveform_{wf}_mean_mahalanobis_auc"] = float(np.mean([r["mahalanobis_auc"] for r in wf_sub]))
 
     # Summary by Sensor
     for sn in ["Hall_Air_Core", "Hall_Pot_Core", "TMR"]:
         sn_sub = [r for r in results if r["sensor"] == sn]
         if sn_sub:
-            summary[f"sensor_{sn}_mean_auc"] = float(np.mean([r["auc_roc"] for r in sn_sub]))
-            summary[f"sensor_{sn}_mean_ap"] = float(np.mean([r["average_precision"] for r in sn_sub]))
+            summary[f"sensor_{sn}_mean_linear_probe_auc"] = float(np.mean([r["linear_probe_auc"] for r in sn_sub]))
+            summary[f"sensor_{sn}_mean_mahalanobis_auc"] = float(np.mean([r["mahalanobis_auc"] for r in sn_sub]))
 
-    json_path = os.path.join(args.out_dir, "benchmark_summary.json")
+    json_path = os.path.join(out_dir, "benchmark_summary.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"\n=======================================================")
     print(f"BENCHMARK EVALUATION SUMMARY")
-    print(f"Total Files Evaluated: {summary['num_files_evaluated']}")
-    print(f"Overall Mean AUC-ROC: {summary['mean_auc']:.4f} (+/- {summary['std_auc']:.4f})")
-    print(f"Overall Mean AP:      {summary['mean_ap']:.4f}")
-    print(f"Overall Mean CNR:     {summary['mean_cnr']:.2f}")
+    print(f"Total Files Evaluated:       {summary['num_files_evaluated']}")
+    print(f"Linear Probe Mean AUC-ROC:   {summary['mean_linear_probe_auc']:.4f} (+/- {summary['std_linear_probe_auc']:.4f})")
+    print(f"Linear Probe Mean AP:        {summary['mean_linear_probe_ap']:.4f}")
+    print(f"Mahalanobis Mean AUC-ROC:    {summary['mean_mahalanobis_auc']:.4f}")
+    print(f"Overall Mean CNR:            {summary['mean_cnr']:.2f}")
+    print(f"Mean Segmentation IoU:       {summary['mean_segmentation_iou']:.4f}")
     if "Corrosion_mean_sizing_r2" in summary:
-        print(f"Corrosion Sizing R^2: {summary['Corrosion_mean_sizing_r2']:.4f} | Sizing MAE: {summary['Corrosion_mean_sizing_mae_mm']:.2f} mm")
-    print(f"CSV Report:  {csv_path}")
-    print(f"JSON Report: {json_path}")
-    print(f"Heatmaps:    {viz_dir}")
+        print(f"Corrosion Sizing R^2:        {summary['Corrosion_mean_sizing_r2']:.4f} | Sizing MAE: {summary['Corrosion_mean_sizing_mae_mm']:.2f} mm")
+    print(f"Results Directory:           {out_dir}")
     print(f"=======================================================\n", flush=True)
 
 

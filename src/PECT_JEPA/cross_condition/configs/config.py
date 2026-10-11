@@ -9,6 +9,11 @@ from typing import Tuple, List, Optional
 
 @dataclass
 class CrossConditionConfig:
+    # Experiment metadata
+    exp_name: str = "cross_condition_jepa"
+    add_timestamp: bool = True
+    base_exp_dir: str = "experiments/cross_condition/runs"
+
     # Model architecture
     embed_dim: int = 64
     encoder_depth: int = 4
@@ -37,7 +42,9 @@ class CrossConditionConfig:
 
     # Training parameters
     batch_size: int = 256
-    samples_per_epoch: int = 102400  # 100k samples per epoch covering all 112 directional pairs
+    # samples_per_epoch: if None, automatically calculated based on total pair combinations
+    # Default: 400,000 samples/epoch ensures dense exploration of all pairs and coordinates
+    samples_per_epoch: Optional[int] = 409600
     epochs: int = 40
     lr: float = 4e-4
     min_lr: float = 1e-5
@@ -46,6 +53,7 @@ class CrossConditionConfig:
     ema_momentum_end: float = 0.999
     mixed_precision: bool = True
     grad_clip_norm: float = 1.0
+    resume_checkpoint: Optional[str] = None
 
     # Data and Paths
     data_dir: str = "data"

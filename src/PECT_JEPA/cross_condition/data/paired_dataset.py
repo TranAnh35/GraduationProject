@@ -29,7 +29,8 @@ class PairedPECTDataset(Dataset):
         self,
         file_paths: Optional[List[str]] = None,
         data_dir: Optional[str] = None,
-        samples_per_epoch: int = 102400,
+        samples_per_epoch: Optional[int] = None,
+        points_per_pair: int = 4000,
         topology: str = "concentric_star",
         star_radii: Tuple[int, int, int] = (1, 3, 7),
         grid_size: int = 5,
@@ -47,7 +48,7 @@ class PairedPECTDataset(Dataset):
             all_files = glob.glob(os.path.join(data_dir, "**", "*.tdms"), recursive=True)
             all_files = [f for f in all_files if not f.endswith("_index.tdms")]
             file_paths = filter_base_domain_files(all_files)
-        self.samples_per_epoch = samples_per_epoch
+
         self.grid_size = grid_size
         self.temporal_samples = temporal_samples
         self.rng = random.Random(seed)
@@ -96,17 +97,27 @@ class PairedPECTDataset(Dataset):
                     if i != j:
                         self.directed_pairs.append((scan_list[i], scan_list[j]))
 
-        print(f"Loaded {len(self.scans_by_specimen)} specimens with total {len(self.directed_pairs)} directed condition pairs (A -> B != B -> A).")
+        num_pairs = len(self.directed_pairs)
+        print(f"Loaded {len(self.scans_by_specimen)} specimens with total {num_pairs} directed condition pairs (A -> B != B -> A).")
         for spec in self.scans_by_specimen:
             n_scans = len(self.scans_by_specimen[spec])
             print(f"  Specimen '{spec}': {n_scans} condition scans -> {n_scans * (n_scans - 1)} directed pairs.")
+
+        # If samples_per_epoch is not explicitly specified, calculate realistically based on pairs
+        if samples_per_epoch is None:
+            self.samples_per_epoch = num_pairs * points_per_pair  # e.g. 112 * 4,000 = 448,000 samples/epoch
+        else:
+            self.samples_per_epoch = samples_per_epoch
+
+        print(f"Dataset configured: {self.samples_per_epoch:,} patch pairs per epoch (~{self.samples_per_epoch // num_pairs:,} samples/pair).")
 
     def __len__(self):
         return self.samples_per_epoch
 
     def __getitem__(self, idx: int):
-        # 1. Pick a directed pair (A, B) uniformly
-        scan_a, scan_b = self.rng.choice(self.directed_pairs)
+        # 1. Deterministically / uniformly cycle through or pick a directed pair (A, B)
+        pair_idx = idx % len(self.directed_pairs)
+        scan_a, scan_b = self.directed_pairs[pair_idx]
 
         sY = min(scan_a["sY"], scan_b["sY"])
         sX = min(scan_a["sX"], scan_b["sX"])
