@@ -105,7 +105,7 @@ def main():
     print(f"=======================================================\n", flush=True)
 
     # 1. Load Checkpoint
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = ckpt.get("config", CrossConditionConfig())
     model = CrossConditionJEPA(config).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
