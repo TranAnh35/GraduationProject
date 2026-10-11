@@ -65,6 +65,10 @@ class PairedPECTDataset(Dataset):
             # Pre-pad C-scan for ultra-fast slicing
             padded = np.pad(cscan, ((self.pad, self.pad), (self.pad, self.pad), (0, 0)), mode="edge")
 
+            # Extract a 5x5 reference patch from outer sound metal margin (e.g., [10:15, 10:15, :])
+            # which is guaranteed sound metal (no defect present in margins)
+            ref_patch = cscan[10:15, 10:15, :].copy()
+
             s_id = SENSOR_MAP.get(meta["sensor"].lower(), 0)
             w_id = WAVEFORM_MAP.get(meta["waveform"].lower(), 0)
             l_id = LIFTOFF_MAP.get(meta["liftoff"].lower(), 0)
@@ -76,6 +80,7 @@ class PairedPECTDataset(Dataset):
                 "sX": sX,
                 "C": C,
                 "padded": padded,
+                "ref_patch": ref_patch,
                 "cond": np.array([s_id, w_id, l_id], dtype=np.int64),
             })
 
@@ -122,6 +127,7 @@ class PairedPECTDataset(Dataset):
         return {
             "x_a": torch.from_numpy(patch_a).float(),
             "x_b": torch.from_numpy(patch_b).float(),
+            "ref_b": torch.from_numpy(scan_b["ref_patch"]).float(),
             "cond_a": torch.from_numpy(scan_a["cond"]),
             "cond_b": torch.from_numpy(scan_b["cond"]),
             "coord": torch.tensor([r, c], dtype=torch.long),

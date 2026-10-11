@@ -33,38 +33,15 @@ def compute_vicreg_loss(z: torch.Tensor, var_weight: float = 1.0, cov_weight: fl
     return total, var_loss, cov_loss
 
 
-class ConditionEmbedding(nn.Module):
-    """
-    Encodes sensor, waveform, and lift-off condition IDs into condition embedding vector e in R^D.
-    """
-    def __init__(self, embed_dim: int = 64):
-        super().__init__()
-        self.sensor_embed = nn.Embedding(4, embed_dim)
-        self.waveform_embed = nn.Embedding(4, embed_dim)
-        self.liftoff_embed = nn.Embedding(4, embed_dim)
-        self.proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-
-    def forward(self, cond_b: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            cond_b: [B, 3] containing [sensor_id, waveform_id, liftoff_id]
-        Returns:
-            e: [B, 1, embed_dim]
-        """
-        s = self.sensor_embed(cond_b[:, 0])
-        w = self.waveform_embed(cond_b[:, 1])
-        l = self.liftoff_embed(cond_b[:, 2])
-        e = s + w + l
-        return self.proj(e).unsqueeze(1)
-
-
 class CrossConditionJEPA(nn.Module):
     """
-    Cross-Condition Paired JEPA Model.
+    Self-Supervised Cross-Condition Paired JEPA Model (Zero Metadata Injection).
+    - Inputs: Pair (x_A, x_B) at identical physical plate coordinates from two distinct measurement conditions.
+    - Reference: ref_B is a sound-metal background patch from Condition B, tokenized to produce condition token c_B in R^D.
+    - Context: Visible outer ring tokens from Condition A.
+    - Target: Masked core tokens from Condition B.
+    - Predictor: Predicts target latent of Condition B given context of Condition A + condition token c_B.
+    - Loss: Pure L1 loss on masked targets + VICReg on Context Encoder to prevent representation collapse.
     """
     def __init__(self, config: Optional[Spatiotemporal5x5Config] = None):
         super().__init__()
@@ -72,13 +49,13 @@ class CrossConditionJEPA(nn.Module):
             config = get_default_config_5x5()
         self.config = config
 
-        # 1. Tokenizer (shared between A and B)
+        # 1. Tokenizer (shared between A and B, pure physical signal processing)
         self.tokenizer = build_tokenizer_5x5(config)
 
-        # 2. Context Encoder (encodes x_A)
+        # 2. Context Encoder (encodes x_A, metadata-free)
         self.context_encoder = build_context_encoder_5x5(config)
 
-        # 4. Target Encoder (encodes x_B, stop-gradient)
+        # 3. Target Encoder (encodes x_B, stop-gradient)
         self.target_encoder = TargetEncoder5x5(
             embed_dim=config.embed_dim,
             depth=config.encoder_depth,
@@ -92,10 +69,14 @@ class CrossConditionJEPA(nn.Module):
         )
         self._init_target_encoder()
 
-        # 5. Condition Embedding of target Condition B
-        self.cond_embed = ConditionEmbedding(embed_dim=config.embed_dim)
+        # 4. Self-Supervised Condition Projector (maps pooled ref_b tokens to condition token)
+        self.cond_proj = nn.Sequential(
+            nn.Linear(config.embed_dim, config.embed_dim),
+            nn.GELU(),
+            nn.Linear(config.embed_dim, config.embed_dim),
+        )
 
-        # 6. Predictor
+        # 5. Predictor
         self.predictor = build_predictor_5x5(config)
 
         # Default mask: 9 core probes as target (indices 0..8)
@@ -113,17 +94,30 @@ class CrossConditionJEPA(nn.Module):
             for p_tgt, p_ctx in zip(self.target_encoder.encoder.parameters(), self.context_encoder.parameters()):
                 p_tgt.data.mul_(momentum).add_(p_ctx.data, alpha=1.0 - momentum)
 
+    def extract_condition_token(self, ref_b: torch.Tensor) -> torch.Tensor:
+        """
+        Extracts self-supervised condition token c_B from sound-metal reference patch ref_b.
+        Args:
+            ref_b: [B, 5, 5, C] raw background patch from Condition B.
+        Returns:
+            c_b: [B, 1, D] condition token representing Condition B transfer function.
+        """
+        with torch.no_grad():
+            ref_tokens, _ = self.tokenizer(ref_b) # [B, 25, D]
+            ref_mean = torch.mean(ref_tokens, dim=1) # [B, D]
+        return self.cond_proj(ref_mean).unsqueeze(1) # [B, 1, D]
+
     def forward(
         self,
         x_a: torch.Tensor,
         x_b: torch.Tensor,
-        cond_b: torch.Tensor,
+        ref_b: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward step:
         x_a: [B, 5, 5, C] measurement condition A
         x_b: [B, 5, 5, C] measurement condition B at SAME coordinates
-        cond_b: [B, 3] metadata of condition B
+        ref_b: [B, 5, 5, C] background sound-metal reference patch of condition B
         """
         B = x_a.shape[0]
         device = x_a.device
@@ -132,7 +126,10 @@ class CrossConditionJEPA(nn.Module):
         tokens_a, pos_a = self.tokenizer(x_a) # [B, 25, D]
         tokens_b, pos_b = self.tokenizer(x_b) # [B, 25, D]
 
-        # 2. Partition: Context from A (16 outer), Target from B (9 core)
+        # 2. Extract self-supervised condition token for Condition B
+        c_b = self.extract_condition_token(ref_b) # [B, 1, D]
+
+        # 3. Partition: Context from A (16 outer), Target from B (9 core)
         ctx_idx = self.default_context_idx.unsqueeze(0).expand(B, -1) # [B, 16]
         tgt_idx = self.default_target_idx.unsqueeze(0).expand(B, -1) # [B, 9]
 
@@ -144,14 +141,14 @@ class CrossConditionJEPA(nn.Module):
         tgt_tokens_b = tokens_b[batch_arange, tgt_idx] # [B, 9, D]
         tgt_pos_b = pos_b[batch_arange, tgt_idx]
 
-        # 3. Context Encoder encodes visible context from A
+        # 4. Context Encoder encodes visible context from A
         H_ctx_a = self.context_encoder(
             ctx_tokens_a,
             ctx_pos_a,
             context_indices=ctx_idx
         ) # [B, 16, D]
 
-        # 4. Target Encoder encodes target from B (detached)
+        # 5. Target Encoder encodes target from B (detached)
         with torch.no_grad():
             H_tgt_b = self.target_encoder(
                 tgt_tokens_b,
@@ -159,11 +156,10 @@ class CrossConditionJEPA(nn.Module):
                 target_indices=tgt_idx
             ) # [B, 9, D]
 
-        # 5. Condition Query: condition B embedding added to target queries
-        e_b = self.cond_embed(cond_b) # [B, 1, D]
-        conditioned_tgt_pos = tgt_pos_b + e_b
+        # 6. Conditioned target queries: condition token c_B modulates target positions
+        conditioned_tgt_pos = tgt_pos_b + c_b
 
-        # 6. Predictor predicts H_tgt_b from H_ctx_a + conditioned target queries
+        # 7. Predictor predicts H_tgt_b from H_ctx_a + conditioned target queries
         H_pred_b = self.predictor(
             H_context=H_ctx_a,
             target_pos=conditioned_tgt_pos,
@@ -171,10 +167,10 @@ class CrossConditionJEPA(nn.Module):
             target_indices=tgt_idx,
         ) # [B, 9, D]
 
-        # 7. Prediction Loss (L1)
+        # 8. Prediction Loss (Pure L1 Loss - preserves subtle flaw gradients)
         pred_loss = F.l1_loss(H_pred_b, H_tgt_b)
 
-        # 8. VICReg Regularization on H_ctx_a representations
+        # 9. VICReg Regularization on H_ctx_a representations to prevent encoder collapse
         flat_rep = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
         vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
             flat_rep,
