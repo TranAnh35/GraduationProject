@@ -119,6 +119,7 @@ class CrossConditionTrainer:
             file=sys.stdout,
             dynamic_ncols=True,
             leave=True,
+            mininterval=0.5,
         )
 
         sample_reps = []
