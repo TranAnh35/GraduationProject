@@ -185,20 +185,19 @@ class CrossConditionTrainer:
         epochs: Optional[int] = None,
     ) -> str:
         total_epochs = epochs or self.config.epochs
-        loader = DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=(self.device.type == "cuda"),
-            drop_last=True,
+
+        batches_per_epoch = len(dataset) // self.config.batch_size
+        cycle_info = (
+            f" [Macro-Cycle Partitioning: K={dataset.num_partitions} sub-epochs/cycle]"
+            if getattr(dataset, "use_partitioning", False)
+            else ""
         )
 
         header = (
             f"\n=======================================================\n"
-            f"Starting Cross-Condition JEPA Training\n"
-            f"Epochs: {self.start_epoch} -> {total_epochs} | Batches/Epoch: {len(loader)} | Batch Size: {self.config.batch_size}\n"
-            f"Samples/Epoch: {len(loader) * self.config.batch_size:,} across 112 Directed Pairs\n"
+            f"Starting Cross-Condition JEPA Training{cycle_info}\n"
+            f"Epochs: {self.start_epoch} -> {total_epochs} | Batches/Epoch: {batches_per_epoch:,} | Batch Size: {self.config.batch_size}\n"
+            f"Samples/Epoch: {len(dataset):,} across 112 Directed Pairs\n"
             f"Device: {self.device} | AMP Mixed Precision: {self.config.mixed_precision}\n"
             f"=======================================================\n"
         )
@@ -213,7 +212,19 @@ class CrossConditionTrainer:
         best_ckpt_path = os.path.join(ckpt_dir, "best_cross_condition_jepa.pt")
 
         for epoch in range(self.start_epoch, total_epochs + 1):
-            epoch_metrics = self.train_epoch(loader, epoch, total_epochs)
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(epoch)
+
+            epoch_loader = DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=(self.device.type == "cuda"),
+                drop_last=True,
+            )
+
+            epoch_metrics = self.train_epoch(epoch_loader, epoch, total_epochs)
 
             # Record history
             for k in self.history:

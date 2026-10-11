@@ -33,6 +33,7 @@ class PairedPECTDataset(Dataset):
         data_dir: Optional[str] = None,
         grid_stride: int = 1,
         samples_per_epoch: Optional[int] = None,
+        num_partitions: int = 10,
         topology: str = "concentric_star",
         star_radii: Tuple[int, int, int] = (1, 3, 7),
         grid_size: int = 5,
@@ -41,6 +42,8 @@ class PairedPECTDataset(Dataset):
         seed: int = 42,
     ):
         super().__init__()
+        self.num_partitions = max(1, int(num_partitions))
+        self.seed = seed
         import glob
         from .split import filter_base_domain_files
 
@@ -123,20 +126,57 @@ class PairedPECTDataset(Dataset):
         # Total exhaustive universe of samples = num_pairs * coords_per_pair
         self.total_exhaustive_samples = num_pairs * self.coords_per_pair
 
-        if samples_per_epoch is None:
-            self.samples_per_epoch = self.total_exhaustive_samples
-            print(f"Dataset configured: 100% EXHAUSTIVE COVERAGE -> {self.samples_per_epoch:,} patch pairs per epoch ({self.coords_per_pair:,} pixels x {num_pairs} condition pairs).")
-        else:
+        if samples_per_epoch is not None:
             self.samples_per_epoch = int(samples_per_epoch)
-            print(f"Dataset configured: Capped to {self.samples_per_epoch:,} samples/epoch (Exhaustive total available: {self.total_exhaustive_samples:,}).")
+            self.use_partitioning = False
+            print(f"Dataset configured: Explicitly capped to {self.samples_per_epoch:,} samples/epoch (Universe: {self.total_exhaustive_samples:,}).")
+        else:
+            self.samples_per_epoch = self.total_exhaustive_samples // self.num_partitions
+            self.use_partitioning = (self.num_partitions > 1)
+            if self.use_partitioning:
+                print(f"Dataset configured: MACRO-CYCLE PARTITIONING (K={self.num_partitions}) -> {self.samples_per_epoch:,} patch pairs per sub-epoch.")
+                print(f"  Complete 100% traversal of {self.total_exhaustive_samples:,} universe achieved every {self.num_partitions} sub-epochs without duplicates or omissions.")
+            else:
+                print(f"Dataset configured: 100% EXHAUSTIVE COVERAGE -> {self.samples_per_epoch:,} patch pairs per epoch ({self.coords_per_pair:,} pixels x {num_pairs} condition pairs).")
+
+        self.current_cycle_idx = -1
+        self.current_cycle_perm = None
+        self.active_indices = None
+        self.set_epoch(1)
+
+    def set_epoch(self, epoch: int):
+        """
+        Sets the active epoch to slice the exact partition of the current macro-cycle.
+        Guarantees that across K consecutive epochs, 100% of the Cartesian universe is traversed exactly once.
+        """
+        if not getattr(self, "use_partitioning", False):
+            return
+
+        self.epoch = epoch
+        cycle_idx = (epoch - 1) // self.num_partitions
+        sub_epoch_idx = (epoch - 1) % self.num_partitions
+
+        if cycle_idx != self.current_cycle_idx or self.current_cycle_perm is None:
+            self.current_cycle_idx = cycle_idx
+            # Fast reproducible permutation for this cycle
+            rng = np.random.RandomState(self.seed + cycle_idx * 10007)
+            self.current_cycle_perm = rng.permutation(self.total_exhaustive_samples)
+
+        start = sub_epoch_idx * self.samples_per_epoch
+        end = start + self.samples_per_epoch if sub_epoch_idx < (self.num_partitions - 1) else self.total_exhaustive_samples
+        self.active_indices = self.current_cycle_perm[start:end]
 
     def __len__(self):
+        if getattr(self, "use_partitioning", False) and self.active_indices is not None:
+            return len(self.active_indices)
         return self.samples_per_epoch
 
     def __getitem__(self, idx: int):
-        # Bijective mapping: map idx to (pair_idx, coord_idx)
-        # If capped or expanded beyond total_exhaustive_samples, modulo ensures cycling without out-of-bounds
-        eff_idx = idx % self.total_exhaustive_samples
+        if getattr(self, "use_partitioning", False) and self.active_indices is not None:
+            eff_idx = int(self.active_indices[idx])
+        else:
+            eff_idx = idx % self.total_exhaustive_samples
+
         pair_idx = eff_idx // self.coords_per_pair
         coord_idx = eff_idx % self.coords_per_pair
 

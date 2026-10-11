@@ -42,10 +42,11 @@ class CrossConditionConfig:
 
     # Training parameters
     batch_size: int = 256
-    # samples_per_epoch: if None, 100% exhaustive traversal over ALL coordinates across ALL directed pairs
+    num_partitions: int = 10    # K partitions per macro-cycle (K sub-epochs = 100% full universe pass)
+    # samples_per_epoch: if None, computed automatically from total_exhaustive_samples // num_partitions
     samples_per_epoch: Optional[int] = None
     grid_stride: int = 1        # 1 = all 72,900 pixels per C-scan; 2 = stride 2 subsample (18,225 px)
-    epochs: int = 40
+    epochs: int = 50
     lr: float = 4e-4
     min_lr: float = 1e-5
     weight_decay: float = 1e-4

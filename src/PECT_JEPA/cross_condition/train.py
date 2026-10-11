@@ -27,8 +27,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Official Cross-Condition PECT-JEPA Training")
     parser.add_argument("--exp_name", type=str, default="cross_jepa_base", help="Experiment name")
     parser.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True, help="Append timestamp to experiment directory")
-    parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size per training step")
+    parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions K per macro-cycle (K sub-epochs = 1 full universe pass)")
     parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100% all 72,900 pixels per scan)")
     parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (default None: 100% exhaustive dataset traversal)")
     parser.add_argument("--lr", type=float, default=4e-4, help="Peak learning rate for Cosine schedule")
@@ -57,6 +58,7 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         grid_stride=args.grid_stride,
+        num_partitions=args.num_partitions,
         samples_per_epoch=args.samples_per_epoch,
         lr=args.lr,
         min_lr=args.min_lr,
@@ -79,11 +81,12 @@ def main():
     logger.info(f"Configuration: {config}")
 
     # Build Paired Dataset across all directed pairs
-    logger.info(f"Loading Base Domain Dataset (Exhaustive grid stride: {config.grid_stride})...")
+    logger.info(f"Loading Base Domain Dataset (Exhaustive grid stride: {config.grid_stride}, K={config.num_partitions} partitions)...")
     dataset = PairedPECTDataset(
         data_dir=config.data_dir,
         grid_stride=config.grid_stride,
         samples_per_epoch=config.samples_per_epoch,
+        num_partitions=config.num_partitions,
         transform_csv=config.transform_csv,
     )
 
