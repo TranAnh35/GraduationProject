@@ -1,0 +1,23 @@
+{
+  "loss_type": "l1",
+  "smooth_l1_beta": 1.0,
+  "mixed_precision_amp": true,
+  "dtype": "torch.float32",
+  "grad_stats_init": {
+    "norm_total": 0.0026041667442768812,
+    "norm_pos_direction": 0.00047464307863265276,
+    "norm_orthogonal": 0.002560546388849616,
+    "pos_ratio_percent": 18.226286677414112,
+    "orth_ratio_percent": 98.32494064473647,
+    "pred_param_grad_norm": 1.9281176328659058
+  },
+  "grad_stats_end": {
+    "norm_total": 0.0026041667442768812,
+    "norm_pos_direction": 0.0005818211357109249,
+    "norm_orthogonal": 0.002538339700549841,
+    "pos_ratio_percent": 22.341922366160155,
+    "orth_ratio_percent": 97.47220416688944,
+    "pred_param_grad_norm": 0.31228893995285034
+  },
+  "r2_position_core": 0.9970962994532753,
+  "r2_file": 

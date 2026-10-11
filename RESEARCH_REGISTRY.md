@@ -2134,3 +2134,18 @@ Pilot "qua cổng" khi cả bốn cổng đều đạt cho nhánh A. T0 và nhá
   1. Chạy đánh giá của pipeline tốt nhất KHÔNG dùng JEPA (tokenizer T1 + readout M1/M2; RMS; T0 làm tham chiếu) trên G1-G3 với CI cụm.
   2. Viết `FINAL_CLAIM_SHEET.md`: (i) kết quả kiểm toán rò rỉ và đối chứng; (ii) kết quả ablation JEPA (nhánh A, B, 20 epoch); (iii) danh sách claim được phép và claim bị cấm; (iv) các hạn chế (3 coupon, một tấm nhôm, 2 mức mỗi trục trong pretrain).
   3. Đề xuất bố cục báo cáo/luận văn.
+
+---
+
+### 8. KẾT LUẬN PROTOCOL V2 VÀ THI HÀNH NHÁNH Y (BRANCH Y RATIFICATION)
+- **Thời điểm kết luận**: 2026-10-11
+- **Kết quả đánh giá 4 Cổng Pre-flight (Pilot Branch A)**:
+  - **G-Pre-1**: $R^2_{\text{pos}} = 0.00\%$ (PASS triệt tiêu vị trí), nhưng $R^2_{\text{file}} = 76.25\% > 50\%$ (FAIL do trôi dạt DC phần cứng giữa các file).
+  - **G-Pre-2**: Tỉ số loss 3 epoch = 1.018 (FAIL); 20 epoch = 0.0004 (PASS sau hội tụ sâu).
+  - **G-Pre-3**: Mixed Fastener AUC (N=31) = 47.33% [95% CI: 13.81%, 80.46%] (Cận dưới CI < 50%, FAIL).
+  - **G-Pre-4**: Trên cả 4 ô $\{G2, G3\} \times \{M0, M1\}$ của Corrosion, JEPA thua sút Random Encoder ($C1a$) và Raw RMS ($C4$); $\Delta\text{AP} < +0.03$ ở 4/4 ô (FAIL).
+- **Phán quyết Pilot**: **FAIL** $\rightarrow$ **Kích hoạt Nhánh Y (Branch Y)**. Phase 1 (81 files x 20 epochs x 5 seeds) chính thức KHÔNG khởi động để bảo đảm tính trung thực khoa học và tránh lãng phí tài nguyên tính toán.
+- **Tài liệu bàn giao cốt lõi**:
+  - File công bố chính thức: `FINAL_CLAIM_SHEET.md` (chứa toàn bộ kết quả kiểm toán rò rỉ, ablation JEPA, danh sách claim được phép / bị cấm, giới hạn dữ liệu và đóng gói pipeline Non-JEPA tốt nhất).
+  - Đóng gói Non-JEPA khuyến nghị: **Raw RMS 25D (C4) + Chuẩn hoá M1** (AP - chance = +0.2147 trên Corrosion, AUC = 68.90% trên Mixed Fasteners).
+  - Chuyển đổi định hướng nghiên cứu: Chuyển từ đề tài "Xây dựng Foundation Model PECT" sang đề tài luận văn/bài báo cơ chế: *"Tại sao Self-Supervised World Model thất bại trong kiểm tra không phá hủy PECT: Nghiên cứu cơ chế về Trôi dạt cảm biến, Mất cân bằng dữ liệu và Thiết lập Benchmark không rò rỉ"*.
