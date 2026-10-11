@@ -1,90 +1,128 @@
 """
-Paired Cross-Waveform Dataset for PECT-JEPA v2-A.
-Extracts coordinate-matched patches (x_A, x_B) across different excitation waveforms (Square, Gauss, Chirp)
-at identical spatial probe coordinates on the specimen.
-
-Zero external metadata labels injected; preserves 100% self-supervised data pipeline.
+Paired Cross-Condition Dataset for PECT-JEPA.
+Samples spatial patches (x_A, x_B) at IDENTICAL physical coordinates (r, c)
+from two distinct measurement conditions (Sensor, Waveform, Liftoff) on the SAME physical specimen.
 """
 
 import os
-from typing import Dict, List, Tuple, Optional
+import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from typing import List, Dict, Tuple, Optional
+from pathlib import Path
 
-from src.PECT_JEPA.spatiotemporal_5x5.data.dataset import PECT5x5Dataset
-from src.PECT_JEPA.spatiotemporal_5x5.data.split import extract_file_metadata
+from .split import extract_file_metadata
+from .topologies import get_spatial_topology_offsets
+from ..evaluation.cscan_extractor import load_cscan_from_tdms
 
 
-class PairedWaveformPECT5x5Dataset(Dataset):
+SENSOR_MAP = {"hall_air_core": 0, "hall_pot_core": 1, "tmr": 2}
+WAVEFORM_MAP = {"square": 0, "gaussian": 1, "chirp": 2}
+LIFTOFF_MAP = {"z1": 0, "z2": 1, "z3": 2}
+
+
+class PairedPECTDataset(Dataset):
     """
-    Pairs coordinate-matched 5x5 patches from two different waveforms (e.g. Square and Chirp)
-    at the exact same spatial grid locations (row, col).
+    In-memory Paired PECT Dataset.
+    Loads base training C-scans into RAM and provides infinite or epoch-based
+    cross-condition coordinate-aligned patch pairs.
     """
     def __init__(
         self,
-        base_dataset: PECT5x5Dataset,
-        waveform_pair: Tuple[str, str] = ("Square", "Chirp"),
+        file_paths: List[str],
+        samples_per_epoch: int = 20480,
+        topology: str = "concentric_star",
+        star_radii: Tuple[int, int, int] = (1, 3, 7),
+        grid_size: int = 5,
+        temporal_samples: int = 128,
+        seed: int = 42,
     ):
         super().__init__()
-        self.base_dataset = base_dataset
-        self.wf_A, self.wf_B = waveform_pair
+        self.samples_per_epoch = samples_per_epoch
+        self.grid_size = grid_size
+        self.temporal_samples = temporal_samples
+        self.rng = random.Random(seed)
 
-        # Group sample indices by (specimen, liftoff, row, col) to find coordinate matches
-        print(f"Indexing paired samples for {self.wf_A} <-> {self.wf_B}...")
-        self.pairs: List[Tuple[int, int]] = []
-        self._build_coordinate_pairs()
-        print(f"Found {len(self.pairs)} exactly matched spatial pairs out of {len(self.base_dataset)} samples.")
+        # Offsets
+        self.offsets = get_spatial_topology_offsets(topology, star_radii, grid_size) # [25, 2]
+        self.max_off = int(np.max(np.abs(self.offsets)))
+        self.pad = max(grid_size // 2, self.max_off)
 
-    def _build_coordinate_pairs(self):
-        index_map = {}
-        for idx in range(len(self.base_dataset)):
-            # Extract metadata and spatial coordinate
-            file_path = self.base_dataset.file_paths[self.base_dataset.file_indices[idx]]
-            meta = extract_file_metadata(file_path)
-            wf = meta["waveform"]
-            if wf not in (self.wf_A, self.wf_B):
-                continue
+        # Load and group scans by specimen
+        self.scans_by_specimen: Dict[str, List[Dict]] = {}
+        print(f"Loading {len(file_paths)} paired training C-scans into RAM...")
 
-            r = self.base_dataset.row_indices[idx]
-            c = self.base_dataset.col_indices[idx]
-            sp = meta["specimen"]
-            lo = meta["liftoff"]
-            key = (sp, lo, r, c)
+        for fpath in file_paths:
+            meta = extract_file_metadata(fpath)
+            spec = meta["specimen"]
+            if spec not in self.scans_by_specimen:
+                self.scans_by_specimen[spec] = []
 
-            if key not in index_map:
-                index_map[key] = {}
-            index_map[key][wf] = idx
+            cscan = load_cscan_from_tdms(fpath) # [sY, sX, C]
+            sY, sX, C = cscan.shape
 
-        for key, wfs in index_map.items():
-            if self.wf_A in wfs and self.wf_B in wfs:
-                self.pairs.append((wfs[self.wf_A], wfs[self.wf_B]))
+            # Pre-pad C-scan for ultra-fast slicing
+            padded = np.pad(cscan, ((self.pad, self.pad), (self.pad, self.pad), (0, 0)), mode="edge")
 
-    def __len__(self) -> int:
-        return len(self.pairs)
+            s_id = SENSOR_MAP.get(meta["sensor"].lower(), 0)
+            w_id = WAVEFORM_MAP.get(meta["waveform"].lower(), 0)
+            l_id = LIFTOFF_MAP.get(meta["liftoff"].lower(), 0)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        idx_A, idx_B = self.pairs[idx]
-        sample_A = self.base_dataset[idx_A]
-        sample_B = self.base_dataset[idx_B]
+            self.scans_by_specimen[spec].append({
+                "file_path": fpath,
+                "meta": meta,
+                "sY": sY,
+                "sX": sX,
+                "C": C,
+                "padded": padded,
+                "cond": np.array([s_id, w_id, l_id], dtype=np.int64),
+            })
+
+        self.specimen_keys = list(self.scans_by_specimen.keys())
+        print(f"Loaded specimens: {self.specimen_keys}")
+        for k in self.specimen_keys:
+            print(f"  Specimen '{k}': {len(self.scans_by_specimen[k])} condition scans.")
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __getitem__(self, idx: int):
+        # 1. Pick a random specimen
+        spec = self.rng.choice(self.specimen_keys)
+        scan_list = self.scans_by_specimen[spec]
+
+        # 2. Pick two distinct condition scans A and B
+        if len(scan_list) >= 2:
+            idx_a, idx_b = self.rng.sample(range(len(scan_list)), 2)
+        else:
+            idx_a, idx_b = 0, 0
+
+        scan_a = scan_list[idx_a]
+        scan_b = scan_list[idx_b]
+
+        sY = min(scan_a["sY"], scan_b["sY"])
+        sX = min(scan_a["sX"], scan_b["sX"])
+
+        # 3. Pick random physical coordinates (r, c)
+        r = self.rng.randint(0, sY - 1)
+        c = self.rng.randint(0, sX - 1)
+
+        # 4. Extract star patches
+        r_pad = r + self.pad
+        c_pad = c + self.pad
+
+        sample_r = r_pad + self.offsets[:, 0]
+        sample_c = c_pad + self.offsets[:, 1]
+
+        # Shape [25, C] reshaped to [5, 5, C]
+        patch_a = scan_a["padded"][sample_r, sample_c, :].reshape(self.grid_size, self.grid_size, -1)
+        patch_b = scan_b["padded"][sample_r, sample_c, :].reshape(self.grid_size, self.grid_size, -1)
 
         return {
-            "data_A": sample_A["data"],          # [5, 5, C]
-            "data_B": sample_B["data"],          # [5, 5, C]
-            "file_id_A": sample_A.get("file_id", 0),
-            "file_id_B": sample_B.get("file_id", 0),
+            "x_a": torch.from_numpy(patch_a).float(),
+            "x_b": torch.from_numpy(patch_b).float(),
+            "cond_a": torch.from_numpy(scan_a["cond"]),
+            "cond_b": torch.from_numpy(scan_b["cond"]),
+            "coord": torch.tensor([r, c], dtype=torch.long),
         }
-
-
-def collate_paired_5x5_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    data_A = torch.stack([item["data_A"] for item in batch], dim=0)
-    data_B = torch.stack([item["data_B"] for item in batch], dim=0)
-    file_ids_A = torch.tensor([item["file_id_A"] for item in batch], dtype=torch.long)
-    file_ids_B = torch.tensor([item["file_id_B"] for item in batch], dtype=torch.long)
-
-    return {
-        "data_A": data_A,
-        "data_B": data_B,
-        "file_ids_A": file_ids_A,
-        "file_ids_B": file_ids_B,
-    }
