@@ -121,7 +121,7 @@ class CrossConditionPredictor(nn.Module):
         if config is None:
             config = CrossConditionConfig()
         self.config = config
-        self.modulation = getattr(config, "condition_modulation", "adaln")
+        self.modulation = getattr(config, "condition_modulation", "cross_attention")
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
@@ -147,15 +147,24 @@ class CrossConditionPredictor(nn.Module):
         B, N_tgt, D = target_pos.shape
         queries = self.mask_token.expand(B, N_tgt, -1) + target_pos
 
+        H_context_kv = H_context
         cond_for_block = None
         if condition_token is not None:
-            if self.modulation == "additive":
+            if self.modulation == "cross_attention":
+                # Cross-Attention Conditioning: concatenate condition token c_B to context key-values
+                # Target queries directly cross-attend to [H_context, c_B] in R^{B x (N_ctx + 1) x D}
+                if condition_token.ndim == 2:
+                    c = condition_token.unsqueeze(1)
+                else:
+                    c = condition_token
+                H_context_kv = torch.cat([H_context, c], dim=1)
+            elif self.modulation == "additive":
                 queries = queries + condition_token
             elif self.modulation == "adaln":
                 cond_for_block = condition_token
 
         q = queries
         for blk in self.blocks:
-            q = blk(target_queries=q, H_context=H_context, condition_vec=cond_for_block)
+            q = blk(target_queries=q, H_context=H_context_kv, condition_vec=cond_for_block)
 
         return self.norm(q)

@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (0.0 to disable)")
     parser.add_argument("--cov_weight", type=float, default=1.0, help="VICReg covariance penalty weight (0.0 to disable)")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
-    parser.add_argument("--condition_modulation", type=str, default="adaln", choices=["adaln", "additive", "none"], help="Modulation type for condition token c_b")
+    parser.add_argument("--condition_modulation", type=str, default="cross_attention", choices=["cross_attention", "adaln", "additive", "none"], help="Modulation type for condition token c_b")
     parser.add_argument("--tokenizer_type", type=str, default="energy_adaptive", choices=["energy_adaptive", "dual_domain"], help="Tokenizer type ('energy_adaptive' with temporal instance-norm or baseline 'dual_domain')")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
     parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")

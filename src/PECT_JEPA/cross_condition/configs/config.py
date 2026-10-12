@@ -34,7 +34,7 @@ class CrossConditionConfig:
     num_target_probes: int = 9
     num_context_probes: int = 16
     use_condition_token: bool = True  # If False, disables c_b condition routing
-    condition_modulation: str = "adaln"  # 'adaln' (Adaptive LayerNorm modulation), 'additive' (bias), 'none'
+    condition_modulation: str = "cross_attention"  # 'cross_attention' (KV concatenation), 'adaln', 'additive', 'none'
     tokenizer_type: str = "energy_adaptive"  # 'energy_adaptive' (SOTA instance-norm + saliency), 'dual_domain'
 
     # Loss weights
