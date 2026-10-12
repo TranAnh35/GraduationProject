@@ -33,9 +33,9 @@ class CrossConditionConfig:
     # Masking specification (9 core target probes, 16 outer context probes)
     num_target_probes: int = 9
     num_context_probes: int = 16
-    use_condition_token: bool = True  # If False, disables c_b condition routing
-    condition_modulation: str = "query_projection"  # 'query_projection' (Projected into target queries), 'cross_attention', 'adaln', 'additive', 'none'
-    tokenizer_type: str = "energy_adaptive"  # 'energy_adaptive' (SOTA instance-norm + saliency), 'dual_domain'
+    use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
+    condition_modulation: str = "none"  # 'query_projection', 'cross_attention', 'adaln', 'additive', 'none'
+    tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'continuous_scale_invariant'
     relative_target: bool = False  # If False, predicts full-field target H_tgt preserving natural target variance
 
     # Loss weights

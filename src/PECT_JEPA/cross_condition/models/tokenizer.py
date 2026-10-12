@@ -46,6 +46,9 @@ class DualDomainTokenizer(nn.Module):
         if self.tokenizer_type == "energy_adaptive":
             # x_norm [C] + peak_time [1] + V_pp [1] + energy [1] = C + 3
             self.time_proj = nn.Linear(self.temporal_samples + 3, self.time_dim)
+        elif self.tokenizer_type == "waveform_invariant":
+            # x_shape [C] + log_energy [1] + t_peak [1] = C + 2
+            self.time_proj = nn.Linear(self.temporal_samples + 2, self.time_dim)
         else:
             self.time_proj = nn.Linear(self.temporal_samples, self.time_dim)
 
@@ -53,6 +56,9 @@ class DualDomainTokenizer(nn.Module):
         if self.tokenizer_type == "energy_adaptive":
             # phase [K] + log-mag [K] + phase_gated [K] + centroid [1] + spread [1] = 3*K + 2
             spectral_input_dim = self.num_harmonics * 3 + 2
+        elif self.tokenizer_type == "waveform_invariant":
+            # phase_coherent [K] + saliency [K] = 2*K
+            spectral_input_dim = self.num_harmonics * 2
         else:
             spectral_input_dim = self.num_harmonics * 2
         self.freq_proj = nn.Linear(spectral_input_dim, self.freq_dim)
@@ -116,6 +122,28 @@ class DualDomainTokenizer(nn.Module):
             f_spread = torch.sqrt(torch.sum(((k_idx - f_c) ** 2) * saliency, dim=-1, keepdim=True) + 1e-8)
 
             spectral_feat = torch.cat([phase, mag, phase_gated, f_c, f_spread], dim=-1).to(x_flat.dtype)
+            z_freq = self.freq_proj(spectral_feat)  # [B, 25, freq_dim]
+
+        elif self.tokenizer_type == "waveform_invariant":
+            # --- 1. Scale-Invariant Time Domain Branch ---
+            # L2 normalized waveform shape: strictly unit energy across all waveforms
+            norm_l2 = torch.norm(x_flat, p=2, dim=-1, keepdim=True) + 1e-6
+            x_shape = x_flat / norm_l2  # [B, 25, C] - removes waveform amplitude scaling
+            log_energy = torch.log1p(norm_l2)  # [B, 25, 1] - compact energy scalar
+            t_peak = torch.argmax(torch.abs(x_shape), dim=-1, keepdim=True).float() / float(C)  # [B, 25, 1]
+            time_feat = torch.cat([x_shape, log_energy, t_peak], dim=-1)  # [B, 25, C + 2]
+            z_time = self.time_proj(time_feat)  # [B, 25, time_dim]
+
+            # --- 2. Spectral Coherence Phase Branch (Dodd-Deeds Invariant) ---
+            x_fp32 = x_flat.float()
+            x_fft = torch.fft.rfft(x_fp32, dim=-1)
+            x_harmonics = x_fft[..., 1:self.num_harmonics + 1]  # [B, 25, K]
+            phase = torch.angle(x_harmonics) / torch.pi  # [-1, 1]
+            mag_linear = torch.abs(x_harmonics)
+            power = mag_linear ** 2
+            saliency = power / (torch.sum(power, dim=-1, keepdim=True) + 1e-8)  # Relative power distribution
+            phase_coherent = saliency * phase  # Only prominent frequencies contribute phase!
+            spectral_feat = torch.cat([phase_coherent, saliency], dim=-1).to(x_flat.dtype)  # [B, 25, 2 * K]
             z_freq = self.freq_proj(spectral_feat)  # [B, 25, freq_dim]
 
         else:

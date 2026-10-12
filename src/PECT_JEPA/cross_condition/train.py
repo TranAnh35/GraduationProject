@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument("--relative_target", type=lambda v: v.lower() == "true", default=False, help="Predict relative flaw perturbation Delta H (default False: full target H_tgt)")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
     parser.add_argument("--condition_modulation", type=str, default="query_projection", choices=["query_projection", "cross_attention", "adaln", "additive", "none"], help="Modulation type for condition token c_b")
-    parser.add_argument("--tokenizer_type", type=str, default="energy_adaptive", choices=["energy_adaptive", "dual_domain"], help="Tokenizer type ('energy_adaptive' with temporal instance-norm or baseline 'dual_domain')")
+    parser.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["energy_adaptive", "dual_domain", "waveform_invariant"], help="Tokenizer type ('waveform_invariant', 'dual_domain', 'energy_adaptive')")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
     parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")
     parser.add_argument("--early_stopping_metric", type=str, default="composite", choices=["composite", "val_auc", "latent_snr", "loss"], help="Metric to monitor for early stopping and best checkpoint")
