@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (0.0 to disable)")
     parser.add_argument("--cov_weight", type=float, default=1.0, help="VICReg covariance penalty weight (0.0 to disable)")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
+    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of warmup epochs (linear ramp from min_lr to peak lr)")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
@@ -58,6 +59,7 @@ def main():
         exp_name=args.exp_name,
         add_timestamp=args.add_timestamp,
         epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
         batch_size=args.batch_size,
         grid_stride=args.grid_stride,
         num_partitions=args.num_partitions,

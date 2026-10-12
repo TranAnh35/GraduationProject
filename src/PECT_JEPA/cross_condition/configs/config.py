@@ -48,6 +48,7 @@ class CrossConditionConfig:
     samples_per_epoch: Optional[int] = None
     grid_stride: int = 1        # 1 = all 72,900 pixels per C-scan; 2 = stride 2 subsample (18,225 px)
     epochs: int = 50
+    warmup_epochs: int = 3      # Number of warmup epochs (linear ramp from min_lr to peak lr)
     lr: float = 4e-4
     min_lr: float = 1e-5
     weight_decay: float = 1e-4

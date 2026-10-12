@@ -101,16 +101,23 @@ class CrossConditionTrainer:
         running_var = 0.0
         running_cov = 0.0
 
-        # Cosine learning rate per epoch
-        lr = self.config.min_lr + 0.5 * (self.config.lr - self.config.min_lr) * (
-            1.0 + math.cos(math.pi * epoch / total_epochs)
-        )
+        # Linear Warmup + Cosine Annealing learning rate schedule
+        warmup_epochs = max(0, getattr(self.config, "warmup_epochs", 3))
+        if warmup_epochs > 0 and epoch <= warmup_epochs:
+            lr = self.config.min_lr + (self.config.lr - self.config.min_lr) * (epoch / warmup_epochs)
+        else:
+            anneal_epochs = max(1, total_epochs - warmup_epochs)
+            progress = (epoch - warmup_epochs) / anneal_epochs
+            lr = self.config.min_lr + 0.5 * (self.config.lr - self.config.min_lr) * (
+                1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0))
+            )
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
         # EMA momentum cosine schedule
+        progress_total = epoch / max(1, total_epochs)
         ema_momentum = self.config.ema_momentum_end - (self.config.ema_momentum_end - self.config.ema_momentum_start) * (
-            0.5 * (1.0 + math.cos(math.pi * epoch / total_epochs))
+            0.5 * (1.0 + math.cos(math.pi * progress_total))
         )
 
         pbar = tqdm(
