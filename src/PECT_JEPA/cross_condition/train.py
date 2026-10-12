@@ -39,8 +39,9 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
     parser.add_argument("--embed_dim", type=int, default=64, help="Embedding dimension D")
     parser.add_argument("--data_dir", type=str, default="data", help="Root data directory containing TDMS files")
-    parser.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (0.0 to disable)")
-    parser.add_argument("--cov_weight", type=float, default=1.0, help="VICReg covariance penalty weight (0.0 to disable)")
+    parser.add_argument("--var_weight", type=float, default=0.2, help="VICReg variance hinge weight (0.2 gentle scale anchor)")
+    parser.add_argument("--cov_weight", type=float, default=0.0, help="VICReg covariance penalty weight (0.0 to disable)")
+    parser.add_argument("--relative_target", type=lambda v: v.lower() == "true", default=True, help="Predict relative flaw perturbation Delta H = H_tgt - c_b")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
     parser.add_argument("--condition_modulation", type=str, default="cross_attention", choices=["cross_attention", "adaln", "additive", "none"], help="Modulation type for condition token c_b")
     parser.add_argument("--tokenizer_type", type=str, default="energy_adaptive", choices=["energy_adaptive", "dual_domain"], help="Tokenizer type ('energy_adaptive' with temporal instance-norm or baseline 'dual_domain')")
@@ -82,6 +83,7 @@ def main():
         embed_dim=args.embed_dim,
         var_weight=args.var_weight,
         cov_weight=args.cov_weight,
+        relative_target=args.relative_target,
         use_condition_token=args.use_condition_token,
         condition_modulation=args.condition_modulation,
         tokenizer_type=args.tokenizer_type,

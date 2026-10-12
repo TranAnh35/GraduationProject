@@ -141,11 +141,18 @@ class CrossConditionJEPA(nn.Module):
         with torch.no_grad():
             H_tgt_b = self.target_encoder(tgt_tokens_b, tgt_pos_b)  # [B, 9, D]
 
-        # 6. Predictor predicts H_tgt_b from H_ctx_a (pure cross-condition physical prediction)
+        # Target relative perturbation: Delta H_tgt = H_tgt - c_b
+        use_relative = getattr(self.config, "relative_target", True)
+        if use_relative and c_b is not None:
+            target_signal = H_tgt_b - c_b  # [B, 9, D] centered around Condition B sound metal
+        else:
+            target_signal = H_tgt_b
+
+        # 6. Predictor predicts target_signal from H_ctx_a conditioned on c_b
         H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, c_b)  # [B, 9, D]
 
-        # 7. Prediction Loss (Pure L1 loss preserving subtle defect gradients)
-        pred_loss = F.l1_loss(H_pred_b, H_tgt_b)
+        # 7. Prediction Loss (Pure L1 loss on relative flaw scattering)
+        pred_loss = F.l1_loss(H_pred_b, target_signal)
 
         # 8. VICReg loss on Context Encoder representations (if enabled)
         flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
@@ -171,6 +178,7 @@ class CrossConditionJEPA(nn.Module):
             "H_ctx_a": H_ctx_a,
             "H_tgt_b": H_tgt_b,
             "H_pred_b": H_pred_b,
+            "target_signal": target_signal,
         }
 
     @torch.no_grad()

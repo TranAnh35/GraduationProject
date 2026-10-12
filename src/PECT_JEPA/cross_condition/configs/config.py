@@ -36,11 +36,12 @@ class CrossConditionConfig:
     use_condition_token: bool = True  # If False, disables c_b condition routing
     condition_modulation: str = "cross_attention"  # 'cross_attention' (KV concatenation), 'adaln', 'additive', 'none'
     tokenizer_type: str = "energy_adaptive"  # 'energy_adaptive' (SOTA instance-norm + saliency), 'dual_domain'
+    relative_target: bool = True  # If True, predicts relative flaw scattering Delta H = H_tgt - c_b
 
     # Loss weights
     pred_loss_type: str = "l1"  # Pure L1 loss preserving subtle flaw gradients
-    var_weight: float = 1.0     # VICReg variance hinge on Context Encoder
-    cov_weight: float = 1.0     # VICReg covariance penalty on Context Encoder
+    var_weight: float = 0.2     # Gentle VICReg variance scale anchor (prevents dimensional collapse)
+    cov_weight: float = 0.0     # Covariance decorrelation penalty (0.0 allows natural 6D-12D rank)
     var_gamma: float = 1.0
 
     # Training parameters
