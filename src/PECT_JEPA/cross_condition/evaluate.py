@@ -120,6 +120,7 @@ def parse_args():
     parser.add_argument("--eval_splits", nargs="+", default=["train", "val", "test"], help="Splits to evaluate ('train', 'val', 'test')")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     parser.add_argument("--batch_size", type=int, default=4096, help="Batch size for feature extraction")
+    parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True, help="Enable unsupervised spatial self-calibration (zero-centering C-scan against sound-metal background median)")
     return parser.parse_args()
 
 
@@ -249,7 +250,7 @@ def main():
 
         gt_mask = gt_masks[sp]["mask"]
         cscan = load_canonical_cscan_from_tdms(file_path=fp)
-        latents = extractor.extract_full_cscan(cscan)
+        latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
         cached_train_latents[fp] = latents
 
         flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
@@ -327,7 +328,7 @@ def main():
                 latents = cached_train_latents[fp]
             else:
                 cscan = load_canonical_cscan_from_tdms(file_path=fp)
-                latents = extractor.extract_full_cscan(cscan)
+                latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
 
             # TASK 1: Anomaly Detection
             # A) Supervised Trained Linear Probe

@@ -34,11 +34,13 @@ class CScanFeatureExtractor:
         self.offsets = self.topology.offsets  # [25, 2] in grid units (-7..+7)
 
     @torch.no_grad()
-    def extract_full_cscan(self, cscan: np.ndarray) -> np.ndarray:
+    def extract_full_cscan(self, cscan: np.ndarray, self_calibrate: bool = False) -> np.ndarray:
         """
         Extracts unified downstream latent representation for entire C-scan [270, 270, C].
         Args:
             cscan: [270, 270, 128] float32 numpy array.
+            self_calibrate: If True, performs unsupervised spatial self-calibration (zero-centering
+                            against C-scan median sound-metal background) to align inter-scan baselines.
         Returns:
             latents: [270, 270, 2*D] float32 numpy array.
         """
@@ -81,5 +83,10 @@ class CScanFeatureExtractor:
                 feats = self.model.extract_features(x_tensor)  # [B, 2*D]
 
             out_features[start_idx:end_idx] = feats.cpu().float().numpy()
+
+        if self_calibrate:
+            # Unsupervised spatial self-calibration: zero-center against plate median sound metal (>98% pixels)
+            bg_median = np.median(out_features, axis=0, keepdims=True)
+            out_features = out_features - bg_median
 
         return out_features.reshape(H, W, embed_dim)
