@@ -99,11 +99,13 @@ class CrossConditionPredictor(nn.Module):
         self,
         H_context: torch.Tensor,
         target_pos: torch.Tensor,
-        condition_token: torch.Tensor,
+        condition_token: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N_tgt, D = target_pos.shape
-        # Target queries: mask token + spatial position + condition modulation
-        queries = self.mask_token.expand(B, N_tgt, -1) + target_pos + condition_token
+        # Target queries: mask token + spatial position + optional condition modulation
+        queries = self.mask_token.expand(B, N_tgt, -1) + target_pos
+        if condition_token is not None:
+            queries = queries + condition_token
 
         q = queries
         for blk in self.blocks:

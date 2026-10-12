@@ -37,7 +37,9 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
     parser.add_argument("--embed_dim", type=int, default=64, help="Embedding dimension D")
     parser.add_argument("--data_dir", type=str, default="data", help="Root data directory containing TDMS files")
-    parser.add_argument("--transform_csv", type=str, default="data/ground_truth/raw_tdms_rotate_crop.csv", help="Geometric transformation CSV")
+    parser.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (0.0 to disable)")
+    parser.add_argument("--cov_weight", type=float, default=1.0, help="VICReg covariance penalty weight (0.0 to disable)")
+    parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
@@ -64,8 +66,11 @@ def main():
         min_lr=args.min_lr,
         weight_decay=args.weight_decay,
         embed_dim=args.embed_dim,
+        var_weight=args.var_weight,
+        cov_weight=args.cov_weight,
+        use_condition_token=args.use_condition_token,
         data_dir=args.data_dir,
-        transform_csv=args.transform_csv,
+        transform_csv="data/ground_truth/raw_tdms_rotate_crop.csv",
         exp_dir=run_dir,
         checkpoint_dir=os.path.join(run_dir, "checkpoints"),
         eval_dir=os.path.join(run_dir, "evaluation_results"),

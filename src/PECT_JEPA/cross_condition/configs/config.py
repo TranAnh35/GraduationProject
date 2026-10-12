@@ -33,6 +33,7 @@ class CrossConditionConfig:
     # Masking specification (9 core target probes, 16 outer context probes)
     num_target_probes: int = 9
     num_context_probes: int = 16
+    use_condition_token: bool = True  # If False, disables c_b condition routing shortcut
 
     # Loss weights
     pred_loss_type: str = "l1"  # Pure L1 loss preserving subtle flaw gradients

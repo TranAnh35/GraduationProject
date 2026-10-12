@@ -120,8 +120,8 @@ class CrossConditionJEPA(nn.Module):
         tokens_a, pos_a = self.tokenizer(x_a)  # [B, 25, D]
         tokens_b, pos_b = self.tokenizer(x_b)  # [B, 25, D]
 
-        # 2. Extract self-supervised condition token
-        c_b = self.extract_condition_token(ref_b)  # [B, 1, D]
+        # 2. Extract self-supervised condition token (disabled if use_condition_token is False)
+        c_b = self.extract_condition_token(ref_b) if self.config.use_condition_token else None
 
         # 3. Partition tokens: Context from A (16 outer), Target from B (9 inner)
         batch_arange = torch.arange(B, device=device).unsqueeze(1)
@@ -141,20 +141,25 @@ class CrossConditionJEPA(nn.Module):
         with torch.no_grad():
             H_tgt_b = self.target_encoder(tgt_tokens_b, tgt_pos_b)  # [B, 9, D]
 
-        # 6. Predictor predicts H_tgt_b from H_ctx_a conditioned on c_b
+        # 6. Predictor predicts H_tgt_b from H_ctx_a (pure cross-condition physical prediction)
         H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, c_b)  # [B, 9, D]
 
         # 7. Prediction Loss (Pure L1 loss preserving subtle defect gradients)
         pred_loss = F.l1_loss(H_pred_b, H_tgt_b)
 
-        # 8. VICReg loss on Context Encoder representations to prevent dimensional collapse
+        # 8. VICReg loss on Context Encoder representations (if enabled)
         flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
-        vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
-            flat_ctx,
-            var_weight=self.config.var_weight,
-            cov_weight=self.config.cov_weight,
-            gamma=self.config.var_gamma,
-        )
+        if self.config.var_weight > 0 or self.config.cov_weight > 0:
+            vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
+                flat_ctx,
+                var_weight=self.config.var_weight,
+                cov_weight=self.config.cov_weight,
+                gamma=self.config.var_gamma,
+            )
+        else:
+            vicreg_loss = torch.tensor(0.0, device=device)
+            var_loss = torch.tensor(0.0, device=device)
+            cov_loss = torch.tensor(0.0, device=device)
 
         total_loss = pred_loss + vicreg_loss
 
