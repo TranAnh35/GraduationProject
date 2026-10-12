@@ -38,6 +38,15 @@ class CrossConditionConfig:
     tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'continuous_scale_invariant'
     relative_target: bool = False  # If False, predicts full-field target H_tgt preserving natural target variance
 
+    # Disentangled Dual-Subspace [z_c, z_s] (Carrier vs Scattering)
+    latent_disentanglement: bool = False  # If True, splits latent D into [z_c, z_s]
+    carrier_dim: int = 32                 # Dimension of carrier/background subspace z_c
+    scattering_dim: int = 32              # Dimension of scattering/defect subspace z_s
+    carrier_flat_weight: float = 1.0      # Spatial flatness penalty on z_c within C-scan
+    scattering_var_weight: float = 1.0    # VICReg variance penalty on z_s (hinge std >= 1.0)
+    scattering_cov_weight: float = 1.0    # VICReg covariance decorrelation penalty on z_s (prevents 1D collapse)
+    downstream_latent_type: str = "scattering"  # 'scattering' (z_s only, drift-free), 'full' ([z_c, z_s]), 'carrier' (z_c)
+
     # Loss weights
     pred_loss_type: str = "l1"  # Pure L1 loss preserving subtle flaw gradients
     var_weight: float = 0.5     # Gentle VICReg variance scale anchor (std >= 1.0, prevents 2D collapse)

@@ -50,6 +50,13 @@ def parse_args():
     parser.add_argument("--early_stopping_metric", type=str, default="composite", choices=["composite", "val_auc", "latent_snr", "loss"], help="Metric to monitor for early stopping and best checkpoint")
     parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4, help="Minimum loss reduction delta for early stopping")
     parser.add_argument("--eval_val_every", type=int, default=1, help="Evaluate validation telemetry every N epochs")
+    parser.add_argument("--latent_disentanglement", type=lambda v: v.lower() == "true", default=False, help="Split latent space into [z_c, z_s] (Carrier vs Scattering)")
+    parser.add_argument("--carrier_dim", type=int, default=32, help="Dimension of carrier subspace z_c")
+    parser.add_argument("--scattering_dim", type=int, default=32, help="Dimension of scattering subspace z_s")
+    parser.add_argument("--carrier_flat_weight", type=float, default=1.0, help="Spatial flatness penalty weight on carrier subspace z_c")
+    parser.add_argument("--scattering_var_weight", type=float, default=1.0, help="VICReg variance weight on scattering subspace z_s")
+    parser.add_argument("--scattering_cov_weight", type=float, default=1.0, help="VICReg covariance weight on scattering subspace z_s")
+    parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
@@ -87,6 +94,13 @@ def main():
         use_condition_token=args.use_condition_token,
         condition_modulation=args.condition_modulation,
         tokenizer_type=args.tokenizer_type,
+        latent_disentanglement=args.latent_disentanglement,
+        carrier_dim=args.carrier_dim,
+        scattering_dim=args.scattering_dim,
+        carrier_flat_weight=args.carrier_flat_weight,
+        scattering_var_weight=args.scattering_var_weight,
+        scattering_cov_weight=args.scattering_cov_weight,
+        downstream_latent_type=args.downstream_latent_type,
         data_dir=args.data_dir,
         transform_csv="data/ground_truth/raw_tdms_rotate_crop.csv",
         exp_dir=run_dir,

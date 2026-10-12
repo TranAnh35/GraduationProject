@@ -148,31 +148,65 @@ class CrossConditionJEPA(nn.Module):
         else:
             target_signal = H_tgt_b
 
-        # 6. Predictor predicts target_signal from H_ctx_a conditioned on c_b
-        H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, c_b)  # [B, 9, D]
+        # 6. Latent Disentanglement vs Standard Prediction
+        if getattr(self.config, "latent_disentanglement", False):
+            # Split Context and Target into Carrier z_c and Scattering z_s
+            # D = D_c + D_s
+            D_c = getattr(self.config, "carrier_dim", self.config.embed_dim // 2)
+            D_s = getattr(self.config, "scattering_dim", self.config.embed_dim - D_c)
 
-        # 7. Prediction Loss (Pure L1 loss on relative flaw scattering)
-        pred_loss = F.l1_loss(H_pred_b, target_signal)
+            H_ctx_c = H_ctx_a[..., :D_c]  # [B, 16, D_c] Carrier background
+            H_ctx_s = H_ctx_a[..., D_c:]  # [B, 16, D_s] Scattering flaw perturbation
 
-        # 8. VICReg loss on Context Encoder representations (if enabled)
-        flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
-        if self.config.var_weight > 0 or self.config.cov_weight > 0:
+            H_tgt_c = target_signal[..., :D_c]  # [B, 9, D_c]
+            H_tgt_s = target_signal[..., D_c:]  # [B, 9, D_s]
+
+            # A) Scattering Prediction: Predict z_s WITHOUT condition token (unconditioned mapping)
+            # This forces z_s to align sign/polarity across sensors (Hall vs TMR)
+            H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, condition_token=None)  # [B, 9, D]
+            H_pred_s = H_pred_b[..., D_c:]
+            pred_loss = F.l1_loss(H_pred_s, H_tgt_s)
+
+            # B) Spatial Flatness on Carrier z_c: In a local 5x5 patch and across the scan, z_c should be spatially flat
+            # Penalize variance across the 16 context probes for each patch
+            flat_carrier_loss = torch.mean(torch.var(H_ctx_c, dim=1, unbiased=False))
+            carrier_loss = self.config.carrier_flat_weight * flat_carrier_loss
+
+            # C) VICReg on Scattering z_s: Preserve multi-dimensional rank and prevent 1D collapse
+            flat_ctx_s = H_ctx_s.reshape(B * H_ctx_s.shape[1], -1)
             vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
-                flat_ctx,
-                var_weight=self.config.var_weight,
-                cov_weight=self.config.cov_weight,
+                flat_ctx_s,
+                var_weight=self.config.scattering_var_weight,
+                cov_weight=self.config.scattering_cov_weight,
                 gamma=self.config.var_gamma,
             )
-        else:
-            vicreg_loss = torch.tensor(0.0, device=device)
-            var_loss = torch.tensor(0.0, device=device)
-            cov_loss = torch.tensor(0.0, device=device)
 
-        total_loss = pred_loss + vicreg_loss
+            total_loss = pred_loss + carrier_loss + vicreg_loss
+        else:
+            # Standard single-space prediction
+            H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, c_b)  # [B, 9, D]
+            pred_loss = F.l1_loss(H_pred_b, target_signal)
+
+            flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
+            if self.config.var_weight > 0 or self.config.cov_weight > 0:
+                vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
+                    flat_ctx,
+                    var_weight=self.config.var_weight,
+                    cov_weight=self.config.cov_weight,
+                    gamma=self.config.var_gamma,
+                )
+            else:
+                vicreg_loss = torch.tensor(0.0, device=device)
+                var_loss = torch.tensor(0.0, device=device)
+                cov_loss = torch.tensor(0.0, device=device)
+
+            carrier_loss = torch.tensor(0.0, device=device)
+            total_loss = pred_loss + vicreg_loss
 
         return {
             "total_loss": total_loss,
             "pred_loss": pred_loss,
+            "carrier_loss": carrier_loss,
             "var_loss": var_loss,
             "cov_loss": cov_loss,
             "H_ctx_a": H_ctx_a,
@@ -185,11 +219,30 @@ class CrossConditionJEPA(nn.Module):
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """
         Extracts unified downstream representation for inspection C-scan:
-        Returns concatenated [B, 2*D] vector [h_center, h_context_pool].
-        Center probe carries localized defect perturbation, context pool captures background diffusion.
+        If latent_disentanglement is True:
+          - 'scattering': Extracts scattering perturbation z_s = [h_center_s, h_context_s] in R^{2*D_s} (drift-free).
+          - 'carrier': Extracts carrier baseline z_c in R^{2*D_c}.
+          - 'full': Extracts full concatenated vector [z_c, z_s] in R^{2*D}.
+        Default: Concatenated [B, 2*D] vector [h_center, h_context_pool].
         """
         tokens, pos = self.tokenizer(x)  # [B, 25, D]
         h_all = self.context_encoder(tokens, pos)  # [B, 25, D]
+
+        if getattr(self.config, "latent_disentanglement", False):
+            D_c = getattr(self.config, "carrier_dim", self.config.embed_dim // 2)
+            latent_type = getattr(self.config, "downstream_latent_type", "scattering")
+
+            if latent_type == "scattering":
+                h_all_s = h_all[..., D_c:]  # [B, 25, D_s]
+                h_center = h_all_s[:, 0, :]
+                h_context = torch.mean(h_all_s[:, 1:, :], dim=1)
+                return torch.cat([h_center, h_context], dim=-1)  # [B, 2*D_s]
+            elif latent_type == "carrier":
+                h_all_c = h_all[..., :D_c]  # [B, 25, D_c]
+                h_center = h_all_c[:, 0, :]
+                h_context = torch.mean(h_all_c[:, 1:, :], dim=1)
+                return torch.cat([h_center, h_context], dim=-1)  # [B, 2*D_c]
+
         h_center = h_all[:, 0, :]  # [B, D] Center probe
         h_context = torch.mean(h_all[:, 1:, :], dim=1)  # [B, D] Outer context pool
         return torch.cat([h_center, h_context], dim=-1)  # [B, 2*D]

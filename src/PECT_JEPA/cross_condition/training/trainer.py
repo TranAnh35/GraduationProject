@@ -169,6 +169,7 @@ class CrossConditionTrainer:
 
         running_loss = 0.0
         running_pred = 0.0
+        running_carrier = 0.0
         running_var = 0.0
         running_cov = 0.0
 
@@ -226,6 +227,7 @@ class CrossConditionTrainer:
 
             running_loss += loss.item()
             running_pred += outputs["pred_loss"].item()
+            running_carrier += outputs.get("carrier_loss", torch.tensor(0.0)).item()
             running_var += outputs["var_loss"].item()
             running_cov += outputs["cov_loss"].item()
 
@@ -235,12 +237,14 @@ class CrossConditionTrainer:
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "pred": f"{outputs['pred_loss'].item():.4f}",
+                "car": f"{outputs.get('carrier_loss', torch.tensor(0.0)).item():.4f}",
                 "var": f"{outputs['var_loss'].item():.4f}",
                 "lr": f"{lr:.2e}",
             })
 
         avg_loss = running_loss / total_batches
         avg_pred = running_pred / total_batches
+        avg_carrier = running_carrier / total_batches
         avg_var = running_var / total_batches
         avg_cov = running_cov / total_batches
 
@@ -251,6 +255,7 @@ class CrossConditionTrainer:
             "epoch": epoch,
             "total_loss": avg_loss,
             "pred_loss": avg_pred,
+            "carrier_loss": avg_carrier,
             "var_loss": avg_var,
             "cov_loss": avg_cov,
             "effective_rank": svd_res["effective_rank"],

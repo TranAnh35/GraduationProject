@@ -54,7 +54,17 @@ class CScanFeatureExtractor:
         cc_flat = cc.flatten() + pad
         N_pts = len(rr_flat)
 
-        embed_dim = self.model.config.embed_dim * 2
+        if getattr(self.model.config, "latent_disentanglement", False):
+            latent_type = getattr(self.model.config, "downstream_latent_type", "scattering")
+            if latent_type == "scattering":
+                embed_dim = getattr(self.model.config, "scattering_dim", self.model.config.embed_dim // 2) * 2
+            elif latent_type == "carrier":
+                embed_dim = getattr(self.model.config, "carrier_dim", self.model.config.embed_dim // 2) * 2
+            else:
+                embed_dim = self.model.config.embed_dim * 2
+        else:
+            embed_dim = self.model.config.embed_dim * 2
+
         out_features = np.zeros((N_pts, embed_dim), dtype=np.float32)
 
         offsets_r = self.offsets[:, 0]  # [25]
