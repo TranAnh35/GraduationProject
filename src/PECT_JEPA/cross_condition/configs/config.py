@@ -34,13 +34,13 @@ class CrossConditionConfig:
     num_target_probes: int = 9
     num_context_probes: int = 16
     use_condition_token: bool = True  # If False, disables c_b condition routing
-    condition_modulation: str = "cross_attention"  # 'cross_attention' (KV concatenation), 'adaln', 'additive', 'none'
+    condition_modulation: str = "query_projection"  # 'query_projection' (Projected into target queries), 'cross_attention', 'adaln', 'additive', 'none'
     tokenizer_type: str = "energy_adaptive"  # 'energy_adaptive' (SOTA instance-norm + saliency), 'dual_domain'
-    relative_target: bool = True  # If True, predicts relative flaw scattering Delta H = H_tgt - c_b
+    relative_target: bool = False  # If False, predicts full-field target H_tgt preserving natural target variance
 
     # Loss weights
     pred_loss_type: str = "l1"  # Pure L1 loss preserving subtle flaw gradients
-    var_weight: float = 0.2     # Gentle VICReg variance scale anchor (prevents dimensional collapse)
+    var_weight: float = 0.5     # Gentle VICReg variance scale anchor (std >= 1.0, prevents 2D collapse)
     cov_weight: float = 0.0     # Covariance decorrelation penalty (0.0 allows natural 6D-12D rank)
     var_gamma: float = 1.0
 

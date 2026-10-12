@@ -121,10 +121,17 @@ class CrossConditionPredictor(nn.Module):
         if config is None:
             config = CrossConditionConfig()
         self.config = config
-        self.modulation = getattr(config, "condition_modulation", "cross_attention")
+        self.modulation = getattr(config, "condition_modulation", "query_projection")
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        # Condition projection layer for query conditioning
+        self.cond_query_proj = nn.Sequential(
+            nn.Linear(config.embed_dim, config.embed_dim),
+            nn.GELU(),
+            nn.Linear(config.embed_dim, config.embed_dim),
+        )
 
         self.blocks = nn.ModuleList([
             PredictorBlock(
@@ -150,9 +157,13 @@ class CrossConditionPredictor(nn.Module):
         H_context_kv = H_context
         cond_for_block = None
         if condition_token is not None:
-            if self.modulation == "cross_attention":
-                # Cross-Attention Conditioning: concatenate condition token c_B to context key-values
-                # Target queries directly cross-attend to [H_context, c_B] in R^{B x (N_ctx + 1) x D}
+            if self.modulation == "query_projection":
+                # Condition B is projected into the query representations
+                # Queries specify: "At position (r,c), under Condition B, what is the field?"
+                # Key/Values remain strictly H_context (16 spatial probes), forcing attention to spatial diffusion!
+                c_proj = self.cond_query_proj(condition_token)
+                queries = queries + c_proj
+            elif self.modulation == "cross_attention":
                 if condition_token.ndim == 2:
                     c = condition_token.unsqueeze(1)
                 else:
