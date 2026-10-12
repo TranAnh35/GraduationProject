@@ -27,7 +27,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Official Cross-Condition PECT-JEPA Training")
     parser.add_argument("--exp_name", type=str, default="cross_jepa_base", help="Experiment name")
     parser.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True, help="Append timestamp to experiment directory")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size per training step")
     parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions K per macro-cycle (K sub-epochs = 1 full universe pass)")
     parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100% all 72,900 pixels per scan)")
@@ -40,7 +40,9 @@ def parse_args():
     parser.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (0.0 to disable)")
     parser.add_argument("--cov_weight", type=float, default=1.0, help="VICReg covariance penalty weight (0.0 to disable)")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of warmup epochs (linear ramp from min_lr to peak lr)")
+    parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
+    parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")
+    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4, help="Minimum loss reduction delta for early stopping")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
@@ -60,6 +62,8 @@ def main():
         add_timestamp=args.add_timestamp,
         epochs=args.epochs,
         warmup_epochs=args.warmup_epochs,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         batch_size=args.batch_size,
         grid_stride=args.grid_stride,
         num_partitions=args.num_partitions,

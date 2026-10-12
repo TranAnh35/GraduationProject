@@ -213,7 +213,12 @@ class CrossConditionTrainer:
         else:
             print(header, flush=True)
 
+        warmup_epochs = max(0, getattr(self.config, "warmup_epochs", 10))
+        patience = getattr(self.config, "early_stopping_patience", 15)
+        min_delta = getattr(self.config, "early_stopping_min_delta", 1e-4)
+        patience_counter = 0
         best_loss = float("inf")
+
         ckpt_dir = self.logger.checkpoint_dir if self.logger else self.config.checkpoint_dir
         viz_dir = self.logger.visualizations_dir if self.logger else self.config.visualizations_dir
         best_ckpt_path = os.path.join(ckpt_dir, "best_cross_condition_jepa.pt")
@@ -252,9 +257,11 @@ class CrossConditionTrainer:
             else:
                 print(summary_msg, flush=True)
 
-            # Checkpoint best model
-            if epoch_metrics["total_loss"] < best_loss:
-                best_loss = epoch_metrics["total_loss"]
+            # Checkpoint best model & Early Stopping Evaluation
+            current_loss = epoch_metrics["total_loss"]
+            if current_loss < (best_loss - min_delta):
+                best_loss = current_loss
+                patience_counter = 0
                 torch.save({
                     "epoch": epoch,
                     "model_state_dict": self.model.state_dict(),
@@ -262,6 +269,45 @@ class CrossConditionTrainer:
                     "config": self.config,
                     "metrics": epoch_metrics,
                 }, best_ckpt_path)
+                if epoch > warmup_epochs:
+                    save_msg = f"  [*] New best model saved (Epoch {epoch:02d}, Loss: {best_loss:.4f})"
+                    if self.logger:
+                        self.logger.info(save_msg)
+                    else:
+                        print(save_msg, flush=True)
+            else:
+                if epoch > warmup_epochs and patience > 0:
+                    patience_counter += 1
+                    status_msg = f"  [!] Early stopping patience: {patience_counter}/{patience} (Best loss: {best_loss:.4f})"
+                    if self.logger:
+                        self.logger.info(status_msg)
+                    else:
+                        print(status_msg, flush=True)
+
+                    if patience_counter >= patience:
+                        stop_msg = (
+                            f"\n[Early Stopping Triggered at Epoch {epoch:02d}] "
+                            f"Loss has not improved by {min_delta} for {patience_counter} consecutive epochs "
+                            f"(Best post-warmup loss: {best_loss:.4f}). Terminating training early."
+                        )
+                        if self.logger:
+                            self.logger.info(stop_msg)
+                        else:
+                            print(stop_msg, flush=True)
+                        break
+
+            # Warmup Phase Transition: Reset best_loss and counter for post-warmup regime
+            if epoch == warmup_epochs:
+                best_loss = float("inf")
+                patience_counter = 0
+                reset_msg = (
+                    f"\n>>> [Warmup Completed: {warmup_epochs} Epochs / 1 Full Macro-Cycle] "
+                    f"Resetting best_loss and patience counter for official post-warmup tracking. <<<\n"
+                )
+                if self.logger:
+                    self.logger.info(reset_msg)
+                else:
+                    print(reset_msg, flush=True)
 
             # Save latest checkpoint
             latest_path = os.path.join(ckpt_dir, "latest_cross_condition_jepa.pt")
@@ -278,6 +324,10 @@ class CrossConditionTrainer:
             if epoch % 5 == 0 or epoch == total_epochs:
                 curve_path = os.path.join(viz_dir, "training_curves.png")
                 plot_training_curves(self.history, curve_path)
+
+        # Always save final training curve at conclusion of training
+        curve_path = os.path.join(viz_dir, "training_curves.png")
+        plot_training_curves(self.history, curve_path)
 
         fin_msg = f"\nTraining Complete! Best model saved to: {best_ckpt_path}"
         if self.logger:
