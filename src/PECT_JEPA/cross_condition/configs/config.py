@@ -50,7 +50,9 @@ class CrossConditionConfig:
     epochs: int = 100
     warmup_epochs: int = 10     # Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)
     early_stopping_patience: int = 15  # Early stopping patience in epochs post-warmup (0 to disable)
+    early_stopping_metric: str = "composite"  # 'composite' (AUC + SNR + Loss), 'val_auc', 'latent_snr', 'loss'
     early_stopping_min_delta: float = 1e-4
+    eval_val_every: int = 1     # Evaluate validation metrics every N epochs
     lr: float = 4e-4
     min_lr: float = 1e-5
     weight_decay: float = 1e-4

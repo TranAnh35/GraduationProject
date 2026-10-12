@@ -15,7 +15,8 @@ import os
 import sys
 import time
 import math
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -26,6 +27,8 @@ from ..models.cross_condition_jepa import CrossConditionJEPA
 from ..data.paired_dataset import PairedPECTDataset
 from ..utils.logger import CrossConditionLogger
 from ..evaluation.visualizations import plot_training_curves
+from ..evaluation.cscan_extractor import CScanFeatureExtractor
+from ..evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
 from .diagnostics import compute_svd_diagnostics, compute_latent_snr
 
 
@@ -38,10 +41,12 @@ class CrossConditionTrainer:
         config: CrossConditionConfig,
         device: torch.device,
         logger: Optional[CrossConditionLogger] = None,
+        val_scans: Optional[List[Dict[str, Any]]] = None,
     ):
         self.config = config
         self.device = device
         self.logger = logger
+        self.val_scans = val_scans or []
 
         # 1. Initialize model
         self.model = CrossConditionJEPA(config).to(device)
@@ -66,6 +71,72 @@ class CrossConditionTrainer:
             "cov_loss": [],
             "effective_rank": [],
             "lr": [],
+            "val_auc": [],
+            "val_ap": [],
+            "val_snr": [],
+            "val_sound_var": [],
+        }
+
+    @torch.no_grad()
+    def evaluate_validation_metrics(self) -> Dict[str, float]:
+        """
+        Computes fast downstream validation metrics (Unsupervised Mahalanobis AUC/AP, Latent SNR, Sound Var)
+        across held-out validation C-scans in sub-second GPU time.
+        """
+        if not self.val_scans:
+            return {}
+
+        was_training = self.model.training
+        self.model.eval()
+
+        extractor = CScanFeatureExtractor(
+            model=self.model,
+            device=self.device,
+            batch_size=4096,
+            use_amp=self.config.mixed_precision,
+        )
+        suite = DownstreamBenchmarkSuite(n_splits=3, random_state=42)
+
+        auc_list = []
+        ap_list = []
+        snr_list = []
+        var_list = []
+
+        for item in self.val_scans:
+            cscan = item["cscan"]
+            gt_mask = item["gt_mask"]
+            latents = extractor.extract_full_cscan(cscan)  # [270, 270, 2*D]
+
+            # Mahalanobis Anomaly Detection (pure representation distance without probe training)
+            anom = suite.compute_anomaly_detection_metrics(latents, gt_mask)
+            auc_list.append(anom["auc_roc"])
+            ap_list.append(anom["average_precision"])
+
+            # Latent SNR & Sound Metal Noise Variance
+            flat_l = latents.reshape(-1, latents.shape[-1])
+            flat_m = (gt_mask.reshape(-1) > 0.5).astype(int)
+            sound_pts = flat_l[flat_m == 0]
+            defect_pts = flat_l[flat_m == 1]
+
+            if len(sound_pts) > 0 and len(defect_pts) > 0:
+                mu_s = np.mean(sound_pts, axis=0)
+                mu_d = np.mean(defect_pts, axis=0)
+                var_s = float(np.mean(np.var(sound_pts, axis=0)))
+                snr = float(np.linalg.norm(mu_d - mu_s) / (np.sqrt(var_s) + 1e-6))
+            else:
+                snr = 0.0
+                var_s = 0.0
+
+            snr_list.append(snr)
+            var_list.append(var_s)
+
+        self.model.train(was_training)
+
+        return {
+            "val_auc": float(np.mean(auc_list)) if auc_list else 0.0,
+            "val_ap": float(np.mean(ap_list)) if ap_list else 0.0,
+            "val_snr": float(np.mean(snr_list)) if snr_list else 0.0,
+            "val_sound_var": float(np.mean(var_list)) if var_list else 0.0,
         }
 
         # 5. Resume training if checkpoint specified
@@ -216,8 +287,13 @@ class CrossConditionTrainer:
         warmup_epochs = max(0, getattr(self.config, "warmup_epochs", 10))
         patience = getattr(self.config, "early_stopping_patience", 15)
         min_delta = getattr(self.config, "early_stopping_min_delta", 1e-4)
+        metric_mode = getattr(self.config, "early_stopping_metric", "composite")
+        eval_val_every = max(1, getattr(self.config, "eval_val_every", 1))
+
         patience_counter = 0
         best_loss = float("inf")
+        best_val_auc = 0.0
+        best_val_snr = 0.0
 
         ckpt_dir = self.logger.checkpoint_dir if self.logger else self.config.checkpoint_dir
         viz_dir = self.logger.visualizations_dir if self.logger else self.config.visualizations_dir
@@ -238,16 +314,29 @@ class CrossConditionTrainer:
 
             epoch_metrics = self.train_epoch(epoch_loader, epoch, total_epochs)
 
+            # Evaluate held-out validation telemetry (Mahalanobis AUC/AP, Latent SNR, Sound Var)
+            if self.val_scans and (epoch % eval_val_every == 0 or epoch == total_epochs):
+                val_res = self.evaluate_validation_metrics()
+                epoch_metrics.update(val_res)
+
             # Record history
             for k in self.history:
                 if k in epoch_metrics:
                     self.history[k].append(epoch_metrics[k])
 
+            # Formatted summary logging
+            val_info = ""
+            if "val_auc" in epoch_metrics:
+                val_info = (
+                    f" | Val AUC: {epoch_metrics['val_auc']:.4f}"
+                    f" | SNR: {epoch_metrics['val_snr']:.2f}"
+                    f" | SndVar: {epoch_metrics['val_sound_var']:.4f}"
+                )
+
             summary_msg = (
                 f"[Summary Epoch {epoch:02d}/{total_epochs:02d}] "
                 f"Loss: {epoch_metrics['total_loss']:.4f} | "
-                f"Pred L1: {epoch_metrics['pred_loss']:.4f} | "
-                f"Var: {epoch_metrics['var_loss']:.4f} | "
+                f"Pred: {epoch_metrics['pred_loss']:.4f}{val_info} | "
                 f"R_eff: {epoch_metrics['effective_rank']:.1f}D | "
                 f"LR: {epoch_metrics['lr']:.2e}"
             )
@@ -258,9 +347,50 @@ class CrossConditionTrainer:
                 print(summary_msg, flush=True)
 
             # Checkpoint best model & Early Stopping Evaluation
-            current_loss = epoch_metrics["total_loss"]
-            if current_loss < (best_loss - min_delta):
-                best_loss = current_loss
+            curr_loss = epoch_metrics["total_loss"]
+            curr_auc = epoch_metrics.get("val_auc", 0.0)
+            curr_snr = epoch_metrics.get("val_snr", 0.0)
+
+            improved = False
+            improve_reason = ""
+
+            if metric_mode == "val_auc":
+                if curr_auc > (best_val_auc + 0.002):
+                    improved = True
+                    improve_reason = f"Val AUC improved: {best_val_auc:.4f} -> {curr_auc:.4f}"
+                    best_val_auc = curr_auc
+            elif metric_mode == "latent_snr":
+                if curr_snr > (best_val_snr * 1.02):
+                    improved = True
+                    improve_reason = f"Latent SNR improved: {best_val_snr:.2f} -> {curr_snr:.2f}"
+                    best_val_snr = curr_snr
+            elif metric_mode == "loss":
+                if curr_loss < (best_loss - min_delta):
+                    improved = True
+                    improve_reason = f"Loss improved: {best_loss:.4f} -> {curr_loss:.4f}"
+                    best_loss = curr_loss
+            else:  # "composite"
+                # Multi-criterion representation health:
+                # 1. Defect AUC improved significantly
+                # 2. OR Latent SNR improved by >= 2% while AUC stable
+                # 3. OR Loss dropped by min_delta while AUC stable
+                if curr_auc > (best_val_auc + 0.002):
+                    improved = True
+                    improve_reason = f"Val AUC improved: {best_val_auc:.4f} -> {curr_auc:.4f}"
+                    best_val_auc = max(best_val_auc, curr_auc)
+                    best_val_snr = max(best_val_snr, curr_snr)
+                    best_loss = min(best_loss, curr_loss)
+                elif curr_snr > (best_val_snr * 1.02) and curr_auc >= (best_val_auc - 0.005):
+                    improved = True
+                    improve_reason = f"Latent SNR improved: {best_val_snr:.2f} -> {curr_snr:.2f} (AUC stable: {curr_auc:.4f})"
+                    best_val_snr = max(best_val_snr, curr_snr)
+                    best_loss = min(best_loss, curr_loss)
+                elif curr_loss < (best_loss - min_delta) and curr_auc >= (best_val_auc - 0.010):
+                    improved = True
+                    improve_reason = f"Prediction loss improved: {best_loss:.4f} -> {curr_loss:.4f} (AUC stable: {curr_auc:.4f})"
+                    best_loss = min(best_loss, curr_loss)
+
+            if improved:
                 patience_counter = 0
                 torch.save({
                     "epoch": epoch,
@@ -270,7 +400,7 @@ class CrossConditionTrainer:
                     "metrics": epoch_metrics,
                 }, best_ckpt_path)
                 if epoch > warmup_epochs:
-                    save_msg = f"  [*] New best model saved (Epoch {epoch:02d}, Loss: {best_loss:.4f})"
+                    save_msg = f"  [*] New best model saved (Epoch {epoch:02d} | {improve_reason})"
                     if self.logger:
                         self.logger.info(save_msg)
                     else:
@@ -278,7 +408,10 @@ class CrossConditionTrainer:
             else:
                 if epoch > warmup_epochs and patience > 0:
                     patience_counter += 1
-                    status_msg = f"  [!] Early stopping patience: {patience_counter}/{patience} (Best loss: {best_loss:.4f})"
+                    status_msg = (
+                        f"  [!] Early stopping patience: {patience_counter}/{patience} "
+                        f"(Best Val AUC: {best_val_auc:.4f}, Best SNR: {best_val_snr:.2f}, Best Loss: {best_loss:.4f})"
+                    )
                     if self.logger:
                         self.logger.info(status_msg)
                     else:
@@ -287,8 +420,9 @@ class CrossConditionTrainer:
                     if patience_counter >= patience:
                         stop_msg = (
                             f"\n[Early Stopping Triggered at Epoch {epoch:02d}] "
-                            f"Loss has not improved by {min_delta} for {patience_counter} consecutive epochs "
-                            f"(Best post-warmup loss: {best_loss:.4f}). Terminating training early."
+                            f"Neither Val AUC, Latent SNR, nor Loss improved for {patience_counter} consecutive epochs "
+                            f"(Best Val AUC: {best_val_auc:.4f}, Best SNR: {best_val_snr:.2f}, Best Loss: {best_loss:.4f}). "
+                            f"Terminating training early."
                         )
                         if self.logger:
                             self.logger.info(stop_msg)
@@ -296,13 +430,15 @@ class CrossConditionTrainer:
                             print(stop_msg, flush=True)
                         break
 
-            # Warmup Phase Transition: Reset best_loss and counter for post-warmup regime
+            # Warmup Phase Transition: Reset best metrics and counter for post-warmup regime
             if epoch == warmup_epochs:
                 best_loss = float("inf")
+                best_val_auc = 0.0
+                best_val_snr = 0.0
                 patience_counter = 0
                 reset_msg = (
                     f"\n>>> [Warmup Completed: {warmup_epochs} Epochs / 1 Full Macro-Cycle] "
-                    f"Resetting best_loss and patience counter for official post-warmup tracking. <<<\n"
+                    f"Resetting best metrics (Val AUC, Latent SNR, Loss) and patience counter for official post-warmup tracking. <<<\n"
                 )
                 if self.logger:
                     self.logger.info(reset_msg)

@@ -405,37 +405,68 @@ def plot_training_curves(
     dpi: int = 150,
 ) -> None:
     """
-    Plots training loss trajectory, effective rank, and latent SNR.
+    Plots training loss trajectory, effective rank, validation AUC/AP, and latent SNR.
     """
     save_path = to_safe_path(save_path)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), dpi=dpi)
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4), dpi=dpi)
 
     epochs = range(1, len(history["total_loss"]) + 1)
 
-    axes[0].plot(epochs, history["total_loss"], "b-o", label="Total Loss")
+    # Panel 1: Loss
+    axes[0].plot(epochs, history["total_loss"], "b-o", label="Total Loss", markersize=3)
     axes[0].plot(epochs, history["pred_loss"], "r--", label="Pred L1 Loss")
     axes[0].set_title("Training Loss Trajectory", fontsize=11, fontweight="bold")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
     axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
+    axes[0].legend(loc="upper right", fontsize=8)
 
+    # Panel 2: Effective Rank
     if "effective_rank" in history and len(history["effective_rank"]) > 0:
-        axes[1].plot(epochs, history["effective_rank"], "g-s", label="R_eff")
-        axes[1].set_title("SVD Effective Rank (Anti-Collapse)", fontsize=11, fontweight="bold")
+        axes[1].plot(epochs, history["effective_rank"], "g-s", label="R_eff", markersize=3)
+        axes[1].set_title("SVD Effective Rank", fontsize=11, fontweight="bold")
         axes[1].set_xlabel("Epoch")
         axes[1].set_ylabel("Rank (Dimensions)")
         axes[1].grid(True, alpha=0.3)
-        axes[1].legend()
+        axes[1].legend(loc="lower right", fontsize=8)
 
-    if "latent_snr" in history and len(history["latent_snr"]) > 0:
-        axes[2].plot(epochs, history["latent_snr"], "m-^", label="Latent SNR")
-        axes[2].set_title("Latent Flaw-to-Sound Separability", fontsize=11, fontweight="bold")
+    # Panel 3: Validation AUC & AP
+    if "val_auc" in history and len(history["val_auc"]) > 0:
+        axes[2].plot(epochs, history["val_auc"], "b-^", label="Val AUC", markersize=3)
+        if "val_ap" in history and len(history["val_ap"]) > 0:
+            axes[2].plot(epochs, history["val_ap"], "c--", label="Val AP")
+        axes[2].set_title("Validation Anomaly Detection", fontsize=11, fontweight="bold")
         axes[2].set_xlabel("Epoch")
-        axes[2].set_ylabel("SNR")
+        axes[2].set_ylabel("AUC / AP")
+        axes[2].set_ylim([0.4, 1.02])
         axes[2].grid(True, alpha=0.3)
-        axes[2].legend()
+        axes[2].legend(loc="lower right", fontsize=8)
+    else:
+        axes[2].text(0.5, 0.5, "No Validation Telemetry", ha="center", va="center", transform=axes[2].transAxes)
+
+    # Panel 4: Latent SNR & Sound Var
+    snr_data = history.get("val_snr", history.get("latent_snr", []))
+    if len(snr_data) > 0:
+        ax4_snr = axes[3]
+        line1 = ax4_snr.plot(epochs, snr_data, "m-d", label="Latent SNR", markersize=3)
+        ax4_snr.set_title("Latent SNR & Background Variance", fontsize=11, fontweight="bold")
+        ax4_snr.set_xlabel("Epoch")
+        ax4_snr.set_ylabel("SNR (Flaw / Noise)", color="purple")
+        ax4_snr.tick_params(axis="y", labelcolor="purple")
+        ax4_snr.grid(True, alpha=0.3)
+
+        if "val_sound_var" in history and len(history["val_sound_var"]) > 0:
+            ax4_var = ax4_snr.twinx()
+            line2 = ax4_var.plot(epochs, history["val_sound_var"], "k:", label="Sound Var")
+            ax4_var.set_ylabel("Sound Metal Variance", color="black")
+            lines = line1 + line2
+            labels = [l.get_label() for l in lines]
+            ax4_snr.legend(lines, labels, loc="upper left", fontsize=8)
+        else:
+            ax4_snr.legend(loc="upper left", fontsize=8)
+    else:
+        axes[3].text(0.5, 0.5, "No Latent SNR Data", ha="center", va="center", transform=axes[3].transAxes)
 
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
