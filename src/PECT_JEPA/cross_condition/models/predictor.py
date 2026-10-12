@@ -17,6 +17,7 @@ class PredictorBlock(nn.Module):
     1. Self-Attention among Target Queries
     2. Cross-Attention from Target Queries to Context H_context
     3. Feed-Forward MLP
+    Supports AdaLN (Adaptive LayerNorm) modulation from condition token c_B.
     """
     def __init__(
         self,
@@ -24,8 +25,10 @@ class PredictorBlock(nn.Module):
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        modulation: str = "adaln",
     ):
         super().__init__()
+        self.modulation = modulation
         self.norm_self = nn.LayerNorm(embed_dim)
         self.self_attn = MultiheadSelfAttention(
             embed_dim=embed_dim,
@@ -48,21 +51,59 @@ class PredictorBlock(nn.Module):
             dropout=dropout,
         )
 
+        if self.modulation == "adaln":
+            # AdaLN maps condition vector c_B to scale and shift for norm_self and norm_mlp:
+            # (gamma_self, beta_self, gamma_mlp, beta_mlp) in R^{4*D}
+            self.ada_mod = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(embed_dim, 4 * embed_dim),
+            )
+            # Zero-initialize the modulation projection so it starts as exact identity
+            nn.init.zeros_(self.ada_mod[1].weight)
+            nn.init.zeros_(self.ada_mod[1].bias)
+
     def forward(
         self,
         target_queries: torch.Tensor,
         H_context: torch.Tensor,
+        condition_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # 1. Self-Attention
-        q = target_queries + self.self_attn(self.norm_self(target_queries))
-        # 2. Cross-Attention to Context
-        q = q + self.cross_attn(
-            query=self.norm_cross_q(q),
-            key_value=self.norm_cross_kv(H_context),
-        )
-        # 3. MLP
-        q = q + self.mlp(self.norm_mlp(q))
-        return q
+        if self.modulation == "adaln" and condition_vec is not None:
+            # condition_vec: [B, 1, D] -> [B, D]
+            if condition_vec.ndim == 3:
+                c = condition_vec.squeeze(1)
+            else:
+                c = condition_vec
+            params = self.ada_mod(c)  # [B, 4*D]
+            gamma_s, beta_s, gamma_m, beta_m = params.chunk(4, dim=-1)
+            gamma_s = gamma_s.unsqueeze(1)  # [B, 1, D]
+            beta_s = beta_s.unsqueeze(1)
+            gamma_m = gamma_m.unsqueeze(1)
+            beta_m = beta_m.unsqueeze(1)
+
+            # 1. Modulated Self-Attention
+            norm_q = self.norm_self(target_queries) * (1.0 + gamma_s) + beta_s
+            q = target_queries + self.self_attn(norm_q)
+
+            # 2. Cross-Attention to Context
+            q = q + self.cross_attn(
+                query=self.norm_cross_q(q),
+                key_value=self.norm_cross_kv(H_context),
+            )
+
+            # 3. Modulated MLP
+            norm_m = self.norm_mlp(q) * (1.0 + gamma_m) + beta_m
+            q = q + self.mlp(norm_m)
+            return q
+        else:
+            # Standard unmodulated forward
+            q = target_queries + self.self_attn(self.norm_self(target_queries))
+            q = q + self.cross_attn(
+                query=self.norm_cross_q(q),
+                key_value=self.norm_cross_kv(H_context),
+            )
+            q = q + self.mlp(self.norm_mlp(q))
+            return q
 
 
 class CrossConditionPredictor(nn.Module):
@@ -80,6 +121,7 @@ class CrossConditionPredictor(nn.Module):
         if config is None:
             config = CrossConditionConfig()
         self.config = config
+        self.modulation = getattr(config, "condition_modulation", "adaln")
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
@@ -90,6 +132,7 @@ class CrossConditionPredictor(nn.Module):
                 num_heads=config.predictor_heads,
                 mlp_ratio=config.mlp_ratio,
                 dropout=config.dropout,
+                modulation=self.modulation,
             )
             for _ in range(config.predictor_depth)
         ])
@@ -102,13 +145,17 @@ class CrossConditionPredictor(nn.Module):
         condition_token: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N_tgt, D = target_pos.shape
-        # Target queries: mask token + spatial position + optional condition modulation
         queries = self.mask_token.expand(B, N_tgt, -1) + target_pos
+
+        cond_for_block = None
         if condition_token is not None:
-            queries = queries + condition_token
+            if self.modulation == "additive":
+                queries = queries + condition_token
+            elif self.modulation == "adaln":
+                cond_for_block = condition_token
 
         q = queries
         for blk in self.blocks:
-            q = blk(target_queries=q, H_context=H_context)
+            q = blk(target_queries=q, H_context=H_context, condition_vec=cond_for_block)
 
         return self.norm(q)

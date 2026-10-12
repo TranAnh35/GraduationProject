@@ -21,6 +21,10 @@ from ..data.topologies import ConcentricStarTopology
 class DualDomainTokenizer(nn.Module):
     """
     Continuous Dual-Domain Tokenizer for 25-probe concentric star topology.
+    Supports:
+    - 'energy_adaptive': Instance-normalized temporal signal + physical transient scalars
+      (peak arrival t_p, V_pp, energy) + energy-gated Dodd-Deeds phase and spectral moments.
+    - 'dual_domain': Standard baseline dual-domain projection.
     Input: [B, 5, 5, C] -> Output: tokens [B, 25, D], pos [B, 25, D]
     """
     def __init__(self, config: Optional[CrossConditionConfig] = None):
@@ -33,15 +37,24 @@ class DualDomainTokenizer(nn.Module):
         self.temporal_samples = config.temporal_samples
         self.embed_dim = config.embed_dim
         self.num_harmonics = min(config.num_harmonics, config.temporal_samples // 2)
+        self.tokenizer_type = getattr(config, "tokenizer_type", "energy_adaptive")
 
         self.time_dim = config.embed_dim // 2
         self.freq_dim = config.embed_dim - self.time_dim
 
         # 1. Time branch projection
-        self.time_proj = nn.Linear(self.temporal_samples, self.time_dim)
+        if self.tokenizer_type == "energy_adaptive":
+            # x_norm [C] + peak_time [1] + V_pp [1] + energy [1] = C + 3
+            self.time_proj = nn.Linear(self.temporal_samples + 3, self.time_dim)
+        else:
+            self.time_proj = nn.Linear(self.temporal_samples, self.time_dim)
 
-        # 2. Spectral branch projection (phase + log-mag for each harmonic)
-        spectral_input_dim = self.num_harmonics * 2
+        # 2. Spectral branch projection
+        if self.tokenizer_type == "energy_adaptive":
+            # phase [K] + log-mag [K] + phase_gated [K] + centroid [1] + spread [1] = 3*K + 2
+            spectral_input_dim = self.num_harmonics * 3 + 2
+        else:
+            spectral_input_dim = self.num_harmonics * 2
         self.freq_proj = nn.Linear(spectral_input_dim, self.freq_dim)
 
         # 3. Layer normalization and dropout
@@ -68,21 +81,57 @@ class DualDomainTokenizer(nn.Module):
 
         x_flat = x.reshape(B, self.num_tokens, C)
 
-        # 1. Time domain branch
-        z_time = self.time_proj(x_flat)  # [B, 25, time_dim]
+        if self.tokenizer_type == "energy_adaptive":
+            # --- 1. Time domain branch with instance normalization & transient physical anchors ---
+            mean_t = x_flat.mean(dim=-1, keepdim=True)
+            std_t = x_flat.std(dim=-1, keepdim=True) + 1e-6
+            x_norm = (x_flat - mean_t) / std_t
 
-        # 2. Spectral domain branch (torch.fft.rfft along time dimension)
-        x_fp32 = x_flat.float()
-        x_fft = torch.fft.rfft(x_fp32, dim=-1)  # [B, 25, C//2 + 1] complex
-        x_harmonics = x_fft[..., 1:self.num_harmonics + 1]  # Exclude DC offset bin 0
+            # Transient physical anchors (waveform-agnostic)
+            t_peak = torch.argmax(torch.abs(x_norm), dim=-1, keepdim=True).float() / float(C)
+            v_max = x_flat.max(dim=-1, keepdim=True).values
+            v_min = x_flat.min(dim=-1, keepdim=True).values
+            v_pp = torch.log1p(torch.clamp(v_max - v_min, min=0.0))
+            energy_t = torch.log1p(torch.mean(x_flat ** 2, dim=-1, keepdim=True))
 
-        # Normalized Dodd-Deeds phase angle [-1, 1] & log-magnitude
-        phase = torch.angle(x_harmonics) / torch.pi
-        mag_linear = torch.abs(x_harmonics)
-        mag = torch.log1p(mag_linear)
+            time_feat = torch.cat([x_norm, t_peak, v_pp, energy_t], dim=-1)
+            z_time = self.time_proj(time_feat)  # [B, 25, time_dim]
 
-        spectral_feat = torch.cat([phase, mag], dim=-1).to(x_flat.dtype)
-        z_freq = self.freq_proj(spectral_feat)  # [B, 25, freq_dim]
+            # --- 2. Spectral domain branch with energy-weighted Dodd-Deeds gating ---
+            x_fp32 = x_flat.float()
+            x_fft = torch.fft.rfft(x_fp32, dim=-1)  # [B, 25, C//2 + 1] complex
+            x_harmonics = x_fft[..., 1:self.num_harmonics + 1]  # Exclude DC offset bin 0
+
+            phase = torch.angle(x_harmonics) / torch.pi  # [-1, 1]
+            mag_linear = torch.abs(x_harmonics)
+            mag = torch.log1p(mag_linear)
+
+            power = mag_linear ** 2
+            saliency = power / (torch.sum(power, dim=-1, keepdim=True) + 1e-8)
+            phase_gated = saliency * phase
+
+            # Spectral centroid and bandwidth moments
+            k_idx = torch.linspace(0.1, 1.0, self.num_harmonics, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+            f_c = torch.sum(k_idx * saliency, dim=-1, keepdim=True)
+            f_spread = torch.sqrt(torch.sum(((k_idx - f_c) ** 2) * saliency, dim=-1, keepdim=True) + 1e-8)
+
+            spectral_feat = torch.cat([phase, mag, phase_gated, f_c, f_spread], dim=-1).to(x_flat.dtype)
+            z_freq = self.freq_proj(spectral_feat)  # [B, 25, freq_dim]
+
+        else:
+            # Baseline dual_domain branch
+            z_time = self.time_proj(x_flat)  # [B, 25, time_dim]
+
+            x_fp32 = x_flat.float()
+            x_fft = torch.fft.rfft(x_fp32, dim=-1)  # [B, 25, C//2 + 1] complex
+            x_harmonics = x_fft[..., 1:self.num_harmonics + 1]  # Exclude DC offset bin 0
+
+            phase = torch.angle(x_harmonics) / torch.pi
+            mag_linear = torch.abs(x_harmonics)
+            mag = torch.log1p(mag_linear)
+
+            spectral_feat = torch.cat([phase, mag], dim=-1).to(x_flat.dtype)
+            z_freq = self.freq_proj(spectral_feat)  # [B, 25, freq_dim]
 
         # 3. Dual-domain fusion
         z_fused = torch.cat([z_time, z_freq], dim=-1)  # [B, 25, D]
@@ -90,3 +139,4 @@ class DualDomainTokenizer(nn.Module):
         pos = self.pos_embed.expand(B, -1, -1)
 
         return tokens, pos
+

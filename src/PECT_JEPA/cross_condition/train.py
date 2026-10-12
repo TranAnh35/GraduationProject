@@ -31,9 +31,9 @@ def parse_args():
     parser.add_argument("--add_timestamp", type=lambda v: v.lower() == "true", default=True, help="Append timestamp to experiment directory")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size per training step")
-    parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions K per macro-cycle (K sub-epochs = 1 full universe pass)")
-    parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100% all 72,900 pixels per scan)")
-    parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (default None: 100% exhaustive dataset traversal)")
+    parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions K per macro-cycle (K sub-epochs = 100%% full universe pass)")
+    parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100%% all 72,900 pixels per scan)")
+    parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (default None: 100%% exhaustive dataset traversal)")
     parser.add_argument("--lr", type=float, default=4e-4, help="Peak learning rate for Cosine schedule")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
@@ -42,6 +42,8 @@ def parse_args():
     parser.add_argument("--var_weight", type=float, default=1.0, help="VICReg variance hinge weight (0.0 to disable)")
     parser.add_argument("--cov_weight", type=float, default=1.0, help="VICReg covariance penalty weight (0.0 to disable)")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
+    parser.add_argument("--condition_modulation", type=str, default="adaln", choices=["adaln", "additive", "none"], help="Modulation type for condition token c_b")
+    parser.add_argument("--tokenizer_type", type=str, default="energy_adaptive", choices=["energy_adaptive", "dual_domain"], help="Tokenizer type ('energy_adaptive' with temporal instance-norm or baseline 'dual_domain')")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
     parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")
     parser.add_argument("--early_stopping_metric", type=str, default="composite", choices=["composite", "val_auc", "latent_snr", "loss"], help="Metric to monitor for early stopping and best checkpoint")
@@ -81,6 +83,8 @@ def main():
         var_weight=args.var_weight,
         cov_weight=args.cov_weight,
         use_condition_token=args.use_condition_token,
+        condition_modulation=args.condition_modulation,
+        tokenizer_type=args.tokenizer_type,
         data_dir=args.data_dir,
         transform_csv="data/ground_truth/raw_tdms_rotate_crop.csv",
         exp_dir=run_dir,
