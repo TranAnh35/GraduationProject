@@ -27,13 +27,34 @@ def compute_vicreg_loss(
     cov_weight: float = 1.0,
     gamma: float = 1.0,
     eps: float = 1e-4,
+    scan_id: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """VICReg coordinate-wise variance hinge and covariance decorrelation penalty."""
-    std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)
+    """
+    VICReg coordinate-wise variance hinge and covariance decorrelation penalty.
+    If scan_id is provided, z is centered per-scan (z_centered = z - mean_{scan}(z))
+    before computing variance and covariance. This strictly prevents between-scan drift
+    from falsely satisfying the variance regularizer, forcing the model to amplify
+    true within-scan flaw/defect variance!
+    """
+    if scan_id is not None:
+        # z: [N, D], scan_id: [N]
+        unique_scans = torch.unique(scan_id)
+        z_cent = torch.zeros_like(z)
+        for s in unique_scans:
+            mask = (scan_id == s)
+            if mask.sum() > 1:
+                z_cent[mask] = z[mask] - z[mask].mean(dim=0, keepdim=True)
+            else:
+                z_cent[mask] = z[mask]
+        # Standard deviation computed strictly on within-scan centered perturbations
+        std = torch.sqrt(z_cent.var(dim=0, unbiased=False) + eps)
+    else:
+        std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)
+        z_cent = z - z.mean(dim=0, keepdim=True)
+
     var_loss = torch.mean(F.relu(gamma - std))
 
-    z_cent = z - z.mean(dim=0, keepdim=True)
-    N = z.shape[0]
+    N = z_cent.shape[0]
     cov = (z_cent.T @ z_cent) / max(N - 1, 1)
     cov_off = cov - torch.diag(torch.diag(cov))
     cov_loss = (cov_off ** 2).sum() / z.shape[1]
@@ -106,12 +127,14 @@ class CrossConditionJEPA(nn.Module):
         x_a: torch.Tensor,
         x_b: torch.Tensor,
         ref_b: torch.Tensor,
+        scan_id: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass during self-supervised pretraining:
-        x_a:   [B, 5, 5, C] measurement patch from Condition A
-        x_b:   [B, 5, 5, C] measurement patch from Condition B (same physical coordinate)
-        ref_b: [B, 5, 5, C] background sound-metal patch of Condition B
+        x_a:     [B, 5, 5, C] measurement patch from Condition A
+        x_b:     [B, 5, 5, C] measurement patch from Condition B (same physical coordinate)
+        ref_b:   [B, 5, 5, C] background sound-metal patch of Condition B
+        scan_id: [B] scan pair identifier for within-scan centered regularization
         """
         B = x_a.shape[0]
         device = x_a.device
@@ -148,6 +171,11 @@ class CrossConditionJEPA(nn.Module):
         else:
             target_signal = H_tgt_b
 
+        # Expand scan_id across the 16 context tokens if provided: [B] -> [B * 16]
+        scan_id_expanded = None
+        if scan_id is not None and getattr(self.config, "scan_centered_vicreg", True):
+            scan_id_expanded = scan_id.unsqueeze(1).expand(-1, 16).reshape(-1)
+
         # 6. Latent Disentanglement vs Standard Prediction
         if getattr(self.config, "latent_disentanglement", False):
             # Split Context and Target into Carrier z_c and Scattering z_s
@@ -179,6 +207,7 @@ class CrossConditionJEPA(nn.Module):
                 var_weight=self.config.scattering_var_weight,
                 cov_weight=self.config.scattering_cov_weight,
                 gamma=self.config.var_gamma,
+                scan_id=scan_id_expanded,
             )
 
             total_loss = pred_loss + carrier_loss + vicreg_loss
@@ -194,6 +223,7 @@ class CrossConditionJEPA(nn.Module):
                     var_weight=self.config.var_weight,
                     cov_weight=self.config.cov_weight,
                     gamma=self.config.var_gamma,
+                    scan_id=scan_id_expanded,
                 )
             else:
                 vicreg_loss = torch.tensor(0.0, device=device)

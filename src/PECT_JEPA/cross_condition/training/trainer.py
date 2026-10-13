@@ -77,6 +77,10 @@ class CrossConditionTrainer:
             "val_sound_var": [],
         }
 
+        # 5. Resume training if checkpoint specified
+        if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
+            self._load_checkpoint(config.resume_checkpoint)
+
     @torch.no_grad()
     def evaluate_validation_metrics(self) -> Dict[str, float]:
         """
@@ -138,10 +142,6 @@ class CrossConditionTrainer:
             "val_snr": float(np.mean(snr_list)) if snr_list else 0.0,
             "val_sound_var": float(np.mean(var_list)) if var_list else 0.0,
         }
-
-        # 5. Resume training if checkpoint specified
-        if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
-            self._load_checkpoint(config.resume_checkpoint)
 
     def _load_checkpoint(self, ckpt_path: str):
         msg = f"Resuming training from checkpoint: {ckpt_path}"
@@ -207,11 +207,14 @@ class CrossConditionTrainer:
             x_a = batch["x_a"].to(self.device, non_blocking=True)
             x_b = batch["x_b"].to(self.device, non_blocking=True)
             ref_b = batch["ref_b"].to(self.device, non_blocking=True)
+            scan_id = batch.get("scan_id")
+            if scan_id is not None:
+                scan_id = scan_id.to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=self.config.mixed_precision and self.device.type == "cuda"):
-                outputs = self.model(x_a, x_b, ref_b)
+                outputs = self.model(x_a, x_b, ref_b, scan_id=scan_id)
                 loss = outputs["total_loss"]
 
             self.scaler.scale(loss).backward()
@@ -299,6 +302,15 @@ class CrossConditionTrainer:
         best_loss = float("inf")
         best_val_auc = 0.0
         best_val_snr = 0.0
+
+        # If resumed, recover best metric state from history
+        if hasattr(self, "history") and self.history:
+            if "total_loss" in self.history and self.history["total_loss"]:
+                best_loss = min(self.history["total_loss"])
+            if "val_auc" in self.history and self.history["val_auc"]:
+                best_val_auc = max(self.history["val_auc"])
+            if "val_snr" in self.history and self.history["val_snr"]:
+                best_val_snr = max(self.history["val_snr"])
 
         ckpt_dir = self.logger.checkpoint_dir if self.logger else self.config.checkpoint_dir
         viz_dir = self.logger.visualizations_dir if self.logger else self.config.visualizations_dir

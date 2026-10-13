@@ -469,5 +469,9 @@ def plot_training_curves(
         axes[3].text(0.5, 0.5, "No Latent SNR Data", ha="center", va="center", transform=axes[3].transAxes)
 
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    # Normalize path on Windows to avoid Errno 22 with \\?\ prefixes
+    clean_save_path = os.path.abspath(save_path)
+    if clean_save_path.startswith("\\\\?\\"):
+        clean_save_path = clean_save_path[4:]
+    plt.savefig(clean_save_path, bbox_inches="tight")
     plt.close(fig)

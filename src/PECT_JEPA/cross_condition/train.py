@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument("--carrier_flat_weight", type=float, default=1.0, help="Spatial flatness penalty weight on carrier subspace z_c")
     parser.add_argument("--scattering_var_weight", type=float, default=1.0, help="VICReg variance weight on scattering subspace z_s")
     parser.add_argument("--scattering_cov_weight", type=float, default=1.0, help="VICReg covariance weight on scattering subspace z_s")
+    parser.add_argument("--scan_centered_vicreg", type=lambda v: v.lower() == "true", default=True, help="Center representations per scan before computing VICReg")
+    parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
@@ -100,6 +102,8 @@ def main():
         carrier_flat_weight=args.carrier_flat_weight,
         scattering_var_weight=args.scattering_var_weight,
         scattering_cov_weight=args.scattering_cov_weight,
+        scan_centered_vicreg=args.scan_centered_vicreg,
+        var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,
         data_dir=args.data_dir,
         transform_csv="data/ground_truth/raw_tdms_rotate_crop.csv",

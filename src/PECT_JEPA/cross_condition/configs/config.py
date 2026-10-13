@@ -49,6 +49,7 @@ class CrossConditionConfig:
 
     # Loss weights
     pred_loss_type: str = "l1"  # Pure L1 loss preserving subtle flaw gradients
+    scan_centered_vicreg: bool = True  # If True, centers representations per scan before computing VICReg (forces within-scan variance)
     var_weight: float = 0.5     # Gentle VICReg variance scale anchor (std >= 1.0, prevents 2D collapse)
     cov_weight: float = 0.0     # Covariance decorrelation penalty (0.0 allows natural 6D-12D rank)
     var_gamma: float = 1.0

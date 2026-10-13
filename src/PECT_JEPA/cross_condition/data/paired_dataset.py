@@ -198,4 +198,5 @@ class PairedPECTDataset(Dataset):
             "x_b": torch.from_numpy(patch_b).float(),
             "ref_b": torch.from_numpy(scan_b["ref_patch"]).float(),
             "coord": torch.tensor([r, c], dtype=torch.long),
+            "scan_id": torch.tensor(pair_idx, dtype=torch.long),
         }
