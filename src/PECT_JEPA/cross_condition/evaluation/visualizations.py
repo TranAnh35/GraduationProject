@@ -12,6 +12,7 @@ Provides publication-quality plots:
 """
 
 import os
+import time
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import matplotlib
@@ -23,13 +24,58 @@ import scipy.ndimage as ndi
 
 
 def to_safe_path(path: str) -> str:
-    """Ensures paths on Windows bypass the MAX_PATH (260 char) limitation using extended prefix."""
+    """Returns a plain absolute path on Windows.
+
+    NOTE: The Win32 extended prefix (``\\\\?\\``) is intentionally NOT used:
+    Pillow/matplotlib do not reliably support it (sporadic ``OSError:
+    [Errno 22] Invalid argument`` on save, exactly the crash observed in
+    long training runs). The prefix is only needed for paths > ~260 chars;
+    our experiment paths are ~140 chars, so a plain abspath is safest.
+    """
     if not path:
         return path
     abs_path = os.path.abspath(path)
-    if os.name == "nt" and not abs_path.startswith("\\\\?\\"):
-        return "\\\\?\\" + abs_path
+    if os.name == "nt" and abs_path.startswith("\\\\?\\"):
+        return abs_path[4:]
     return abs_path
+
+
+def _safe_savefig(fig, save_path: str, **kwargs) -> None:
+    """Saves a matplotlib figure robustly on Windows.
+
+    Uses atomic write (temp file + os.replace) with retries so a transient
+    file-lock / AV-scan / cloud-sync hiccup (the sporadic Errno 22 seen in
+    long runs) never crashes training. Falls back to a timestamped sibling
+    file if the target path stays unwritable.
+    """
+    save_path = to_safe_path(save_path)
+    parent = os.path.dirname(save_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    base, ext = os.path.splitext(save_path)
+    tmp_path = base + ".tmp" + (ext or ".png")
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            fig.savefig(tmp_path, **kwargs)
+            os.replace(tmp_path, save_path)
+            return
+        except OSError as e:
+            last_err = e
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            time.sleep(0.5 * (attempt + 1))
+    # Final fallback: timestamped sibling so training can continue
+    try:
+        base, ext = os.path.splitext(save_path)
+        fallback = f"{base}_epoch{int(time.time())}{ext or '.png'}"
+        fig.savefig(fallback, **kwargs)
+        print(f"[WARN] Could not overwrite {save_path} ({last_err}); saved fallback {fallback}", flush=True)
+    except Exception as e2:
+        print(f"[WARN] Skipping plot save {save_path}: {last_err} (fallback also failed: {e2})", flush=True)
 
 
 def apply_spatial_coherence_filter(bin_map: np.ndarray, min_area: int = 8) -> np.ndarray:
@@ -76,7 +122,7 @@ def plot_probability_heatmap(
     ax.set_xlabel("Scan X (pixels)", fontsize=9)
     ax.set_ylabel("Scan Y (pixels)", fontsize=9)
     fig.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    _safe_savefig(fig, save_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -132,7 +178,7 @@ def plot_detection_summary_map(
     plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
 
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    _safe_savefig(fig, save_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -170,7 +216,7 @@ def plot_cscan_anomaly_map(
     plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    _safe_savefig(fig, save_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -333,7 +379,7 @@ def plot_defect_contours_and_iou(
 
     fig.suptitle(f"{title}\nIoU: {clean_iou*100:.1f}% | Precision: {clean_prec*100:.1f}% | Recall: {clean_rec*100:.1f}%, Sound Metal FPR: {sound_fpr_clean*100:.2f}%", fontsize=12, fontweight="bold", y=0.99)
     fig.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    _safe_savefig(fig, save_path, bbox_inches="tight")
     plt.close(fig)
 
     return {
@@ -395,7 +441,7 @@ def plot_sizing_calibration(
     ax.grid(True, linestyle=":", alpha=0.6)
 
     fig.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    _safe_savefig(fig, save_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -413,10 +459,12 @@ def plot_training_curves(
 
     epochs = range(1, len(history["total_loss"]) + 1)
 
-    # Panel 1: Loss
-    axes[0].plot(epochs, history["total_loss"], "b-o", label="Total Loss", markersize=3)
-    axes[0].plot(epochs, history["pred_loss"], "r--", label="Pred L1 Loss")
-    axes[0].set_title("Training Loss Trajectory", fontsize=11, fontweight="bold")
+    # Panel 1: Loss (train vs val reconstruction)
+    axes[0].plot(epochs, history["total_loss"], "b-o", label="Train Total Loss", markersize=3)
+    axes[0].plot(epochs, history["pred_loss"], "r--", label="Train Pred L1 Loss")
+    if "val_loss" in history and len(history["val_loss"]) == len(history["total_loss"]) and any(v > 0 for v in history["val_loss"]):
+        axes[0].plot(epochs, history["val_loss"], "g-s", label="Val Recon Loss", markersize=3)
+    axes[0].set_title("Training / Validation Loss Trajectory", fontsize=11, fontweight="bold")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
     axes[0].grid(True, alpha=0.3)
@@ -469,9 +517,5 @@ def plot_training_curves(
         axes[3].text(0.5, 0.5, "No Latent SNR Data", ha="center", va="center", transform=axes[3].transAxes)
 
     plt.tight_layout()
-    # Normalize path on Windows to avoid Errno 22 with \\?\ prefixes
-    clean_save_path = os.path.abspath(save_path)
-    if clean_save_path.startswith("\\\\?\\"):
-        clean_save_path = clean_save_path[4:]
-    plt.savefig(clean_save_path, bbox_inches="tight")
+    _safe_savefig(fig, save_path, bbox_inches="tight")
     plt.close(fig)

@@ -71,6 +71,7 @@ class CrossConditionTrainer:
             "cov_loss": [],
             "effective_rank": [],
             "lr": [],
+            "val_loss": [],
             "val_auc": [],
             "val_ap": [],
             "val_snr": [],
@@ -80,6 +81,44 @@ class CrossConditionTrainer:
         # 5. Resume training if checkpoint specified
         if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
             self._load_checkpoint(config.resume_checkpoint)
+
+    @torch.no_grad()
+    def _compute_val_reconstruction_loss(self, num_patches: int = 512) -> float:
+        """Self-conditioned JEPA reconstruction loss on held-out val scans.
+
+        No cross-condition pairs exist at eval time, so each val scan
+        predicts itself: context probes -> core target probes within the
+        same scan (A == B self-pair). Uses the same scattering L1 objective
+        as training in disentangled mode. Returns mean over val scans.
+        """
+        if not self.val_scans:
+            return 0.0
+        was_training = self.model.training
+        self.model.eval()
+        rng = np.random.RandomState(12345)
+        losses = []
+        for item in self.val_scans:
+            cscan = item["cscan"]  # [H, W, C]
+            H, W, C = cscan.shape
+            pad = 7
+            padded = np.pad(cscan, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
+            # Topology offsets: idx 0..8 core target, 9..24 outer context
+            from ..data.topologies import get_spatial_topology_offsets as _get_offsets
+            offsets = _get_offsets("concentric_star", (1, 3, 7), 5)
+            rr = rng.randint(0, H, size=num_patches) + pad
+            cc = rng.randint(0, W, size=num_patches) + pad
+            # Gather 25 star probes per patch: [N, 25, C]
+            r_idx = rr[:, None] + offsets[None, :, 0]
+            c_idx = cc[:, None] + offsets[None, :, 1]
+            patch25 = padded[r_idx, c_idx]  # [N, 25, C]
+            patch55 = patch25.reshape(num_patches, 5, 5, C)
+            x = torch.from_numpy(patch55).to(self.device, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=self.config.mixed_precision and self.device.type == "cuda"):
+                out = self.model(x_a=x, x_b=x, ref_b=x[:1].expand(x.shape[0], -1, -1, -1) if x.shape[0] > 0 else x)
+                pl = out.get("pred_loss", None)
+                losses.append(float(pl.item()) if pl is not None else 0.0)
+        self.model.train(was_training)
+        return float(np.mean(losses)) if losses else 0.0
 
     @torch.no_grad()
     def evaluate_validation_metrics(self) -> Dict[str, float]:
@@ -105,6 +144,7 @@ class CrossConditionTrainer:
         ap_list = []
         snr_list = []
         var_list = []
+        vloss_list = []
 
         for item in self.val_scans:
             cscan = item["cscan"]
@@ -134,6 +174,12 @@ class CrossConditionTrainer:
             snr_list.append(snr)
             var_list.append(var_s)
 
+        # Self-conditioned JEPA reconstruction loss on held-out val scans
+        try:
+            vloss_list.append(self._compute_val_reconstruction_loss())
+        except Exception as e:
+            print(f"  [WARN] val_loss computation skipped: {type(e).__name__}: {e}", flush=True)
+
         self.model.train(was_training)
 
         return {
@@ -141,6 +187,7 @@ class CrossConditionTrainer:
             "val_ap": float(np.mean(ap_list)) if ap_list else 0.0,
             "val_snr": float(np.mean(snr_list)) if snr_list else 0.0,
             "val_sound_var": float(np.mean(var_list)) if var_list else 0.0,
+            "val_loss": float(np.mean(vloss_list)) if vloss_list else 0.0,
         }
 
     def _load_checkpoint(self, ckpt_path: str):
@@ -157,6 +204,12 @@ class CrossConditionTrainer:
         self.start_epoch = ckpt.get("epoch", 0) + 1
         if "history" in ckpt:
             self.history = ckpt["history"]
+            # Backward compat: older checkpoints lack val_loss -> pad with zeros
+            n = len(self.history.get("total_loss", []))
+            if "val_loss" not in self.history:
+                self.history["val_loss"] = [0.0] * n
+            elif len(self.history["val_loss"]) < n:
+                self.history["val_loss"] += [0.0] * (n - len(self.history["val_loss"]))
 
     def train_epoch(
         self,
@@ -345,6 +398,7 @@ class CrossConditionTrainer:
             val_info = ""
             if "val_auc" in epoch_metrics:
                 val_info = (
+                    f" | ValLoss: {epoch_metrics.get('val_loss', 0.0):.4f}"
                     f" | Val AUC: {epoch_metrics['val_auc']:.4f}"
                     f" | SNR: {epoch_metrics['val_snr']:.2f}"
                     f" | SndVar: {epoch_metrics['val_sound_var']:.4f}"
@@ -473,14 +527,28 @@ class CrossConditionTrainer:
                 "history": self.history,
             }, latest_path)
 
-            # Periodically plot training loss curves every 5 epochs
-            if epoch % 5 == 0 or epoch == total_epochs:
-                curve_path = os.path.join(viz_dir, "training_curves.png")
+            # Plot training curves every epoch (cheap: 1 figure, no grad)
+            # (non-fatal: a plotting hiccup must never kill a long training run)
+            curve_path = os.path.join(viz_dir, "training_curves.png")
+            try:
                 plot_training_curves(self.history, curve_path)
+            except Exception as e:
+                warn_msg = f"  [WARN] Skipping training-curve plot at epoch {epoch}: {type(e).__name__}: {e}"
+                if self.logger:
+                    self.logger.info(warn_msg)
+                else:
+                    print(warn_msg, flush=True)
 
         # Always save final training curve at conclusion of training
         curve_path = os.path.join(viz_dir, "training_curves.png")
-        plot_training_curves(self.history, curve_path)
+        try:
+            plot_training_curves(self.history, curve_path)
+        except Exception as e:
+            warn_msg = f"  [WARN] Skipping final training-curve plot: {type(e).__name__}: {e}"
+            if self.logger:
+                self.logger.info(warn_msg)
+            else:
+                print(warn_msg, flush=True)
 
         fin_msg = f"\nTraining Complete! Best model saved to: {best_ckpt_path}"
         if self.logger:

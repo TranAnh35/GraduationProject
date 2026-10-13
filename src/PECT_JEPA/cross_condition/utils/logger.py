@@ -71,7 +71,8 @@ class CrossConditionLogger:
         fh.setFormatter(f_formatter)
         self.logger.addHandler(fh)
 
-        # Save config and git info
+        # Save config and git info (resume-safe: never overwrite the original
+        # config.json; store the resume config separately for provenance)
         cfg_dict = vars(config) if hasattr(config, "__dict__") else dict(config)
         # Convert non-serializable fields if any
         serializable_cfg = {}
@@ -81,11 +82,19 @@ class CrossConditionLogger:
             else:
                 serializable_cfg[k] = str(v)
 
-        with open(os.path.join(self.run_dir, "config.json"), "w", encoding="utf-8") as f:
-            json.dump(serializable_cfg, f, indent=2)
+        cfg_path = os.path.join(self.run_dir, "config.json")
+        if os.path.exists(cfg_path):
+            resume_cfg_path = os.path.join(self.run_dir, "config_resume.json")
+            with open(resume_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(serializable_cfg, f, indent=2)
+        else:
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(serializable_cfg, f, indent=2)
 
-        with open(os.path.join(self.run_dir, "git_info.json"), "w", encoding="utf-8") as f:
-            json.dump(get_git_revision_info(), f, indent=2)
+        git_path = os.path.join(self.run_dir, "git_info.json")
+        if not os.path.exists(git_path):
+            with open(git_path, "w", encoding="utf-8") as f:
+                json.dump(get_git_revision_info(), f, indent=2)
 
         self.metrics_csv_path = os.path.join(self.run_dir, "metrics_epoch.csv")
         self.csv_initialized = False

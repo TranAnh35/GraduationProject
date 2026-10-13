@@ -67,10 +67,24 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Determine unified experiment directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{args.exp_name}_{timestamp}" if args.add_timestamp else args.exp_name
-    run_dir = os.path.join("experiments", "cross_condition", "runs", run_name)
+    # Determine unified experiment directory.
+    # Resume mode: reuse the folder that CONTAINS the checkpoint instead of
+    # creating a new one, so logs/metrics/plots keep appending to the old run.
+    # e.g. --resume_checkpoint experiments/.../exp48_.../checkpoints/latest_....pt
+    #   -> run_dir = experiments/.../exp48_...
+    run_dir = None
+    run_name = None
+    if args.resume_checkpoint:
+        ckpt_abs = os.path.abspath(args.resume_checkpoint)
+        ckpt_dir = os.path.dirname(ckpt_abs)          # .../checkpoints
+        parent = os.path.dirname(ckpt_dir)            # .../<run_name>
+        if os.path.basename(ckpt_dir) == "checkpoints" and os.path.isdir(parent):
+            run_dir = os.path.relpath(parent)
+            run_name = os.path.basename(parent)
+    if run_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"{args.exp_name}_{timestamp}" if args.add_timestamp else args.exp_name
+        run_dir = os.path.join("experiments", "cross_condition", "runs", run_name)
 
     # Build config from args
     config = CrossConditionConfig(
