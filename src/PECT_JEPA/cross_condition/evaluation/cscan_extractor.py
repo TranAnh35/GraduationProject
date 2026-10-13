@@ -21,7 +21,7 @@ class CScanFeatureExtractor:
         self,
         model: CrossConditionJEPA,
         device: torch.device,
-        batch_size: int = 4096,
+        batch_size: int = 8192,
         use_amp: bool = True,
     ):
         self.model = model
@@ -33,7 +33,7 @@ class CScanFeatureExtractor:
         self.topology = ConcentricStarTopology(star_radii=(1, 3, 7))
         self.offsets = self.topology.offsets  # [25, 2] in grid units (-7..+7)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def extract_full_cscan(self, cscan: np.ndarray, self_calibrate: bool = False) -> np.ndarray:
         """
         Extracts unified downstream latent representation for entire C-scan [270, 270, C].
@@ -80,14 +80,16 @@ class CScanFeatureExtractor:
             r_coords = b_r[:, None] + offsets_r[None, :]
             c_coords = b_c[:, None] + offsets_c[None, :]
 
-            # Fetch patches: [B, 25, C] -> reshape to 5x5 concentric grid
-            # Since ConcentricStarTopology maps 25 points, we place them into [B, 5, 5, C]
-            # using standard indexing
-            grid_5x5 = self.topology.grid_indices  # [5, 5] maps to 0..24
+            # Fetch patches: [B, 25, C] -> reshape to 5x5 concentric grid.
+            # grid_indices is the identity arange(25).reshape(5, 5), so a plain
+            # reshape view yields the identical layout with zero extra copy
+            # (the old patch_25[:, grid_5x5] fancy-index duplicated ~50 MB/batch).
             patch_25 = padded[r_coords, c_coords]  # [B, 25, C]
-            patch_5x5 = patch_25[:, grid_5x5]      # [B, 5, 5, C]
+            patch_5x5 = patch_25.reshape(end_idx - start_idx, 5, 5, C)
 
-            x_tensor = torch.from_numpy(patch_5x5).to(self.device, non_blocking=True)
+            # Pinned staging + async H2D: lets the copy overlap with the
+            # previous batch's GPU forward instead of blocking on pageable RAM.
+            x_tensor = torch.from_numpy(patch_5x5).pin_memory().to(self.device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=self.use_amp and self.device.type == "cuda"):
                 feats = self.model.extract_features(x_tensor)  # [B, 2*D]

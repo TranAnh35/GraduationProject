@@ -35,17 +35,23 @@ def compute_vicreg_loss(
     before computing variance and covariance. This strictly prevents between-scan drift
     from falsely satisfying the variance regularizer, forcing the model to amplify
     true within-scan flaw/defect variance!
+
+    Vectorized via scatter (index_add_) over 0..S-1 remapped ids: a single pass
+    instead of one Python-level masked pass per unique scan (~100 kernel-launch
+    rounds per training step -> 3 kernels). Singletons keep z unchanged.
     """
     if scan_id is not None:
-        # z: [N, D], scan_id: [N]
-        unique_scans = torch.unique(scan_id)
-        z_cent = torch.zeros_like(z)
-        for s in unique_scans:
-            mask = (scan_id == s)
-            if mask.sum() > 1:
-                z_cent[mask] = z[mask] - z[mask].mean(dim=0, keepdim=True)
-            else:
-                z_cent[mask] = z[mask]
+        # z: [N, D], scan_id: [N] (arbitrary ids)
+        uniq, inv = torch.unique(scan_id, return_inverse=True)  # inv: [N] in 0..S-1
+        n_groups = uniq.numel()
+        # float32 accumulators for stable means under AMP fp16 inputs
+        counts = torch.bincount(inv, minlength=n_groups)  # [S] int64
+        sums = torch.zeros(n_groups, z.shape[1], device=z.device, dtype=torch.float32)
+        sums.index_add_(0, inv, z.float())
+        means = sums / counts.clamp_min(1).unsqueeze(1).float()  # [S, D]
+        m = means[inv].to(z.dtype)  # [N, D]
+        singleton = (counts[inv] <= 1).unsqueeze(1)  # [N, 1]
+        z_cent = torch.where(singleton, z, z - m)
         # Standard deviation computed strictly on within-scan centered perturbations
         std = torch.sqrt(z_cent.var(dim=0, unbiased=False) + eps)
     else:
@@ -210,7 +216,49 @@ class CrossConditionJEPA(nn.Module):
                 scan_id=scan_id_expanded,
             )
 
-            total_loss = pred_loss + carrier_loss + vicreg_loss
+            # D) EXP-49 L_inv: Cross-condition invariance on z_s.
+            # Same physical coordinate seen under condition A (context encoder,
+            # grad ON) vs condition B (target encoder, stop-grad/EMA target).
+            # Penalizes any condition drift left inside z_s. Asymmetric by
+            # design: gradient flows only into the A branch, the B branch is
+            # a fixed per-step target (BYOL-style, no collapse).
+            inv_weight = getattr(self.config, "inv_weight", 0.0)
+            if inv_weight > 0:
+                # z_s of condition B from the EMA target encoder over the SAME
+                # 16 outer context probes (context geometry matches H_ctx_a).
+                with torch.no_grad():
+                    ctx_tokens_b = tokens_b[batch_arange, ctx_idx]  # [B, 16, D]
+                    ctx_pos_b = pos_b[batch_arange, ctx_idx]
+                    H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b)  # [B, 16, D]
+                H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, 16, D_s] fixed target
+                inv_loss = F.mse_loss(H_ctx_s, H_ctx_b_s)
+            else:
+                inv_loss = torch.tensor(0.0, device=device)
+
+            # E) EXP-49 L_xcov: Cross-subspace decorrelation lock.
+            # ||XCov(z_c, z_s)||^2 over the N = B*16 context tokens.
+            # Purely unsupervised; prevents z_c from copying defect info back
+            # from z_s, forcing it to pick up the remainder (condition drift).
+            # NOTE: this term alone cannot create the split (it is symmetric);
+            # L_inv above creates the role asymmetry, L_xcov locks it in.
+            xcov_weight = getattr(self.config, "xcov_weight", 0.0)
+            if xcov_weight > 0:
+                flat_ctx_c = H_ctx_c.reshape(B * H_ctx_c.shape[1], -1)  # [N, D_c]
+                N = flat_ctx_c.shape[0]
+                zc_cent = flat_ctx_c - flat_ctx_c.mean(dim=0, keepdim=True)
+                zs_cent = flat_ctx_s - flat_ctx_s.mean(dim=0, keepdim=True)
+                xcov = (zc_cent.T @ zs_cent) / max(N - 1, 1)  # [D_c, D_s]
+                xcov_loss = (xcov ** 2).sum() / (D_c * D_s)
+            else:
+                xcov_loss = torch.tensor(0.0, device=device)
+
+            total_loss = (
+                pred_loss
+                + carrier_loss
+                + vicreg_loss
+                + inv_weight * inv_loss
+                + xcov_weight * xcov_loss
+            )
         else:
             # Standard single-space prediction
             H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, c_b)  # [B, 9, D]
@@ -232,6 +280,8 @@ class CrossConditionJEPA(nn.Module):
 
             carrier_loss = torch.tensor(0.0, device=device)
             total_loss = pred_loss + vicreg_loss
+            inv_loss = torch.tensor(0.0, device=device)
+            xcov_loss = torch.tensor(0.0, device=device)
 
         return {
             "total_loss": total_loss,
@@ -239,6 +289,8 @@ class CrossConditionJEPA(nn.Module):
             "carrier_loss": carrier_loss,
             "var_loss": var_loss,
             "cov_loss": cov_loss,
+            "inv_loss": inv_loss,
+            "xcov_loss": xcov_loss,
             "H_ctx_a": H_ctx_a,
             "H_tgt_b": H_tgt_b,
             "H_pred_b": H_pred_b,

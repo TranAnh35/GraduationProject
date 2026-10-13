@@ -10,6 +10,7 @@ Features:
 
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 import torch
@@ -18,7 +19,7 @@ from tqdm import tqdm
 
 from .split import extract_file_metadata
 from .topologies import get_spatial_topology_offsets
-from .preprocessing import load_canonical_cscan_from_tdms
+from .preprocessing import load_canonical_cscan_from_tdms, get_canonical_transformer
 
 
 class PairedPECTDataset(Dataset):
@@ -63,28 +64,29 @@ class PairedPECTDataset(Dataset):
         self.max_off = int(np.max(np.abs(self.offsets)))
         self.pad = max(grid_size // 2, self.max_off)
 
-        # Load scans and group by specimen
+        # Load scans and group by specimen (parallel TDMS decode: each file is
+        # independent; order is preserved by mapping back onto file_paths, so
+        # the resulting dataset is bit-identical to sequential loading)
         self.scans_by_specimen: Dict[str, List[Dict]] = {}
         print(f"\n[Loading & Standardizing {len(file_paths)} Training C-scans into RAM...]")
 
-        for fpath in tqdm(file_paths, desc="Loading canonical C-scans", dynamic_ncols=True):
-            meta = extract_file_metadata(fpath)
-            spec = meta["specimen"]
-            if spec not in self.scans_by_specimen:
-                self.scans_by_specimen[spec] = []
+        # Pre-build the canonical transformer in the main thread (lazy global)
+        get_canonical_transformer()
+        _temporal = temporal_samples
+        _pad = self.pad
 
+        def _load_one(fpath: str):
+            meta = extract_file_metadata(fpath)
             # Load canonical aligned C-scan (already rotated, flipped, and cropped to 270x270x128)
             cscan = load_canonical_cscan_from_tdms(
                 file_path=fpath,
-                temporal_samples=temporal_samples,
+                temporal_samples=_temporal,
                 apply_transforms=True,
             )
             sY, sX, C = cscan.shape
-
-            padded = np.pad(cscan, ((self.pad, self.pad), (self.pad, self.pad), (0, 0)), mode="edge")
+            padded = np.pad(cscan, ((_pad, _pad), (_pad, _pad), (0, 0)), mode="edge")
             ref_patch = cscan[10:15, 10:15, :].copy()
-
-            self.scans_by_specimen[spec].append({
+            return fpath, meta, {
                 "file_path": fpath,
                 "meta": meta,
                 "sY": sY,
@@ -92,7 +94,20 @@ class PairedPECTDataset(Dataset):
                 "C": C,
                 "padded": padded,
                 "ref_patch": ref_patch,
-            })
+            }
+
+        max_workers = min(4, max(1, len(file_paths)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            loaded = list(tqdm(pool.map(_load_one, file_paths),
+                               total=len(file_paths),
+                               desc="Loading canonical C-scans",
+                               dynamic_ncols=True))
+
+        for fpath, meta, entry in loaded:
+            spec = meta["specimen"]
+            if spec not in self.scans_by_specimen:
+                self.scans_by_specimen[spec] = []
+            self.scans_by_specimen[spec].append(entry)
 
         # Construct ALL directed pairs (A, B) with A != B on each specimen
         self.directed_pairs: List[Tuple[Dict, Dict]] = []

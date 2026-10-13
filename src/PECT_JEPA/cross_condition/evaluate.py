@@ -35,6 +35,7 @@ import glob
 import json
 import csv
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
@@ -47,7 +48,10 @@ if ROOT_DIR not in sys.path:
 
 from src.PECT_JEPA.cross_condition.configs.config import CrossConditionConfig
 from src.PECT_JEPA.cross_condition.models.cross_condition_jepa import CrossConditionJEPA
-from src.PECT_JEPA.cross_condition.data.preprocessing import load_canonical_cscan_from_tdms
+from src.PECT_JEPA.cross_condition.data.preprocessing import (
+    load_canonical_cscan_from_tdms,
+    get_canonical_transformer,
+)
 from src.PECT_JEPA.cross_condition.data.split import (
     extract_file_metadata,
     get_canonical_train_val_test_splits,
@@ -99,15 +103,20 @@ def build_corrosion_diameter_map(config: Dict[str, Any], grid_shape: Tuple[int, 
     """Creates [270, 270] continuous diameter map in mm from flaw config."""
     d_map = np.zeros(grid_shape, dtype=np.float32)
     features = config.get("features", [])
+    if not features:
+        return d_map
+    # Vectorized disk rasterization (identical values to the old per-pixel
+    # Python loops, without the O(flaws x area) interpreter overhead)
+    rr, cc = np.mgrid[0:grid_shape[0], 0:grid_shape[1]]
     for feat in features:
         cx = int(round(feat["x"]))
         cy = int(round(feat["y"]))
         dia = float(feat.get("diameter", 0.0))
         rad = int(round(dia / 2.0))
-        for r in range(max(0, cy - rad), min(grid_shape[0], cy + rad + 1)):
-            for c in range(max(0, cx - rad), min(grid_shape[1], cx + rad + 1)):
-                if (r - cy) ** 2 + (c - cx) ** 2 <= rad ** 2:
-                    d_map[r, c] = dia
+        r0, r1 = max(0, cy - rad), min(grid_shape[0], cy + rad + 1)
+        c0, c1 = max(0, cx - rad), min(grid_shape[1], cx + rad + 1)
+        disk = (rr[r0:r1, c0:c1] - cy) ** 2 + (cc[r0:r1, c0:c1] - cx) ** 2 <= rad ** 2
+        d_map[r0:r1, c0:c1][disk] = dia
     return d_map
 
 
@@ -119,7 +128,8 @@ def parse_args():
     parser.add_argument("--out_dir", type=str, default=None, help="Explicit override for output directory")
     parser.add_argument("--eval_splits", nargs="+", default=["train", "val", "test"], help="Splits to evaluate ('train', 'val', 'test')")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
-    parser.add_argument("--batch_size", type=int, default=4096, help="Batch size for feature extraction")
+    parser.add_argument("--batch_size", type=int, default=8192, help="Batch size for feature extraction")
+    parser.add_argument("--prefetch", type=lambda v: v.lower() == "true", default=True, help="Overlap next-file TDMS load with current-file GPU/CPU processing")
     parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True, help="Enable unsupervised spatial self-calibration (zero-centering C-scan against sound-metal background median)")
     return parser.parse_args()
 
@@ -172,9 +182,46 @@ def resolve_paths(args) -> Tuple[str, str]:
     raise ValueError("Must provide either --exp_dir or --checkpoint")
 
 
+def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int = 2, lookahead: int = 2):
+    """Yields (file_path, canonical_cscan) in order, decoding up to `lookahead`
+    TDMS files concurrently on background threads while the caller processes
+    the current file (TDMS decode + filtering ~3 s hidden behind GPU
+    extraction + sklearn + plots). Processing order, RNG consumption, and
+    results are identical to the sequential loop; use_prefetch=False
+    reproduces the old loop exactly.
+    """
+    if not use_prefetch or len(files) <= 1:
+        for fp in files:
+            yield fp, load_canonical_cscan_from_tdms(file_path=fp)
+        return
+    from collections import deque
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pending: deque = deque()
+        nxt = 0
+
+        def _pump():
+            nonlocal nxt
+            while nxt < len(files) and len(pending) < lookahead:
+                pending.append((files[nxt], pool.submit(load_canonical_cscan_from_tdms, files[nxt])))
+                nxt += 1
+
+        _pump()
+        for fp in files:
+            wfp, fut = pending.popleft()
+            assert wfp == fp, "Prefetch stream out of order"
+            cscan = fut.result()
+            _pump()
+            yield fp, cscan
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
     # Resolve paths to unify checkpoints and evaluations in the same folder
     ckpt_path, out_dir = resolve_paths(args)
@@ -214,7 +261,7 @@ def main():
 
     # 2. Ground Truth Masks & Feature Extractor
     extractor = CScanFeatureExtractor(model=model, device=device, batch_size=args.batch_size)
-    suite = DownstreamBenchmarkSuite(n_splits=5, random_state=42)
+    suite = DownstreamBenchmarkSuite(n_splits=5, random_state=42, device=device)
     gt_masks = load_ground_truth_masks()
     corr_d_map = None
     if "Corrosion" in gt_masks and gt_masks["Corrosion"]["config"] is not None:
@@ -225,6 +272,9 @@ def main():
     all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
 
     splits = get_canonical_train_val_test_splits(all_files, val_files_count=4, seed=42)
+    # Pre-build the canonical transformer on the main thread so background
+    # prefetch workers never race on the lazy global.
+    get_canonical_transformer()
     print(f"Discovered {len(all_files)} total inspection files:")
     print(f"  - Train Split (Base Domain):     {len(splits['train'])} files")
     print(f"  - Val Split (Base Domain):       {len(splits['val'])} files")
@@ -239,17 +289,20 @@ def main():
     train_det_x, train_det_y = [], []
     train_size_x, train_size_y = [], []
 
-    pbar_train = tqdm(splits["train"], desc="Fitting Readouts on Train Pool", file=sys.stdout, dynamic_ncols=True)
+    # Metadata-only pre-filter (no IO): identical survivor set/order as the
+    # old in-loop `continue`, so RNG draws and fitted readouts are unchanged.
+    train_eval_files = [fp for fp in splits["train"]
+                        if extract_file_metadata(fp)["specimen"] in gt_masks]
+    pbar_train = tqdm(_iter_with_prefetch(train_eval_files, args.prefetch),
+                      total=len(train_eval_files),
+                      desc="Fitting Readouts on Train Pool", file=sys.stdout, dynamic_ncols=True)
     rng = np.random.RandomState(42)
 
-    for fp in pbar_train:
+    for fp, cscan in pbar_train:
         meta = extract_file_metadata(fp)
         sp = meta["specimen"]
-        if sp not in gt_masks:
-            continue
 
         gt_mask = gt_masks[sp]["mask"]
-        cscan = load_canonical_cscan_from_tdms(file_path=fp)
         latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
         cached_train_latents[fp] = latents
 
@@ -308,7 +361,15 @@ def main():
         split_files = splits.get(split_name, [])
         print(f"\n>>> Running Evaluation on Split [{split_name.upper()}] ({len(split_files)} files) <<<", flush=True)
 
-        pbar = tqdm(split_files, desc=f"Evaluating [{split_name.upper()}]", file=sys.stdout, dynamic_ncols=True)
+        # Metadata-only pre-filter (same survivor set/order as old `continue`)
+        eval_files = [fp for fp in split_files
+                      if extract_file_metadata(fp)["specimen"] in gt_masks]
+        uncached = [fp for fp in eval_files
+                    if not (split_name == "train" and fp in cached_train_latents)]
+        load_stream = iter(_iter_with_prefetch(uncached, args.prefetch))
+        next_loaded = next(load_stream, None)
+
+        pbar = tqdm(eval_files, desc=f"Evaluating [{split_name.upper()}]", file=sys.stdout, dynamic_ncols=True)
         for fp in pbar:
             meta = extract_file_metadata(fp)
             specimen = meta["specimen"]
@@ -318,17 +379,16 @@ def main():
             fname = os.path.basename(fp)
             bname = os.path.splitext(fname)[0]
 
-            if specimen not in gt_masks:
-                continue
-
             gt_mask = gt_masks[specimen]["mask"]
 
-            # Load or retrieve cached latents
+            # Load or retrieve cached latents (prefetched in order)
             if split_name == "train" and fp in cached_train_latents:
                 latents = cached_train_latents[fp]
             else:
-                cscan = load_canonical_cscan_from_tdms(file_path=fp)
-                latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
+                assert next_loaded is not None and next_loaded[0] == fp, \
+                    "Prefetch stream out of order"
+                latents = extractor.extract_full_cscan(next_loaded[1], self_calibrate=args.self_calibration)
+                next_loaded = next(load_stream, None)
 
             # TASK 1: Anomaly Detection
             # A) Supervised Trained Linear Probe

@@ -45,6 +45,9 @@ class CrossConditionConfig:
     carrier_flat_weight: float = 1.0      # Spatial flatness penalty on z_c within C-scan
     scattering_var_weight: float = 1.0    # VICReg variance penalty on z_s (hinge std >= 1.0)
     scattering_cov_weight: float = 1.0    # VICReg covariance decorrelation penalty on z_s (prevents 1D collapse)
+    # EXP-49: Cross-condition invariance (L_inv) + cross-subspace lock (L_xcov)
+    inv_weight: float = 0.0               # MSE(z_s(x_a), stopgrad(z_s(x_b))): drives condition drift OUT of z_s
+    xcov_weight: float = 0.0              # ||XCov(z_c, z_s)||^2: locks the split, forces z_c to pick up the remainder
     downstream_latent_type: str = "scattering"  # 'scattering' (z_s only, drift-free), 'full' ([z_c, z_s]), 'carrier' (z_c)
 
     # Loss weights

@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument("--carrier_flat_weight", type=float, default=1.0, help="Spatial flatness penalty weight on carrier subspace z_c")
     parser.add_argument("--scattering_var_weight", type=float, default=1.0, help="VICReg variance weight on scattering subspace z_s")
     parser.add_argument("--scattering_cov_weight", type=float, default=1.0, help="VICReg covariance weight on scattering subspace z_s")
+    parser.add_argument("--inv_weight", type=float, default=0.0, help="EXP-49 cross-condition invariance MSE(z_s(A), stopgrad(z_s(B))) weight")
+    parser.add_argument("--xcov_weight", type=float, default=0.0, help="EXP-49 cross-subspace decorrelation ||XCov(z_c,z_s)||^2 weight")
     parser.add_argument("--scan_centered_vicreg", type=lambda v: v.lower() == "true", default=True, help="Center representations per scan before computing VICReg")
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
@@ -116,6 +118,8 @@ def main():
         carrier_flat_weight=args.carrier_flat_weight,
         scattering_var_weight=args.scattering_var_weight,
         scattering_cov_weight=args.scattering_cov_weight,
+        inv_weight=args.inv_weight,
+        xcov_weight=args.xcov_weight,
         scan_centered_vicreg=args.scan_centered_vicreg,
         var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,
@@ -131,6 +135,11 @@ def main():
     # Initialize logger
     logger = CrossConditionLogger(run_dir=run_dir, run_name=run_name, config=config)
     device = torch.device(args.device)
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
     logger.info(f"Initialized Unified Experiment Directory: {run_dir}")
     logger.info(f"Configuration: {config}")

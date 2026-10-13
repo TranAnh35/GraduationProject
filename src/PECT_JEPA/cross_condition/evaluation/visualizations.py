@@ -91,11 +91,11 @@ def apply_spatial_coherence_filter(bin_map: np.ndarray, min_area: int = 8) -> np
     if num_features == 0:
         return np.zeros_like(bin_map)
     sizes = ndi.sum(closed, labeled, range(1, num_features + 1))
-    cleaned = np.zeros_like(bin_map)
-    for i, s in enumerate(sizes, 1):
-        if s >= min_area:
-            cleaned[labeled == i] = 1
-    return cleaned
+    # Vectorized keep-mask (identical to the old per-component Python loop)
+    keep = np.nonzero(np.asarray(sizes) >= min_area)[0] + 1
+    if len(keep) == 0:
+        return np.zeros_like(bin_map)
+    return np.isin(labeled, keep).astype(bin_map.dtype)
 
 
 def plot_probability_heatmap(

@@ -29,6 +29,7 @@ from ..utils.logger import CrossConditionLogger
 from ..evaluation.visualizations import plot_training_curves
 from ..evaluation.cscan_extractor import CScanFeatureExtractor
 from ..evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
+from ..data.topologies import get_spatial_topology_offsets as _get_offsets
 from .diagnostics import compute_svd_diagnostics, compute_latent_snr
 
 
@@ -58,6 +59,18 @@ class CrossConditionTrainer:
             weight_decay=config.weight_decay,
         )
 
+        # Runtime: autotune cudnn kernels once + allow TF32/high-precision
+        # matmuls. Numerics of the AMP fp16 training path are unchanged.
+        try:
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+        # Hoisted validation helpers (built once, not re-allocated every epoch)
+        self._val_extractor: Optional[CScanFeatureExtractor] = None
+        self._val_suite: Optional[DownstreamBenchmarkSuite] = None
+
         # 3. AMP Scaler
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.mixed_precision and device.type == "cuda")
 
@@ -69,6 +82,8 @@ class CrossConditionTrainer:
             "pred_loss": [],
             "var_loss": [],
             "cov_loss": [],
+            "inv_loss": [],
+            "xcov_loss": [],
             "effective_rank": [],
             "lr": [],
             "val_loss": [],
@@ -103,7 +118,6 @@ class CrossConditionTrainer:
             pad = 7
             padded = np.pad(cscan, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
             # Topology offsets: idx 0..8 core target, 9..24 outer context
-            from ..data.topologies import get_spatial_topology_offsets as _get_offsets
             offsets = _get_offsets("concentric_star", (1, 3, 7), 5)
             rr = rng.randint(0, H, size=num_patches) + pad
             cc = rng.randint(0, W, size=num_patches) + pad
@@ -132,13 +146,16 @@ class CrossConditionTrainer:
         was_training = self.model.training
         self.model.eval()
 
-        extractor = CScanFeatureExtractor(
-            model=self.model,
-            device=self.device,
-            batch_size=4096,
-            use_amp=self.config.mixed_precision,
-        )
-        suite = DownstreamBenchmarkSuite(n_splits=3, random_state=42)
+        if self._val_extractor is None:
+            self._val_extractor = CScanFeatureExtractor(
+                model=self.model,
+                device=self.device,
+                batch_size=8192,
+                use_amp=self.config.mixed_precision,
+            )
+            self._val_suite = DownstreamBenchmarkSuite(n_splits=3, random_state=42, device=self.device)
+        extractor = self._val_extractor
+        suite = self._val_suite
 
         auc_list = []
         ap_list = []
@@ -220,11 +237,20 @@ class CrossConditionTrainer:
         self.model.train()
         total_batches = len(loader)
 
-        running_loss = 0.0
-        running_pred = 0.0
-        running_carrier = 0.0
-        running_var = 0.0
-        running_cov = 0.0
+        # Runtime: accumulate loss sums as GPU-side float64 scalars and sync to
+        # CPU only once per LOG_EVERY batches for the progress bar (plus once
+        # at epoch end). The old code called .item() 7x per batch, forcing a
+        # full CUDA pipeline stall on every one of the ~3.2k steps/epoch.
+        LOG_EVERY = 10
+        acc_loss = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_pred = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_carrier = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_var = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_cov = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_inv = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_xcov = torch.zeros((), device=self.device, dtype=torch.float64)
+        disp = {"loss": float("nan"), "pred": float("nan"), "car": float("nan"),
+                "var": float("nan"), "inv": float("nan")}
 
         # Linear Warmup + Cosine Annealing learning rate schedule
         warmup_epochs = max(0, getattr(self.config, "warmup_epochs", 3))
@@ -281,28 +307,43 @@ class CrossConditionTrainer:
             # EMA update
             self.model.update_target_encoder(momentum=ema_momentum)
 
-            running_loss += loss.item()
-            running_pred += outputs["pred_loss"].item()
-            running_carrier += outputs.get("carrier_loss", torch.tensor(0.0)).item()
-            running_var += outputs["var_loss"].item()
-            running_cov += outputs["cov_loss"].item()
+            # Sync-free accumulation (detach keeps the graph released)
+            acc_loss += loss.detach().double()
+            acc_pred += outputs["pred_loss"].detach().double()
+            _car = outputs.get("carrier_loss", None)
+            acc_carrier += _car.detach().double() if _car is not None else 0.0
+            acc_var += outputs["var_loss"].detach().double()
+            acc_cov += outputs["cov_loss"].detach().double()
+            _inv = outputs.get("inv_loss", None)
+            acc_inv += _inv.detach().double() if _inv is not None else 0.0
+            _xc = outputs.get("xcov_loss", None)
+            acc_xcov += _xc.detach().double() if _xc is not None else 0.0
 
             if batch_idx < 5:
                 sample_reps.append(outputs["H_ctx_a"].detach().cpu())
 
+            # Refresh displayed values at most every LOG_EVERY batches
+            if batch_idx % LOG_EVERY == 0:
+                snap = torch.stack([acc_loss, acc_pred, acc_carrier, acc_var, acc_inv]).cpu() / (batch_idx + 1)
+                snap_list = snap.tolist()
+                disp = {"loss": snap_list[0], "pred": snap_list[1], "car": snap_list[2],
+                        "var": snap_list[3], "inv": snap_list[4]}
             pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "pred": f"{outputs['pred_loss'].item():.4f}",
-                "car": f"{outputs.get('carrier_loss', torch.tensor(0.0)).item():.4f}",
-                "var": f"{outputs['var_loss'].item():.4f}",
+                "loss": f"{disp['loss']:.4f}",
+                "pred": f"{disp['pred']:.4f}",
+                "car": f"{disp['car']:.4f}",
+                "var": f"{disp['var']:.4f}",
+                "inv": f"{disp['inv']:.4f}",
                 "lr": f"{lr:.2e}",
             })
 
-        avg_loss = running_loss / total_batches
-        avg_pred = running_pred / total_batches
-        avg_carrier = running_carrier / total_batches
-        avg_var = running_var / total_batches
-        avg_cov = running_cov / total_batches
+        avg_loss = (acc_loss / total_batches).item()
+        avg_pred = (acc_pred / total_batches).item()
+        avg_carrier = (acc_carrier / total_batches).item()
+        avg_var = (acc_var / total_batches).item()
+        avg_cov = (acc_cov / total_batches).item()
+        avg_inv = (acc_inv / total_batches).item()
+        avg_xcov = (acc_xcov / total_batches).item()
 
         all_reps = torch.cat(sample_reps, dim=0)
         svd_res = compute_svd_diagnostics(all_reps)
@@ -314,6 +355,8 @@ class CrossConditionTrainer:
             "carrier_loss": avg_carrier,
             "var_loss": avg_var,
             "cov_loss": avg_cov,
+            "inv_loss": avg_inv,
+            "xcov_loss": avg_xcov,
             "effective_rank": svd_res["effective_rank"],
             "lr": lr,
         }
@@ -357,8 +400,12 @@ class CrossConditionTrainer:
         best_val_snr = 0.0
 
         # If resumed, recover best metric state from history
+        # (loss-based state uses VAL loss, consistent with early stopping)
         if hasattr(self, "history") and self.history:
-            if "total_loss" in self.history and self.history["total_loss"]:
+            if "val_loss" in self.history and self.history["val_loss"]:
+                positives = [v for v in self.history["val_loss"] if v and v > 0]
+                best_loss = min(positives) if positives else float("inf")
+            elif "total_loss" in self.history and self.history["total_loss"]:
                 best_loss = min(self.history["total_loss"])
             if "val_auc" in self.history and self.history["val_auc"]:
                 best_val_auc = max(self.history["val_auc"])
@@ -418,7 +465,14 @@ class CrossConditionTrainer:
                 print(summary_msg, flush=True)
 
             # Checkpoint best model & Early Stopping Evaluation
-            curr_loss = epoch_metrics["total_loss"]
+            # NOTE: all loss-based comparisons use VAL loss (self-conditioned
+            # JEPA recon on held-out scans), never train loss. Train L1 drops
+            # monotonically even while the model overfits condition drift, so
+            # rewarding train-loss decrease rewards overfitting.
+            curr_loss = epoch_metrics.get("val_loss", 0.0) or 0.0
+            if curr_loss == 0.0:
+                # val telemetry unavailable (no val_scans): fall back to train
+                curr_loss = epoch_metrics["total_loss"]
             curr_auc = epoch_metrics.get("val_auc", 0.0)
             curr_snr = epoch_metrics.get("val_snr", 0.0)
 
@@ -438,13 +492,13 @@ class CrossConditionTrainer:
             elif metric_mode == "loss":
                 if curr_loss < (best_loss - min_delta):
                     improved = True
-                    improve_reason = f"Loss improved: {best_loss:.4f} -> {curr_loss:.4f}"
+                    improve_reason = f"Val loss improved: {best_loss:.4f} -> {curr_loss:.4f}"
                     best_loss = curr_loss
             else:  # "composite"
                 # Multi-criterion representation health:
                 # 1. Defect AUC improved significantly
                 # 2. OR Latent SNR improved by >= 2% while AUC stable
-                # 3. OR Loss dropped by min_delta while AUC stable
+                # 3. OR Val loss dropped by min_delta while AUC stable
                 if curr_auc > (best_val_auc + 0.002):
                     improved = True
                     improve_reason = f"Val AUC improved: {best_val_auc:.4f} -> {curr_auc:.4f}"
@@ -458,7 +512,7 @@ class CrossConditionTrainer:
                     best_loss = min(best_loss, curr_loss)
                 elif curr_loss < (best_loss - min_delta) and curr_auc >= (best_val_auc - 0.010):
                     improved = True
-                    improve_reason = f"Prediction loss improved: {best_loss:.4f} -> {curr_loss:.4f} (AUC stable: {curr_auc:.4f})"
+                    improve_reason = f"Val loss improved: {best_loss:.4f} -> {curr_loss:.4f} (AUC stable: {curr_auc:.4f})"
                     best_loss = min(best_loss, curr_loss)
 
             if improved:
@@ -481,7 +535,7 @@ class CrossConditionTrainer:
                     patience_counter += 1
                     status_msg = (
                         f"  [!] Early stopping patience: {patience_counter}/{patience} "
-                        f"(Best Val AUC: {best_val_auc:.4f}, Best SNR: {best_val_snr:.2f}, Best Loss: {best_loss:.4f})"
+                        f"(Best Val AUC: {best_val_auc:.4f}, Best SNR: {best_val_snr:.2f}, Best ValLoss: {best_loss:.4f})"
                     )
                     if self.logger:
                         self.logger.info(status_msg)
@@ -491,8 +545,8 @@ class CrossConditionTrainer:
                     if patience_counter >= patience:
                         stop_msg = (
                             f"\n[Early Stopping Triggered at Epoch {epoch:02d}] "
-                            f"Neither Val AUC, Latent SNR, nor Loss improved for {patience_counter} consecutive epochs "
-                            f"(Best Val AUC: {best_val_auc:.4f}, Best SNR: {best_val_snr:.2f}, Best Loss: {best_loss:.4f}). "
+                            f"Neither Val AUC, Latent SNR, nor Val Loss improved for {patience_counter} consecutive epochs "
+                            f"(Best Val AUC: {best_val_auc:.4f}, Best SNR: {best_val_snr:.2f}, Best ValLoss: {best_loss:.4f}). "
                             f"Terminating training early."
                         )
                         if self.logger:
@@ -527,17 +581,20 @@ class CrossConditionTrainer:
                 "history": self.history,
             }, latest_path)
 
-            # Plot training curves every epoch (cheap: 1 figure, no grad)
+            # Plot training curves periodically (cheap, but a full matplotlib
+            # 4-panel figure every epoch wastes ~0.7 s x epochs for an image
+            # that gets overwritten anyway) + always at the end of training.
             # (non-fatal: a plotting hiccup must never kill a long training run)
-            curve_path = os.path.join(viz_dir, "training_curves.png")
-            try:
-                plot_training_curves(self.history, curve_path)
-            except Exception as e:
-                warn_msg = f"  [WARN] Skipping training-curve plot at epoch {epoch}: {type(e).__name__}: {e}"
-                if self.logger:
-                    self.logger.info(warn_msg)
-                else:
-                    print(warn_msg, flush=True)
+            if epoch % 5 == 0 or epoch == total_epochs:
+                curve_path = os.path.join(viz_dir, "training_curves.png")
+                try:
+                    plot_training_curves(self.history, curve_path)
+                except Exception as e:
+                    warn_msg = f"  [WARN] Skipping training-curve plot at epoch {epoch}: {type(e).__name__}: {e}"
+                    if self.logger:
+                        self.logger.info(warn_msg)
+                    else:
+                        print(warn_msg, flush=True)
 
         # Always save final training curve at conclusion of training
         curve_path = os.path.join(viz_dir, "training_curves.png")

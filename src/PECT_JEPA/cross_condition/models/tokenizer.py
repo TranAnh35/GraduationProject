@@ -71,6 +71,11 @@ class DualDomainTokenizer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, config.embed_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
+        # Precomputed spectral-moment frequency grid (hoisted: avoids rebuilding
+        # a linspace tensor on every forward call in the hot training loop)
+        k_grid = torch.linspace(0.1, 1.0, self.num_harmonics, dtype=torch.float32).view(1, 1, -1)
+        self.register_buffer("k_grid", k_grid, persistent=False)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -117,7 +122,7 @@ class DualDomainTokenizer(nn.Module):
             phase_gated = saliency * phase
 
             # Spectral centroid and bandwidth moments
-            k_idx = torch.linspace(0.1, 1.0, self.num_harmonics, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+            k_idx = self.k_grid.to(dtype=x_flat.dtype, device=x_flat.device)
             f_c = torch.sum(k_idx * saliency, dim=-1, keepdim=True)
             f_spread = torch.sqrt(torch.sum(((k_idx - f_c) ** 2) * saliency, dim=-1, keepdim=True) + 1e-8)
 
