@@ -103,11 +103,28 @@ class CrossConditionLogger:
         self.logger.info(msg)
 
     def log_epoch(self, metrics: Dict[str, Any]):
-        fieldnames = list(metrics.keys())
-        write_header = not os.path.exists(self.metrics_csv_path)
+        # Resume-safe append: if the file already has a header from a previous
+        # run whose metric keys differ (e.g. val telemetry on/off, new loss
+        # terms), merge headers and rewrite once instead of appending
+        # misaligned rows under a stale header.
+        if os.path.exists(self.metrics_csv_path):
+            with open(self.metrics_csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                old_header = list(reader.fieldnames or [])
+                old_rows = list(reader)
+            merged = old_header + [k for k in metrics.keys() if k not in old_header]
+            if len(merged) != len(old_header):
+                with open(self.metrics_csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=merged)
+                    writer.writeheader()
+                    writer.writerows(old_rows)
+            with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=merged)
+                writer.writerow({k: metrics.get(k, "") for k in merged})
+            return
 
-        with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as f:
+        fieldnames = list(metrics.keys())
+        with open(self.metrics_csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
+            writer.writeheader()
             writer.writerow(metrics)

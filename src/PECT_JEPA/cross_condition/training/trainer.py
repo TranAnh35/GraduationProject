@@ -33,6 +33,39 @@ from ..data.topologies import get_spatial_topology_offsets as _get_offsets
 from .diagnostics import compute_svd_diagnostics, compute_latent_snr
 
 
+def _ramp_scale(epoch: int, start_epoch: int, ramp_epochs: int) -> float:
+    """P0-1 curriculum multiplier in [0, 1] for auxiliary representation
+    losses (L_inv / L_xcov). Stays 0 before start_epoch, then cosine-ramps to
+    1 over ramp_epochs (ramp <= 0 means legacy constant-on from start_epoch).
+    Lets the predictor path build features first; the direct-on-encoder terms
+    only polish invariance afterwards instead of hijacking early training.
+    """
+    if epoch < start_epoch:
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    p = min(1.0, max(0.0, (epoch - start_epoch) / ramp_epochs))
+    return 0.5 * (1.0 - math.cos(math.pi * p))
+
+
+def _val_divergence_step(val_loss: float, best_min: float, counter: int,
+                         factor: float) -> tuple:
+    """One update of the train/val-divergence guard.
+
+    Tracks the running best val recon loss; counts consecutive evals where val
+    exceeds best * factor (default 1.5x). A rising val while train stays
+    flat/falling = shortcut or overfit (exp49: val 0.0275 -> 0.06 while train
+    pred sat at ~0.03). Returns (new_best_min, new_counter); the caller stops
+    when counter reaches diverge_patience.
+    NOTE: read R_eff only jointly with SndVar/SNR/AUC — a high R_eff with
+    collapsed SndVar is an isotropic noise floor, not learned rank (exp49:
+    R_eff 15 with SndVar -> 0, AUC ~= chance).
+    """
+    if val_loss > best_min * factor:
+        return best_min, counter + 1
+    return min(best_min, val_loss), 0
+
+
 class CrossConditionTrainer:
     """
     Manages end-to-end self-supervised pretraining of CrossConditionJEPA.
@@ -76,6 +109,7 @@ class CrossConditionTrainer:
 
         # 4. History tracking
         self.start_epoch = 1
+        self._resumed_patience = 0
         self.history: Dict[str, list] = {
             "epoch": [],
             "total_loss": [],
@@ -84,6 +118,7 @@ class CrossConditionTrainer:
             "cov_loss": [],
             "inv_loss": [],
             "xcov_loss": [],
+            "zc_cond_loss": [],
             "effective_rank": [],
             "lr": [],
             "val_loss": [],
@@ -115,10 +150,11 @@ class CrossConditionTrainer:
         for item in self.val_scans:
             cscan = item["cscan"]  # [H, W, C]
             H, W, C = cscan.shape
-            pad = 7
-            padded = np.pad(cscan, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
+            _radii = tuple(getattr(self.config, "star_radii", (1, 3, 7)))
             # Topology offsets: idx 0..8 core target, 9..24 outer context
-            offsets = _get_offsets("concentric_star", (1, 3, 7), 5)
+            offsets = _get_offsets("concentric_star", _radii, 5)
+            pad = int(max(1, np.max(np.abs(offsets))))
+            padded = np.pad(cscan, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
             rr = rng.randint(0, H, size=num_patches) + pad
             cc = rng.randint(0, W, size=num_patches) + pad
             # Gather 25 star probes per patch: [N, 25, C]
@@ -218,15 +254,25 @@ class CrossConditionTrainer:
         self.model.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        # AMP scaler state (loss scale / growth tracker); absent in old ckpts
+        if "scaler_state_dict" in ckpt:
+            try:
+                self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+            except Exception:
+                pass
         self.start_epoch = ckpt.get("epoch", 0) + 1
+        self._resumed_patience = int(ckpt.get("patience_counter", 0))
         if "history" in ckpt:
             self.history = ckpt["history"]
-            # Backward compat: older checkpoints lack val_loss -> pad with zeros
+            # Backward compat: pad any missing/short key with zeros so resumed
+            # history lists stay aligned (old ckpts lack val_loss, inv_loss,
+            # xcov_loss, val_ap, ...). Padding uses total_loss length as ref.
             n = len(self.history.get("total_loss", []))
-            if "val_loss" not in self.history:
-                self.history["val_loss"] = [0.0] * n
-            elif len(self.history["val_loss"]) < n:
-                self.history["val_loss"] += [0.0] * (n - len(self.history["val_loss"]))
+            for k, v in self.history.items():
+                if isinstance(v, list) and len(v) < n:
+                    v += [0.0] * (n - len(v))
+        else:
+            self._resumed_patience = 0
 
     def train_epoch(
         self,
@@ -249,6 +295,7 @@ class CrossConditionTrainer:
         acc_cov = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_inv = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_xcov = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_zc = torch.zeros((), device=self.device, dtype=torch.float64)
         disp = {"loss": float("nan"), "pred": float("nan"), "car": float("nan"),
                 "var": float("nan"), "inv": float("nan")}
 
@@ -270,6 +317,12 @@ class CrossConditionTrainer:
         ema_momentum = self.config.ema_momentum_end - (self.config.ema_momentum_end - self.config.ema_momentum_start) * (
             0.5 * (1.0 + math.cos(math.pi * progress_total))
         )
+
+        # P0-1 curriculum scales for this epoch (1.0 = legacy unscheduled path)
+        inv_scale = _ramp_scale(epoch, getattr(self.config, "inv_start_epoch", 1),
+                                getattr(self.config, "inv_ramp_epochs", 0))
+        xcov_scale = _ramp_scale(epoch, getattr(self.config, "xcov_start_epoch", 1),
+                                 getattr(self.config, "xcov_ramp_epochs", 0))
 
         pbar = tqdm(
             loader,
@@ -293,7 +346,8 @@ class CrossConditionTrainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=self.config.mixed_precision and self.device.type == "cuda"):
-                outputs = self.model(x_a, x_b, ref_b, scan_id=scan_id)
+                outputs = self.model(x_a, x_b, ref_b, scan_id=scan_id,
+                                     inv_scale=inv_scale, xcov_scale=xcov_scale)
                 loss = outputs["total_loss"]
 
             self.scaler.scale(loss).backward()
@@ -318,6 +372,8 @@ class CrossConditionTrainer:
             acc_inv += _inv.detach().double() if _inv is not None else 0.0
             _xc = outputs.get("xcov_loss", None)
             acc_xcov += _xc.detach().double() if _xc is not None else 0.0
+            _zc = outputs.get("zc_cond_loss", None)
+            acc_zc += _zc.detach().double() if _zc is not None else 0.0
 
             if batch_idx < 5:
                 sample_reps.append(outputs["H_ctx_a"].detach().cpu())
@@ -344,6 +400,7 @@ class CrossConditionTrainer:
         avg_cov = (acc_cov / total_batches).item()
         avg_inv = (acc_inv / total_batches).item()
         avg_xcov = (acc_xcov / total_batches).item()
+        avg_zc = (acc_zc / total_batches).item()
 
         all_reps = torch.cat(sample_reps, dim=0)
         svd_res = compute_svd_diagnostics(all_reps)
@@ -357,9 +414,44 @@ class CrossConditionTrainer:
             "cov_loss": avg_cov,
             "inv_loss": avg_inv,
             "xcov_loss": avg_xcov,
+            "zc_cond_loss": avg_zc,
             "effective_rank": svd_res["effective_rank"],
             "lr": lr,
         }
+
+    def _recover_best_state(self, warmup_epochs: int):
+        """Recomputes early-stopping best state from resumed history.
+
+        Warmup epochs are EXCLUDED: the warmup reset (epoch == warmup_epochs)
+        discards warmup-era bests in a fresh run, so including them here would
+        let a warmup-epoch value permanently block the post-warmup improvement
+        paths (especially the val_loss branch). Filter by stored epoch numbers;
+        fall back to the full history when resuming mid-warmup.
+        Returns (best_loss, best_val_auc, best_val_snr, patience_counter).
+        """
+        best_loss, best_val_auc, best_val_snr = float("inf"), 0.0, 0.0
+        if hasattr(self, "history") and self.history:
+            ep_list = self.history.get("epoch", [])
+            post_idx = [i for i, e in enumerate(ep_list) if isinstance(e, int) and e > warmup_epochs]
+            if not post_idx:
+                post_idx = list(range(len(ep_list)))
+
+            def _col(key: str):
+                vals = self.history.get(key, [])
+                return [vals[i] for i in post_idx if i < len(vals) and isinstance(vals[i], (int, float))]
+
+            post_val = [v for v in _col("val_loss") if v and v > 0]
+            if post_val:
+                best_loss = min(post_val)
+            elif _col("total_loss"):
+                best_loss = min(_col("total_loss"))
+            post_auc = _col("val_auc")
+            if post_auc:
+                best_val_auc = max(post_auc)
+            post_snr = _col("val_snr")
+            if post_snr:
+                best_val_snr = max(post_snr)
+        return best_loss, best_val_auc, best_val_snr, getattr(self, "_resumed_patience", 0)
 
     def train(
         self,
@@ -367,6 +459,21 @@ class CrossConditionTrainer:
         epochs: Optional[int] = None,
     ) -> str:
         total_epochs = epochs or self.config.epochs
+
+        # Resume guard: requesting fewer total epochs than already trained is
+        # almost always a CLI mistake (e.g. forgetting --epochs). Fail loud
+        # instead of printing a fake "Training Complete".
+        ckpt_dir = self.logger.checkpoint_dir if self.logger else self.config.checkpoint_dir
+        viz_dir = self.logger.visualizations_dir if self.logger else self.config.visualizations_dir
+        best_ckpt_path = os.path.join(ckpt_dir, "best_cross_condition_jepa.pt") if ckpt_dir else "best_cross_condition_jepa.pt"
+        if self.start_epoch > total_epochs:
+            msg = (f"[Resume] start_epoch={self.start_epoch} > total_epochs={total_epochs}: "
+                   f"nothing to train. Re-run with --epochs >= {self.start_epoch}.")
+            if self.logger:
+                self.logger.info(msg)
+            if os.path.exists(best_ckpt_path):
+                return best_ckpt_path
+            raise ValueError(msg)
 
         batches_per_epoch = len(dataset) // self.config.batch_size
         cycle_info = (
@@ -399,22 +506,24 @@ class CrossConditionTrainer:
         best_val_auc = 0.0
         best_val_snr = 0.0
 
-        # If resumed, recover best metric state from history
-        # (loss-based state uses VAL loss, consistent with early stopping)
+        # If resumed, recover best metric state from history (post-warmup only;
+        # loss-based state uses VAL loss, consistent with early stopping)
         if hasattr(self, "history") and self.history:
-            if "val_loss" in self.history and self.history["val_loss"]:
-                positives = [v for v in self.history["val_loss"] if v and v > 0]
-                best_loss = min(positives) if positives else float("inf")
-            elif "total_loss" in self.history and self.history["total_loss"]:
-                best_loss = min(self.history["total_loss"])
-            if "val_auc" in self.history and self.history["val_auc"]:
-                best_val_auc = max(self.history["val_auc"])
-            if "val_snr" in self.history and self.history["val_snr"]:
-                best_val_snr = max(self.history["val_snr"])
+            best_loss, best_val_auc, best_val_snr, patience_counter = \
+                self._recover_best_state(warmup_epochs)
+
+        # Train/val-divergence guard state (val recon rising far above its
+        # running best while train stays flat = shortcut/overfit, exp49)
+        div_patience = max(0, getattr(self.config, "diverge_patience", 3))
+        div_factor = getattr(self.config, "diverge_factor", 1.5)
+        div_min_val = float("inf")
+        div_counter = 0
+        sndvar_max = 0.0
+        sndvar_warned = False
 
         ckpt_dir = self.logger.checkpoint_dir if self.logger else self.config.checkpoint_dir
         viz_dir = self.logger.visualizations_dir if self.logger else self.config.visualizations_dir
-        best_ckpt_path = os.path.join(ckpt_dir, "best_cross_condition_jepa.pt")
+        best_ckpt_path = os.path.join(ckpt_dir, "best_cross_condition_jepa.pt") if ckpt_dir else "best_cross_condition_jepa.pt"
 
         for epoch in range(self.start_epoch, total_epochs + 1):
             if hasattr(dataset, "set_epoch"):
@@ -444,11 +553,14 @@ class CrossConditionTrainer:
             # Formatted summary logging
             val_info = ""
             if "val_auc" in epoch_metrics:
+                _vl = epoch_metrics.get("val_loss", 0.0) or 0.0
+                _gap = _vl - epoch_metrics["pred_loss"] if _vl > 0 else 0.0
                 val_info = (
-                    f" | ValLoss: {epoch_metrics.get('val_loss', 0.0):.4f}"
+                    f" | ValLoss: {_vl:.4f}"
                     f" | Val AUC: {epoch_metrics['val_auc']:.4f}"
                     f" | SNR: {epoch_metrics['val_snr']:.2f}"
                     f" | SndVar: {epoch_metrics['val_sound_var']:.4f}"
+                    f" | Gap: {_gap:+.4f}"
                 )
 
             summary_msg = (
@@ -521,8 +633,11 @@ class CrossConditionTrainer:
                     "epoch": epoch,
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scaler_state_dict": self.scaler.state_dict(),
+                    "patience_counter": patience_counter,
                     "config": self.config,
                     "metrics": epoch_metrics,
+                    "history": self.history,
                 }, best_ckpt_path)
                 if epoch > warmup_epochs:
                     save_msg = f"  [*] New best model saved (Epoch {epoch:02d} | {improve_reason})"
@@ -555,6 +670,45 @@ class CrossConditionTrainer:
                             print(stop_msg, flush=True)
                         break
 
+            # Train/val-divergence guard: val recon far above its running best
+            # for div_patience consecutive evals -> stop. Catches shortcut /
+            # overfit runs (exp49) long before early-stopping patience runs
+            # out. Only active when val telemetry is present.
+            vl = epoch_metrics.get("val_loss", 0.0) or 0.0
+            if vl > 0 and div_patience > 0:
+                div_min_val, div_counter = _val_divergence_step(vl, div_min_val, div_counter, div_factor)
+                if div_counter >= div_patience:
+                    div_msg = (
+                        f"\n[Divergence Stop at Epoch {epoch:02d}] "
+                        f"Val recon {vl:.4f} exceeds {div_factor}x its running best "
+                        f"({div_min_val:.4f}) for {div_counter} consecutive evals while "
+                        f"train pred is {epoch_metrics['total_loss']:.4f}. "
+                        f"Representation is shortcutting/overfitting, not learning."
+                    )
+                    if self.logger:
+                        self.logger.info(div_msg)
+                    else:
+                        print(div_msg, flush=True)
+                    break
+
+            # Sound-variance collapse watch (warn once): SndVar falling below
+            # 10% of its running max while training continues = amplitude
+            # shrinkage toward a noise floor. Read R_eff only jointly with
+            # SndVar/SNR/AUC from here on.
+            sv = epoch_metrics.get("val_sound_var", 0.0) or 0.0
+            if sv > 0:
+                sndvar_max = max(sndvar_max, sv)
+            if (not sndvar_warned and sndvar_max > 0 and sv > 0
+                    and sv < 0.1 * sndvar_max and epoch > warmup_epochs):
+                sndvar_warned = True
+                col_msg = (f"  [WARN] Sound-metal variance collapsed "
+                           f"({sndvar_max:.4f} -> {sv:.4f}); R_eff={epoch_metrics.get('effective_rank', 0.0):.1f}D "
+                           f"with collapsed amplitude is a noise floor, not learned rank.")
+                if self.logger:
+                    self.logger.info(col_msg)
+                else:
+                    print(col_msg, flush=True)
+
             # Warmup Phase Transition: Reset best metrics and counter for post-warmup regime
             if epoch == warmup_epochs:
                 best_loss = float("inf")
@@ -576,6 +730,8 @@ class CrossConditionTrainer:
                 "epoch": epoch,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "scaler_state_dict": self.scaler.state_dict(),
+                "patience_counter": patience_counter,
                 "config": self.config,
                 "metrics": epoch_metrics,
                 "history": self.history,

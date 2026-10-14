@@ -48,6 +48,25 @@ class CrossConditionConfig:
     # EXP-49: Cross-condition invariance (L_inv) + cross-subspace lock (L_xcov)
     inv_weight: float = 0.0               # MSE(z_s(x_a), stopgrad(z_s(x_b))): drives condition drift OUT of z_s
     xcov_weight: float = 0.0              # ||XCov(z_c, z_s)||^2: locks the split, forces z_c to pick up the remainder
+    # P0-1 curriculum + geometry for L_inv / L_xcov:
+    # raw MSE rewards amplitude shrinkage (the exp49 collapse). Two guards:
+    # (a) schedule: weight stays 0 before *_start_epoch, then cosine-ramps to
+    #     full over *_ramp_epochs (0 = constant from start_epoch, legacy);
+    # (b) cosine geometry: 1 - cos(z_s(A), sg(z_s(B))) is scale-invariant, so
+    #     shrinking the representation no longer reduces the loss.
+    inv_start_epoch: int = 1              # first epoch where L_inv may be > 0
+    inv_ramp_epochs: int = 0              # cosine ramp length (0 = legacy constant)
+    xcov_start_epoch: int = 1
+    xcov_ramp_epochs: int = 0
+    inv_cosine: bool = False              # True: scale-invariant cosine L_inv
+    # Grounding job for z_c (exp48 left z_c with no direct objective, so the
+    # split was decorative): predict Condition-B token from pooled z_c.
+    zc_cond_weight: float = 0.0           # MSE(head(mean(z_c)), stopgrad(c_b))
+    # Divergence guard: stop when val recon rises far above its running best
+    # for `diverge_patience` consecutive evals (train/val divergence = shortcut
+    # or overfit, e.g. exp49 val 0.0275 -> 0.06 while train stayed flat).
+    diverge_patience: int = 3             # 0 disables the guard
+    diverge_factor: float = 1.5           # trigger when val > best * factor
     downstream_latent_type: str = "scattering"  # 'scattering' (z_s only, drift-free), 'full' ([z_c, z_s]), 'carrier' (z_c)
 
     # Loss weights

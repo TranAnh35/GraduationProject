@@ -30,8 +30,9 @@ class CScanFeatureExtractor:
         self.use_amp = use_amp
         self.model.eval()
 
-        self.topology = ConcentricStarTopology(star_radii=(1, 3, 7))
-        self.offsets = self.topology.offsets  # [25, 2] in grid units (-7..+7)
+        _star_radii = tuple(getattr(model.config, "star_radii", (1, 3, 7)))
+        self.topology = ConcentricStarTopology(star_radii=_star_radii)
+        self.offsets = self.topology.offsets  # [25, 2] in grid units
 
     @torch.inference_mode()
     def extract_full_cscan(self, cscan: np.ndarray, self_calibrate: bool = False) -> np.ndarray:
@@ -45,7 +46,7 @@ class CScanFeatureExtractor:
             latents: [270, 270, 2*D] float32 numpy array.
         """
         H, W, C = cscan.shape
-        pad = 7
+        pad = int(max(1, np.max(np.abs(self.offsets))))
         padded = np.pad(cscan, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
 
         # Meshgrid of all pixel centers

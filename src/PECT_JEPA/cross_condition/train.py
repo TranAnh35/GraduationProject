@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size per training step")
     parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions K per macro-cycle (K sub-epochs = 100%% full universe pass)")
     parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100%% all 72,900 pixels per scan)")
+    parser.add_argument("--star_radii", type=int, nargs=3, default=[1, 3, 7], help="Concentric star ring radii in px (default 1 3 7; e.g. 2 4 7 for harder masking)")
     parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (default None: 100%% exhaustive dataset traversal)")
     parser.add_argument("--lr", type=float, default=4e-4, help="Peak learning rate for Cosine schedule")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
@@ -47,6 +48,8 @@ def parse_args():
     parser.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["energy_adaptive", "dual_domain", "waveform_invariant"], help="Tokenizer type ('waveform_invariant', 'dual_domain', 'energy_adaptive')")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
     parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")
+    parser.add_argument("--diverge_patience", type=int, default=3, help="Stop when val recon exceeds factor*best for N consecutive evals (0 to disable)")
+    parser.add_argument("--diverge_factor", type=float, default=1.5, help="Val divergence trigger factor over running best")
     parser.add_argument("--early_stopping_metric", type=str, default="composite", choices=["composite", "val_auc", "latent_snr", "loss"], help="Metric to monitor for early stopping and best checkpoint")
     parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4, help="Minimum loss reduction delta for early stopping")
     parser.add_argument("--eval_val_every", type=int, default=1, help="Evaluate validation telemetry every N epochs")
@@ -58,6 +61,12 @@ def parse_args():
     parser.add_argument("--scattering_cov_weight", type=float, default=1.0, help="VICReg covariance weight on scattering subspace z_s")
     parser.add_argument("--inv_weight", type=float, default=0.0, help="EXP-49 cross-condition invariance MSE(z_s(A), stopgrad(z_s(B))) weight")
     parser.add_argument("--xcov_weight", type=float, default=0.0, help="EXP-49 cross-subspace decorrelation ||XCov(z_c,z_s)||^2 weight")
+    parser.add_argument("--inv_cosine", type=lambda v: v.lower() == "true", default=False, help="P0-1: scale-invariant cosine L_inv instead of raw MSE (kills shrink-to-zero shortcut)")
+    parser.add_argument("--inv_start_epoch", type=int, default=1, help="P0-1: first epoch where L_inv may be > 0 (e.g. 11 to skip warmup)")
+    parser.add_argument("--inv_ramp_epochs", type=int, default=0, help="P0-1: cosine ramp length for L_inv (0 = constant from start)")
+    parser.add_argument("--xcov_start_epoch", type=int, default=1, help="P0-1 schedule start for L_xcov")
+    parser.add_argument("--xcov_ramp_epochs", type=int, default=0, help="P0-1 cosine ramp length for L_xcov")
+    parser.add_argument("--zc_cond_weight", type=float, default=0.0, help="Grounding job for z_c: MSE(head(mean(z_c)), stopgrad(c_b))")
     parser.add_argument("--scan_centered_vicreg", type=lambda v: v.lower() == "true", default=True, help="Center representations per scan before computing VICReg")
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
@@ -95,11 +104,14 @@ def main():
         epochs=args.epochs,
         warmup_epochs=args.warmup_epochs,
         early_stopping_patience=args.early_stopping_patience,
+        diverge_patience=args.diverge_patience,
+        diverge_factor=args.diverge_factor,
         early_stopping_metric=args.early_stopping_metric,
         early_stopping_min_delta=args.early_stopping_min_delta,
         eval_val_every=args.eval_val_every,
         batch_size=args.batch_size,
         grid_stride=args.grid_stride,
+        star_radii=tuple(args.star_radii),
         num_partitions=args.num_partitions,
         samples_per_epoch=args.samples_per_epoch,
         lr=args.lr,
@@ -120,6 +132,12 @@ def main():
         scattering_cov_weight=args.scattering_cov_weight,
         inv_weight=args.inv_weight,
         xcov_weight=args.xcov_weight,
+        inv_cosine=args.inv_cosine,
+        inv_start_epoch=args.inv_start_epoch,
+        inv_ramp_epochs=args.inv_ramp_epochs,
+        xcov_start_epoch=args.xcov_start_epoch,
+        xcov_ramp_epochs=args.xcov_ramp_epochs,
+        zc_cond_weight=args.zc_cond_weight,
         scan_centered_vicreg=args.scan_centered_vicreg,
         var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,

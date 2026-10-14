@@ -99,6 +99,20 @@ class CrossConditionJEPA(nn.Module):
         # 5. Cross-Condition Predictor
         self.predictor = CrossConditionPredictor(config)
 
+        # 6. z_c grounding head: gives the carrier subspace an explicit job
+        # (predict Condition-B token from pooled z_c) so the [z_c, z_s]
+        # split is enforced by an objective instead of being decorative.
+        # Inactive unless latent_disentanglement and zc_cond_weight > 0.
+        if getattr(config, "latent_disentanglement", False):
+            _D_c = getattr(config, "carrier_dim", config.embed_dim // 2)
+            self.zc_cond_head = nn.Sequential(
+                nn.Linear(_D_c, _D_c),
+                nn.GELU(),
+                nn.Linear(_D_c, config.embed_dim),
+            )
+        else:
+            self.zc_cond_head = None
+
         # Concentric star partitioning:
         # Indices 0..8: Core 9 probes (center + 8 inner ring probes)
         # Indices 9..24: Outer 16 probes (outer rings)
@@ -134,6 +148,8 @@ class CrossConditionJEPA(nn.Module):
         x_b: torch.Tensor,
         ref_b: torch.Tensor,
         scan_id: Optional[torch.Tensor] = None,
+        inv_scale: float = 1.0,
+        xcov_scale: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass during self-supervised pretraining:
@@ -141,6 +157,8 @@ class CrossConditionJEPA(nn.Module):
         x_b:     [B, 5, 5, C] measurement patch from Condition B (same physical coordinate)
         ref_b:   [B, 5, 5, C] background sound-metal patch of Condition B
         scan_id: [B] scan pair identifier for within-scan centered regularization
+        inv_scale/xcov_scale: P0-1 curriculum multipliers in [0, 1] supplied by
+            the trainer from the epoch schedule (default 1.0 = legacy path).
         """
         B = x_a.shape[0]
         device = x_a.device
@@ -177,10 +195,11 @@ class CrossConditionJEPA(nn.Module):
         else:
             target_signal = H_tgt_b
 
-        # Expand scan_id across the 16 context tokens if provided: [B] -> [B * 16]
+        # Expand scan_id across the N_ctx context tokens if provided: [B] -> [B * N_ctx]
+        # (N_ctx is read from the tensor, not hardcoded: masking splits vary)
         scan_id_expanded = None
         if scan_id is not None and getattr(self.config, "scan_centered_vicreg", True):
-            scan_id_expanded = scan_id.unsqueeze(1).expand(-1, 16).reshape(-1)
+            scan_id_expanded = scan_id.unsqueeze(1).expand(-1, H_ctx_a.shape[1]).reshape(-1)
 
         # 6. Latent Disentanglement vs Standard Prediction
         if getattr(self.config, "latent_disentanglement", False):
@@ -222,17 +241,26 @@ class CrossConditionJEPA(nn.Module):
             # Penalizes any condition drift left inside z_s. Asymmetric by
             # design: gradient flows only into the A branch, the B branch is
             # a fixed per-step target (BYOL-style, no collapse).
+            # P0-1 guards (exp49 post-mortem): raw MSE rewards amplitude
+            # shrinkage and learns faster than the predictor path, hijacking
+            # training. eff_inv schedules the term in late; cosine geometry
+            # (inv_cosine) is scale-invariant, killing the shrink shortcut.
             inv_weight = getattr(self.config, "inv_weight", 0.0)
-            if inv_weight > 0:
+            eff_inv = inv_weight * inv_scale
+            if eff_inv > 0:
                 # z_s of condition B from the EMA target encoder over the SAME
-                # 16 outer context probes (context geometry matches H_ctx_a).
+                # context probes (context geometry matches H_ctx_a).
                 with torch.no_grad():
                     ctx_tokens_b = tokens_b[batch_arange, ctx_idx]  # [B, 16, D]
                     ctx_pos_b = pos_b[batch_arange, ctx_idx]
                     H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b)  # [B, 16, D]
-                H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, 16, D_s] fixed target
-                inv_loss = F.mse_loss(H_ctx_s, H_ctx_b_s)
+                H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, N_ctx, D_s] fixed target
+                if getattr(self.config, "inv_cosine", False):
+                    inv_loss = 1.0 - F.cosine_similarity(H_ctx_s, H_ctx_b_s, dim=-1).mean()
+                else:
+                    inv_loss = F.mse_loss(H_ctx_s, H_ctx_b_s)
             else:
+                # Skipped by schedule: avoid the extra EMA forward entirely.
                 inv_loss = torch.tensor(0.0, device=device)
 
             # E) EXP-49 L_xcov: Cross-subspace decorrelation lock.
@@ -242,7 +270,8 @@ class CrossConditionJEPA(nn.Module):
             # NOTE: this term alone cannot create the split (it is symmetric);
             # L_inv above creates the role asymmetry, L_xcov locks it in.
             xcov_weight = getattr(self.config, "xcov_weight", 0.0)
-            if xcov_weight > 0:
+            eff_xcov = xcov_weight * xcov_scale
+            if eff_xcov > 0:
                 flat_ctx_c = H_ctx_c.reshape(B * H_ctx_c.shape[1], -1)  # [N, D_c]
                 N = flat_ctx_c.shape[0]
                 zc_cent = flat_ctx_c - flat_ctx_c.mean(dim=0, keepdim=True)
@@ -252,12 +281,24 @@ class CrossConditionJEPA(nn.Module):
             else:
                 xcov_loss = torch.tensor(0.0, device=device)
 
+            # F) z_c grounding job: predict the Condition-B token from pooled
+            # z_c. Gives the carrier subspace an explicit condition-carrying
+            # role (target detached: gradient shapes z_c + head, never the
+            # condition path). Inactive when weight is 0 or c_b is disabled.
+            zc_cond_weight = getattr(self.config, "zc_cond_weight", 0.0)
+            if zc_cond_weight > 0 and self.zc_cond_head is not None and c_b is not None:
+                zc_pred = self.zc_cond_head(H_ctx_c.mean(dim=1))  # [B, D]
+                zc_cond_loss = F.mse_loss(zc_pred, c_b.squeeze(1).detach())
+            else:
+                zc_cond_loss = torch.tensor(0.0, device=device)
+
             total_loss = (
                 pred_loss
                 + carrier_loss
                 + vicreg_loss
-                + inv_weight * inv_loss
-                + xcov_weight * xcov_loss
+                + eff_inv * inv_loss
+                + eff_xcov * xcov_loss
+                + zc_cond_weight * zc_cond_loss
             )
         else:
             # Standard single-space prediction
@@ -282,6 +323,7 @@ class CrossConditionJEPA(nn.Module):
             total_loss = pred_loss + vicreg_loss
             inv_loss = torch.tensor(0.0, device=device)
             xcov_loss = torch.tensor(0.0, device=device)
+            zc_cond_loss = torch.tensor(0.0, device=device)
 
         return {
             "total_loss": total_loss,
@@ -291,6 +333,7 @@ class CrossConditionJEPA(nn.Module):
             "cov_loss": cov_loss,
             "inv_loss": inv_loss,
             "xcov_loss": xcov_loss,
+            "zc_cond_loss": zc_cond_loss,
             "H_ctx_a": H_ctx_a,
             "H_tgt_b": H_tgt_b,
             "H_pred_b": H_pred_b,
