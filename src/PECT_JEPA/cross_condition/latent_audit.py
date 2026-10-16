@@ -93,7 +93,10 @@ def extract_subspaces(model, cscan: np.ndarray, device, batch_size: int = 8192):
         b_r, b_c = rr_flat[s:e], cc_flat[s:e]
         patch = padded[b_r[:, None] + orr[None, :], b_c[:, None] + occ[None, :]]
         patch = patch.reshape(e - s, 5, 5, C)
-        x = torch.from_numpy(patch).pin_memory().to(device, non_blocking=True)
+        x_cpu = torch.from_numpy(patch)
+        if device.type == "cuda":
+            x_cpu = x_cpu.pin_memory()
+        x = x_cpu.to(device, non_blocking=(device.type == "cuda"))
         with torch.amp.autocast("cuda", enabled=use_amp and device.type == "cuda"):
             tokens, pos = model.tokenizer(x)
             h_all = model.context_encoder(tokens, pos)

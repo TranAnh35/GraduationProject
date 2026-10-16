@@ -88,9 +88,12 @@ class CScanFeatureExtractor:
             patch_25 = padded[r_coords, c_coords]  # [B, 25, C]
             patch_5x5 = patch_25.reshape(end_idx - start_idx, 5, 5, C)
 
-            # Pinned staging + async H2D: lets the copy overlap with the
-            # previous batch's GPU forward instead of blocking on pageable RAM.
-            x_tensor = torch.from_numpy(patch_5x5).pin_memory().to(self.device, non_blocking=True)
+            # Pinned staging + async H2D only when a CUDA accelerator exists;
+            # pin_memory() raises on CPU-only hosts (no accelerator driver).
+            x_cpu = torch.from_numpy(patch_5x5)
+            if self.device.type == "cuda":
+                x_cpu = x_cpu.pin_memory()
+            x_tensor = x_cpu.to(self.device, non_blocking=(self.device.type == "cuda"))
 
             with torch.amp.autocast("cuda", enabled=self.use_amp and self.device.type == "cuda"):
                 feats = self.model.extract_features(x_tensor)  # [B, 2*D]
