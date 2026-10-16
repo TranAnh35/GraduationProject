@@ -37,9 +37,10 @@ class CrossConditionConfig:
     contiguous_masking: bool = False      # Contiguous non-enclosing wedge masking (avoids context inside target and vice versa)
     predictor_scattering_only: bool = False  # If True, predictor reads only z_s (blocks carrier z_c shortcut)
     scan_centered_inv: bool = False       # If True, subtracts scan/batch mean before cosine L_inv (kills LN_bias needle bypass)
+    patch_energy_norm: bool = False       # If True (or tokenizer_type='patch_energy_adaptive'), normalizes temporal amplitude by shared 25-probe patch std (dim=(-2,-1)) instead of per-probe (dim=-1), preserving within-patch spatial contrast (fixes FM11)
     use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
     condition_modulation: str = "none"  # 'query_projection', 'cross_attention', 'adaln', 'additive', 'none'
-    tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'continuous_scale_invariant'
+    tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'patch_energy_adaptive', 'waveform_invariant'
     relative_target: bool = False  # If False, predicts full-field target H_tgt preserving natural target variance
 
     # Disentangled Dual-Subspace [z_c, z_s] (Carrier vs Scattering)

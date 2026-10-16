@@ -39,6 +39,7 @@
     {"id": "R-P2", "label": "P2 hardneg-mined (polarity mirror, not deployable)", "status": "REJECTED"},
     {"id": "R-MLPraw", "label": "Official MLP probe on raw features (sanity anchor)", "status": "EVALUATED"},
     {"id": "R-MLPp1u_s2", "label": "MLP on P1u_s2-whitened (combo test)", "status": "REJECTED"},
+    {"id": "R-P1u_trim_s2", "label": "Outlier-trimmed (keep_q=0.75 MAD energy) unsupervised bg whitening + shrinkage s2 (fixes high-defect Rivet contamination)", "status": "IMPLEMENTED"},
     {"id": "R-maha", "label": "Mahalanobis distance readout (0.6948 Test AUC on exp53, 0.6792 on TMR, 0.7817 on Chirp)", "status": "EVALUATED"}
   ],
   "run_overrides": {
@@ -80,11 +81,13 @@
     {"src": "FM12", "dst": "R-P1u_s2", "rel": "CAUSED_BY", "rationale": "Full 64x64 SVD whitening on within-scan rank 1.49-1.98D amplifies 62 noise eigenvectors and rotates coordinates on TMR.", "source": "src/PECT_JEPA/cross_condition/diagnose_readouts.py:125"},
     {"src": "FM2", "dst": "component:telemetry=train_scans", "rel": "CAUSED_BY", "rationale": "Old telemetry monitored 2 TRAIN scans; fixed to 4 canonical val scans with GT.", "source": "src/PECT_JEPA/cross_condition/train.py: canonical-val telemetry loader"},
     {"src": "component:head=inv_head_MLP", "dst": "FM6", "rel": "FIXES", "rationale": "Asymmetric route: encoder never directly pulled; rank collapse cured (not OOD).", "source": "runs/exp51_asyminv_20261015_013636"},
-    {"src": "component:mask=oracle_sound_mask", "dst": "FM1", "rel": "FIXES", "rationale": "Stage-0 hypothesis: align sound tokens only; improved exp54 over matched exp51 (+0.020 Test LP, 3x Val AP).", "source": "src/PECT_JEPA/cross_condition/data/paired_dataset.py: context_sound_mask"},
+    {"src": "component:mask=oracle_sound_mask", "dst": "FM1", "rel": "FIXES", "rationale": "Stage-0 hypothesis: align sound tokens only (now emitted as [B,25] in PairedPECTDataset so it works with both fixed and contiguous_masking).", "source": "src/PECT_JEPA/cross_condition/data/paired_dataset.py:257-269"},
     {"src": "component:pos=continuous_pos_mlp", "dst": "FM7", "rel": "FIXES", "rationale": "Option A continuous 2D coordinate MLP pos_mlp(dr, dc) + decoupled predictor target_pos_proj.", "source": "src/PECT_JEPA/cross_condition/models/tokenizer.py + predictor.py"},
     {"src": "component:mask=contiguous_wedge_16", "dst": "FM7", "rel": "FIXES", "rationale": "16 non-enclosing contiguous wedge masks ensure all 25 probes (incl. center 0 at 8/16 context, 8/16 target) are trained in ContextEncoder without context/target interleaving.", "source": "src/PECT_JEPA/cross_condition/data/topologies.py: get_contiguous_star_masks"},
     {"src": "component:loss=scan_centered_inv", "dst": "FM8", "rel": "FIXES", "rationale": "Batch-mean centering (dim 0,1) cancels the scan-independent LayerNorm bias inside cosine without needing offset/pool weights. Per-scan-conditioned offsets (FM3) survive; per-scan EMA version still open.", "source": "src/PECT_JEPA/cross_condition/models/cross_condition_jepa.py:317-322"},
     {"src": "component:pred=scattering_only", "dst": "FM12", "rel": "FIXES", "rationale": "Zeros out H_ctx_c before predictor so predictor cannot use carrier c_A as a cross-condition shortcut.", "source": "src/PECT_JEPA/cross_condition/models/cross_condition_jepa.py:246-250"},
+    {"src": "component:tokenizer=patch_energy_adaptive", "dst": "FM11", "rel": "FIXES", "rationale": "Shared 25-probe patch std normalization (dim=(-2,-1)) removes 56x cross-waveform/sensor voltage scale (diff=1.67e-6) while preserving within-patch probe-to-probe contrast (center/ring std ratio=3.11 vs 1.00 in per-probe norm).", "source": "src/PECT_JEPA/cross_condition/models/tokenizer.py:120-145"},
+    {"src": "R-P1u_trim_s2", "dst": "FM12", "rel": "FIXES", "rationale": "Unsupervised MAD-energy quantile trimming (keep_q=0.75) removes high-defect-ratio contamination (281x lower bg mean error at 25% defect ratio) without GT labels.", "source": "src/PECT_JEPA/cross_condition/diagnose_readouts.py:142-164"},
     {"src": "R-P1u_s2", "dst": "R-P0", "rel": "SUPERSEDES", "rationale": "Default readout on Hall: +50% AP, +0.01 AUC, 100% unsupervised calibration.", "source": "diagnose_readouts_v4/readout_diagnostics.csv"},
     {"src": "R-Otsu", "dst": "R-P0", "rel": "SUPERSEDES", "rationale": "Replaces fixed 0.5 threshold for IoU eval.", "source": "diagnose_readouts_v3/readout_diagnostics.csv"},
     {"src": "exp51_asyminv_20261015_013636", "dst": "INV1", "rel": "VIOLATES_INVARIANT", "rationale": "Blind cross-condition penalty corrupts the pretraining manifold instead of unsupervised self-calibration.", "source": "GEMINI.md s4 + exp51 OOD degradation"}
@@ -93,7 +96,7 @@
     {"id": "component:loss=blind_L_inv", "label": "Uncentered L_inv over all context tokens (MSE/cosine, direct encoder pull)"},
     {"id": "component:loss=scan_centered_inv", "label": "Batch-mean-centered cosine L_inv (scan_centered_inv flag; kills the GLOBAL LN_bias needle only, per-scan EMA offsets still open)"},
     {"id": "component:head=inv_head_MLP", "label": "inv_head MLP asymmetric predictor (inv_predictor flag)"},
-    {"id": "component:mask=oracle_sound_mask", "label": "Stage-0 oracle sound mask over 16 context probes (inv_oracle_mask)"},
+    {"id": "component:mask=oracle_sound_mask", "label": "Stage-0 oracle sound mask over all 25 probes [B,25] indexed via ctx_idx (inv_oracle_mask)"},
     {"id": "component:pos=discrete_fixed_mask", "label": "Discrete pos_embed[1,25,D] with fixed 0..8 target / 9..24 context mask"},
     {"id": "component:pos=continuous_pos_mlp", "label": "Option A continuous 2D coordinate MLP pos_mlp(dr,dc) + decoupled predictor target_pos_proj (continuous_pos_embed)"},
     {"id": "component:mask=contiguous_wedge_16", "label": "16 non-enclosing contiguous 9-target/16-context wedge masks (contiguous_masking)"},
@@ -102,6 +105,7 @@
     {"id": "component:telemetry=train_scans", "label": "Legacy telemetry on TRAIN scans / unsplit PairedPECTDataset"},
     {"id": "component:tokenizer=dual_domain", "label": "dual_domain tokenizer (021809/exp51 lineage)"},
     {"id": "component:tokenizer=waveform_invariant", "label": "waveform_invariant tokenizer (exp52)"},
-    {"id": "component:tokenizer=energy_adaptive", "label": "energy_adaptive tokenizer (exp53)"}
+    {"id": "component:tokenizer=energy_adaptive", "label": "energy_adaptive tokenizer (exp53 per-probe dim=-1 norm)"},
+    {"id": "component:tokenizer=patch_energy_adaptive", "label": "patch_energy_adaptive tokenizer (--patch_energy_norm true; shared 25-probe dim=(-2,-1) std norm preserving spatial contrast)"}
   ]
 }

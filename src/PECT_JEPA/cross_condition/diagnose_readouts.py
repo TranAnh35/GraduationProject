@@ -139,6 +139,30 @@ def unsup_bg_stats(flat_z: np.ndarray, valid_mask: np.ndarray, eps: float = 1e-4
     return whiten_stats(flat_z[valid_mask], eps=eps)
 
 
+def unsup_trimmed_bg_stats(
+    flat_z: np.ndarray,
+    valid_mask: np.ndarray,
+    eps: float = 1e-4,
+    keep_q: float = 0.75,
+) -> tuple:
+    """Unsupervised outlier-trimmed bg stats (zero GT labels, fixes high-defect contamination).
+
+    On Rivet_v1 (15% defect area) and Rivet_v2 (25.2% defect area), all-pixel
+    mean/cov is contaminated by defect/rivet responses. Ranks valid pixels by
+    unsupervised MAD-normalized energy distance from the coordinate-wise median
+    and keeps the lowest keep_q (default 75%) before computing (mu, W).
+    """
+    zv = flat_z[valid_mask].astype(np.float64)
+    med = np.median(zv, axis=0, keepdims=True)
+    mad = np.median(np.abs(zv - med), axis=0, keepdims=True) + 1e-6
+    d2 = np.mean(((zv - med) / mad) ** 2, axis=1)
+    cut = float(np.quantile(d2, keep_q))
+    keep = d2 <= cut
+    if int(np.sum(keep)) < max(64, zv.shape[1] * 2):
+        keep = np.ones(len(zv), dtype=bool)
+    return whiten_stats(zv[keep].astype(np.float32), eps=eps)
+
+
 def halo_ring(gt_mask: np.ndarray, radius: int = HALO_R) -> np.ndarray:
     """Boolean ring around defect boundaries (dilated minus original).
 
@@ -285,14 +309,16 @@ def main():
         return cached[fp].reshape(-1, cached[fp].shape[-1])[bgm]
     bg_stats_s2: Dict[str, tuple] = {
         fp: whiten_stats(_gt_bg_pixels(fp), eps=SHRINK_EPS) for fp in train_eval_files}
-    # (ii) fully-unsupervised bg (all valid pixels, no GT anywhere)
+    # (ii) fully-unsupervised bg (all valid pixels, no GT anywhere) + outlier-trimmed unsup bg
     bg_stats_uns: Dict[str, tuple] = {}
     bg_stats_uns_s2: Dict[str, tuple] = {}
+    bg_stats_uns_trim_s2: Dict[str, tuple] = {}
     for fp in train_eval_files:
         flat_all = cached[fp].reshape(-1, cached[fp].shape[-1]).astype(np.float32)
         valid_all = gt_of[fp].reshape(-1) >= 0
         bg_stats_uns[fp] = unsup_bg_stats(flat_all, valid_all)
         bg_stats_uns_s2[fp] = unsup_bg_stats(flat_all, valid_all, eps=SHRINK_EPS)
+        bg_stats_uns_trim_s2[fp] = unsup_trimmed_bg_stats(flat_all, valid_all, eps=SHRINK_EPS, keep_q=0.75)
 
     def _wblack(stats: Dict[str, tuple], fp: str, X: np.ndarray) -> np.ndarray:
         mu, W = stats[fp]
@@ -304,6 +330,8 @@ def main():
         [_wblack(bg_stats_uns, p["fp"], p["X"]) for p in pool_parts], axis=0), y_det)
     lr1u_s2 = fit_lr(np.concatenate(
         [_wblack(bg_stats_uns_s2, p["fp"], p["X"]) for p in pool_parts], axis=0), y_det)
+    lr1u_trim_s2 = fit_lr(np.concatenate(
+        [_wblack(bg_stats_uns_trim_s2, p["fp"], p["X"]) for p in pool_parts], axis=0), y_det)
 
     # (iii) halo-cleaned P0 refit: same scaler s0 (feature scaling fixed),
     # only the FITTING labels drop the halo ring around defect boundaries.
@@ -442,6 +470,7 @@ def main():
                 muW_uns = bg_stats_uns[fp]
                 muW_s2 = bg_stats_s2[fp]
                 muW_uns_s2 = bg_stats_uns_s2[fp]
+                muW_uns_trim_s2 = bg_stats_uns_trim_s2[fp]
             else:
                 assert nxt is not None and nxt[0] == fp
                 gt_mask = gt_masks[meta["specimen"]]["mask"]
@@ -457,6 +486,7 @@ def main():
                 muW_uns = unsup_bg_stats(flat_all_l, v0)
                 muW_s2 = whiten_stats(flat_all_l[bgm], eps=SHRINK_EPS)
                 muW_uns_s2 = unsup_bg_stats(flat_all_l, v0, eps=SHRINK_EPS)
+                muW_uns_trim_s2 = unsup_trimmed_bg_stats(flat_all_l, v0, eps=SHRINK_EPS, keep_q=0.75)
 
             flat = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
             y = gt_mask.reshape(-1).astype(np.int64)
@@ -493,6 +523,7 @@ def main():
             fw_s2 = _wapp(muW_s2, flat)[valid]
             fw_u = _wapp(muW_uns, flat)[valid]
             fw_u_s2 = _wapp(muW_uns_s2, flat)[valid]
+            fw_u_trim_s2 = _wapp(muW_uns_trim_s2, flat)[valid]
 
             def _aup(lr_, Xs_):
                 a = auc_of(lr_, Xs_, yv)
@@ -501,6 +532,7 @@ def main():
             auc_p1_s2, ap_p1_s2 = _aup(lr1_s2, fw_s2)
             auc_p1u, ap_p1u = _aup(lr1u, fw_u)
             auc_p1u_s2, ap_p1u_s2 = _aup(lr1u_s2, fw_u_s2)
+            auc_p1u_trim_s2, ap_p1u_trim_s2 = _aup(lr1u_trim_s2, fw_u_trim_s2)
             auc_p0h, ap_p0h = _aup(lr0h, feats_sv)
             auc_p2h, ap_p2h = _aup(lr2h, feats_sv)
             # v4: MLP combo scores
@@ -536,13 +568,14 @@ def main():
                 "auc_p1_s2": round(auc_p1_s2, 4), "ap_p1_s2": round(ap_p1_s2, 4),
                 "auc_p1u": round(auc_p1u, 4), "ap_p1u": round(ap_p1u, 4),
                 "auc_p1u_s2": round(auc_p1u_s2, 4), "ap_p1u_s2": round(ap_p1u_s2, 4),
+                "auc_p1u_trim_s2": round(auc_p1u_trim_s2, 4), "ap_p1u_trim_s2": round(ap_p1u_trim_s2, 4),
                 "auc_p0h": round(auc_p0h, 4), "ap_p0h": round(ap_p0h, 4),
                 "auc_p2h": round(auc_p2h, 4), "ap_p2h": round(ap_p2h, 4),
                 "auc_mlp_raw": round(auc_mlp_raw, 4), "ap_mlp_raw": round(ap_mlp_raw, 4),
                 "auc_mlp_p1": round(auc_mlp_p1, 4), "ap_mlp_p1": round(ap_mlp_p1, 4),
                 "auc_mlp_p1u_s2": round(auc_mlp_p1u_s2, 4), "ap_mlp_p1u_s2": round(ap_mlp_p1u_s2, 4),
                 "auc_p2": round(auc_p2, 4), "ap_p2": round(ap_p2, 4),
-                "auc_p3": round(auc_p3, 4), "ap_p3": round(ap_p3, 4),
+                "auc_p3": round(auc_p3, 4), "ap_p3": round(auc_p3, 4),
                 "iou_05": iou05["iou"], "iou_opt": iouopt["iou"],
                 "opt_thresh": iouopt["optimal_threshold"],
                 "iou_otsu": iou_otsu_d["iou"], "f1_otsu": iou_otsu_d["dice"],
@@ -578,6 +611,7 @@ def main():
               f"P1_s2={mean('auc_p1_s2',rs):.4f}/{mean('ap_p1_s2',rs):.4f} "
               f"P1u={mean('auc_p1u',rs):.4f}/{mean('ap_p1u',rs):.4f} "
               f"P1u_s2={mean('auc_p1u_s2',rs):.4f}/{mean('ap_p1u_s2',rs):.4f} "
+              f"P1u_trim_s2={mean('auc_p1u_trim_s2',rs):.4f}/{mean('ap_p1u_trim_s2',rs):.4f} "
               f"P0h={mean('auc_p0h',rs):.4f}/{mean('ap_p0h',rs):.4f} "
               f"P2h={mean('auc_p2h',rs):.4f}/{mean('ap_p2h',rs):.4f} "
               f"iouOtsu={mean('iou_otsu',rs):.4f}/f1Otsu={mean('f1_otsu',rs):.4f}", flush=True)

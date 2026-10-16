@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument("--relative_target", type=lambda v: v.lower() == "true", default=False, help="Predict relative flaw perturbation Delta H (default False: full target H_tgt)")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
     parser.add_argument("--condition_modulation", type=str, default="query_projection", choices=["query_projection", "cross_attention", "adaln", "additive", "none"], help="Modulation type for condition token c_b")
-    parser.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["energy_adaptive", "dual_domain", "waveform_invariant"], help="Tokenizer type ('waveform_invariant', 'dual_domain', 'energy_adaptive')")
+    parser.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["energy_adaptive", "patch_energy_adaptive", "dual_domain", "waveform_invariant"], help="Tokenizer type ('waveform_invariant', 'dual_domain', 'energy_adaptive', 'patch_energy_adaptive')")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
     parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")
     parser.add_argument("--diverge_patience", type=int, default=3, help="Stop when val recon exceeds factor*best for N consecutive evals (0 to disable)")
@@ -79,6 +79,7 @@ def parse_args():
     parser.add_argument("--contiguous_masking", type=lambda v: v.lower() == "true", default=False, help="Contiguous non-enclosing wedge masking (avoids context inside target and vice versa)")
     parser.add_argument("--predictor_scattering_only", type=lambda v: v.lower() == "true", default=False, help="Zero out H_ctx_c before predictor so predictor reads only z_s")
     parser.add_argument("--scan_centered_inv", type=lambda v: v.lower() == "true", default=False, help="Center z_s before cosine L_inv to eliminate LayerNorm DC bias needle")
+    parser.add_argument("--patch_energy_norm", type=lambda v: v.lower() == "true", default=False, help="Normalize temporal amplitude by shared 25-probe patch std (dim=(-2,-1)) instead of per-probe (dim=-1)")
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
@@ -136,6 +137,7 @@ def main():
         contiguous_masking=args.contiguous_masking,
         predictor_scattering_only=args.predictor_scattering_only,
         scan_centered_inv=args.scan_centered_inv,
+        patch_energy_norm=args.patch_energy_norm,
         relative_target=args.relative_target,
         use_condition_token=args.use_condition_token,
         condition_modulation=args.condition_modulation,
@@ -227,6 +229,7 @@ def main():
         grid_stride=config.grid_stride,
         samples_per_epoch=config.samples_per_epoch,
         num_partitions=config.num_partitions,
+        star_radii=config.star_radii,
         transform_csv=config.transform_csv,
         include_sound_mask=args.inv_oracle_mask,
     )

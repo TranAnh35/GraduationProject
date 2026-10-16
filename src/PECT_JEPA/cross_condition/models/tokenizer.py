@@ -38,12 +38,15 @@ class DualDomainTokenizer(nn.Module):
         self.embed_dim = config.embed_dim
         self.num_harmonics = min(config.num_harmonics, config.temporal_samples // 2)
         self.tokenizer_type = getattr(config, "tokenizer_type", "energy_adaptive")
+        self.patch_energy_norm = bool(getattr(config, "patch_energy_norm", False)) or (
+            self.tokenizer_type == "patch_energy_adaptive"
+        )
 
         self.time_dim = config.embed_dim // 2
         self.freq_dim = config.embed_dim - self.time_dim
 
         # 1. Time branch projection
-        if self.tokenizer_type == "energy_adaptive":
+        if self.tokenizer_type in ("energy_adaptive", "patch_energy_adaptive"):
             # x_norm [C] + peak_time [1] + V_pp [1] + energy [1] = C + 3
             self.time_proj = nn.Linear(self.temporal_samples + 3, self.time_dim)
         elif self.tokenizer_type == "waveform_invariant":
@@ -53,7 +56,7 @@ class DualDomainTokenizer(nn.Module):
             self.time_proj = nn.Linear(self.temporal_samples, self.time_dim)
 
         # 2. Spectral branch projection
-        if self.tokenizer_type == "energy_adaptive":
+        if self.tokenizer_type in ("energy_adaptive", "patch_energy_adaptive"):
             # phase [K] + log-mag [K] + phase_gated [K] + centroid [1] + spread [1] = 3*K + 2
             spectral_input_dim = self.num_harmonics * 3 + 2
         elif self.tokenizer_type == "waveform_invariant":
@@ -117,24 +120,40 @@ class DualDomainTokenizer(nn.Module):
 
         x_flat = x.reshape(B, self.num_tokens, C)
 
-        if self.tokenizer_type == "energy_adaptive":
-            # --- 1. Time domain branch with instance normalization & transient physical anchors ---
+        if self.tokenizer_type in ("energy_adaptive", "patch_energy_adaptive"):
+            # --- 1. Time domain branch with instance/patch normalization & transient physical anchors ---
             mean_t = x_flat.mean(dim=-1, keepdim=True)
-            std_t = x_flat.std(dim=-1, keepdim=True) + 1e-6
-            x_norm = (x_flat - mean_t) / std_t
+            if self.patch_energy_norm:
+                # Patch-level (25-probe) shared temporal std normalization (dim=(-2, -1)):
+                # Removes the 56x cross-waveform / cross-sensor global voltage scale while
+                # strictly preserving within-patch spatial amplitude contrast ||x_center||/||x_ring||
+                # across all 25 probes (resolving FM11 on Rivet_v2 and Defect Sizing R2).
+                x_zero = x_flat - mean_t
+                std_patch = x_zero.std(dim=(-2, -1), keepdim=True) + 1e-6  # [B, 1, 1]
+                x_norm = x_zero / std_patch
 
-            # Transient physical anchors (waveform-agnostic)
-            t_peak = torch.argmax(torch.abs(x_norm), dim=-1, keepdim=True).float() / float(C)
-            v_max = x_flat.max(dim=-1, keepdim=True).values
-            v_min = x_flat.min(dim=-1, keepdim=True).values
-            v_pp = torch.log1p(torch.clamp(v_max - v_min, min=0.0))
-            energy_t = torch.log1p(torch.mean(x_flat ** 2, dim=-1, keepdim=True))
+                t_peak = torch.argmax(torch.abs(x_norm), dim=-1, keepdim=True).float() / float(C)
+                v_max = x_norm.max(dim=-1, keepdim=True).values
+                v_min = x_norm.min(dim=-1, keepdim=True).values
+                v_pp = torch.log1p(torch.clamp(v_max - v_min, min=0.0))
+                energy_t = torch.log1p(torch.mean(x_norm ** 2, dim=-1, keepdim=True))
+                x_fp32 = x_norm.float()
+            else:
+                std_t = x_flat.std(dim=-1, keepdim=True) + 1e-6
+                x_norm = (x_flat - mean_t) / std_t
+
+                # Transient physical anchors (waveform-agnostic)
+                t_peak = torch.argmax(torch.abs(x_norm), dim=-1, keepdim=True).float() / float(C)
+                v_max = x_flat.max(dim=-1, keepdim=True).values
+                v_min = x_flat.min(dim=-1, keepdim=True).values
+                v_pp = torch.log1p(torch.clamp(v_max - v_min, min=0.0))
+                energy_t = torch.log1p(torch.mean(x_flat ** 2, dim=-1, keepdim=True))
+                x_fp32 = x_flat.float()
 
             time_feat = torch.cat([x_norm, t_peak, v_pp, energy_t], dim=-1)
             z_time = self.time_proj(time_feat)  # [B, 25, time_dim]
 
             # --- 2. Spectral domain branch with energy-weighted Dodd-Deeds gating ---
-            x_fp32 = x_flat.float()
             x_fft = torch.fft.rfft(x_fp32, dim=-1)  # [B, 25, C//2 + 1] complex
             x_harmonics = x_fft[..., 1:self.num_harmonics + 1]  # Exclude DC offset bin 0
 

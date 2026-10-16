@@ -254,15 +254,18 @@ class PairedPECTDataset(Dataset):
             "scan_id": torch.tensor(pair_idx, dtype=torch.long),
         }
 
-        # Stage-0 oracle: sound mask over the 16 context probes, resolved
-        # from the A-scan's specimen GT at the patch's context coordinates.
+        # Stage-0 oracle: sound mask over all 25 star probes (0..24), resolved
+        # from the A-scan's specimen GT at the patch's probe coordinates.
+        # Emitting [25] allows CrossConditionJEPA.forward to index via ctx_idx
+        # for both legacy fixed masking (ctx_idx = 9..24) and contiguous_masking.
         # Missing GT -> all-True (blind inv for that sample, never a crash).
         if self.include_sound_mask:
             _gt = self.gt_by_specimen.get(scan_a["meta"]["specimen"])
+            n_probes = len(self.offsets)
             if _gt is not None:
-                _m = context_sound_mask(_gt, int(r), int(c), self.offsets)
+                _m = context_sound_mask(_gt, int(r), int(c), self.offsets, n_context=n_probes)
             else:
-                _m = np.ones(16, dtype=bool)
+                _m = np.ones(n_probes, dtype=bool)
             sample["sound_mask"] = torch.from_numpy(_m)
 
         return sample
