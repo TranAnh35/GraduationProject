@@ -145,6 +145,22 @@ class CrossConditionJEPA(nn.Module):
         self.register_buffer("target_idx_bank", torch.from_numpy(tgt_bank_np).long(), persistent=False)
         self.register_buffer("context_idx_bank", torch.from_numpy(ctx_bank_np).long(), persistent=False)
 
+        # Guard: oracle sound masks from PairedPECTDataset are [B, 16] vectors
+        # aligned to the LEGACY fixed context (probes 9..24). With
+        # contiguous_masking the per-sample context varies, so a [B, 16] mask
+        # would silently align to the wrong tokens. Forbid the combination
+        # until the dataset emits [B, 25] masks (the forward [B, 25] branch
+        # already selects via ctx_idx and would then be correct).
+        if bool(getattr(config, "inv_oracle_mask", False)) and bool(
+            getattr(config, "contiguous_masking", False)
+        ):
+            raise ValueError(
+                "inv_oracle_mask=True requires legacy fixed masking "
+                "(probes 9..24); it is incompatible with contiguous_masking=True "
+                "because dataset sound_mask [B, 16] no longer aligns to ctx_idx. "
+                "Extend the dataset to emit [B, 25] masks to enable this combo."
+            )
+
     def _init_target_encoder(self):
         """Initialize Target Encoder weights identical to Context Encoder."""
         for p_tgt, p_ctx in zip(self.target_encoder.encoder.parameters(), self.context_encoder.parameters()):
