@@ -4,7 +4,7 @@ Numbers are parsed ONLY from files under experiments/cross_condition/runs/:
   config.json, git_info.json, metrics_epoch.csv,
   evaluation_results/master_benchmark_summary.json,
   evaluation_results/master_benchmark_metrics.csv,
-  diagnose_readouts_v{4,3,}/readout_diagnostics.csv (v4 preferred),
+  diagnose_readouts_v{5,4,3,}/readout_diagnostics.csv (v5 preferred; adds P1u_trim_s2),
   evaluation_results/diagnose_readouts/readout_diagnostics.csv (legacy v2).
 
 Causal layer (hypotheses, failures, invariants, verdicts, edges) is loaded
@@ -127,6 +127,7 @@ def parse_suite_metrics(run_dir):
 
 
 READOUT_CANDIDATES = [
+    ("diagnose_readouts_v5", "v5"),
     ("diagnose_readouts_v4", "v4"),
     ("diagnose_readouts_v3", "v3"),
     ("evaluation_results/diagnose_readouts", "v2"),
@@ -158,7 +159,7 @@ def parse_readout_metrics(run_dir):
             m = mean([fnum(r.get(c)) for r in grp])
             if m is not None:
                 recs.append((f"readout:{version}:{split}:{c}", c, m, split, "all", version))
-    key_cols = [c for c in ("auc_raw", "auc_p1u_s2", "auc_mlp_p1u_s2", "auc_p2",
+    key_cols = [c for c in ("auc_raw", "auc_p1u_s2", "auc_p1u_trim_s2", "auc_mlp_p1u_s2", "auc_p2",
                             "auc_p3", "maha_auc") if c in (rows[0].keys() or [])]
     for sensor in sorted({r.get("sensor", "?") for r in rows if r.get("split") == "test"}):
         for c in key_cols:

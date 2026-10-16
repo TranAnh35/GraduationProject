@@ -69,7 +69,8 @@ def q2(cur):
             a = json.loads(attrs)
             ver = mid.split(":")[3] if mid.startswith("metric:") else "?"
             flag = {"auc_oracle": "(oracle-UB, needs GT)", "auc_p1_s2": "(needs GT bg)",
-                    "auc_p1u_s2": "<DEPLOYABLE>", "auc_mlp_p1u_s2": "(supervised probe)",
+                    "auc_p1u_s2": "<DEPLOYABLE>", "auc_p1u_trim_s2": "<DEPLOYABLE, trimmed bg>",
+                    "auc_mlp_p1u_s2": "(supervised probe)",
                     "auc_mlp_raw": "(supervised probe)"}.get(a['metric'], "")
             print(f"    {ver:>3s} {a['metric']:16s} {a['value']:.4f} {flag}")
 
