@@ -1,0 +1,81 @@
+{
+  "_comment": "Human-curated causal layer. Every edge needs rationale+source. Metric numbers are NOT stored here (parsed from files by build.py); ACCEPTED_BECAUSE edges cite the metric id that build.py creates. JSON format = YAML-compatible subset, stdlib-only parsing.",
+  "hypotheses": [
+    {"id": "H1", "label": "Blind invariance (L_inv all tokens) improves OOD transfer", "status": "REJECTED"},
+    {"id": "H2", "label": "Asymmetric inv (inv_head MLP, BYOL-style) fixes rank collapse AND OOD", "status": "PARTIAL"},
+    {"id": "H3", "label": "Waveform-invariant tokenizer front-end fixes OOD", "status": "REJECTED"},
+    {"id": "H4", "label": "Unsupervised calibration readout (P1u_s2 + Otsu) is the deployable default", "status": "ACCEPTED"},
+    {"id": "H5", "label": "Nonlinear probe (MLP) on calibrated features unlocks transfer", "status": "REJECTED"},
+    {"id": "H6", "label": "Selective inv on sound-metal tokens only (oracle mask Stage 0) preserves class signal", "status": "REJECTED"},
+    {"id": "H7", "label": "Energy-adaptive tokenizer front-end fixes OOD", "status": "ACCEPTED_CAVEAT"}
+  ],
+  "failures": [
+    {"id": "FM1", "label": "Blind-inv washout: aligning defect-coupled tokens across conditions destroys class signal (over-invariance)"},
+    {"id": "FM2", "label": "Train-scan telemetry optimism: pre-fix telemetry measured TRAIN scans, not the 4 canonical val files"},
+    {"id": "FM3", "label": "Probe sign/direction rotates per condition: supervised directions that work on Hall fail on TMR"},
+    {"id": "FM4", "label": "P2 is a polarity mirror (1-P0 on hard files), not a learned TMR defect direction"},
+    {"id": "FM5", "label": "Mahalanobis readout is constant 0.667+-0.003 across 4 runs: uninformative for model selection"},
+    {"id": "FM6", "label": "L_inv amplitude-shrinkage hijack: direct inv collapses defect norm (10->1.4D rank) unless delayed/weakened"}
+  ],
+  "invariants": [
+    {"id": "INV1", "label": "Hardware offsets via unsupervised spatial self-calibration; no cross-sensor penalties (GEMINI.md s4)"},
+    {"id": "INV2", "label": "Pure SSL: no waveform/sensor metadata injection (GEMINI.md s3)"},
+    {"id": "INV3", "label": "Check-before-proposing: consult registry/graph before new directions (GEMINI.md s2)"},
+    {"id": "INV4", "label": "Causal chain required: Code/Math -> Optimization -> Latent geometry -> Downstream (GEMINI.md s5)"},
+    {"id": "INV5", "label": "Zero metric recycling: claims about a checkpoint need that checkpoint's own measurements (GEMINI.md s5)"}
+  ],
+  "readouts": [
+    {"id": "R-P0", "label": "P0 LR on raw scattering (legacy baseline)", "status": "BASELINE"},
+    {"id": "R-P1u_s2", "label": "P1u_s2 LR: unsupervised bg stats + shrinkage s2 (deploy default)", "status": "ADOPTED"},
+    {"id": "R-Otsu", "label": "Otsu threshold replacing fixed 0.5 for IoU", "status": "ADOPTED"},
+    {"id": "R-P3", "label": "P3 supervised (best on exp51 only, not transferable)", "status": "EVALUATED"},
+    {"id": "R-P2", "label": "P2 hardneg-mined (polarity mirror, not deployable)", "status": "REJECTED"},
+    {"id": "R-MLPraw", "label": "Official MLP probe on raw features (sanity anchor)", "status": "EVALUATED"},
+    {"id": "R-MLPp1u_s2", "label": "MLP on P1u_s2-whitened (combo test)", "status": "REJECTED"},
+    {"id": "R-maha", "label": "Mahalanobis unsupervised (constant, uninformative)", "status": "REJECTED"}
+  ],
+  "run_overrides": {
+    "exp49_inv_xcov_20261014_021809": {"status": "LINEAGE_REFERENCE", "telemetry": "legacy-train-scans", "verdict": "Delayed-inv curriculum (inv ep11+ramp20, w=0.5); best ckpt effectively pre-inv. Best OOD 0.554/0.037 (P0) and 0.556/0.055 (P1u_s2). Bar for all inv runs."},
+    "exp49_inv_xcov_20261014_135025": {"status": "DIVERGED", "telemetry": "legacy-train-scans", "verdict": "Diverged inv run (0.827 train optimism, test 0.554 P0-equivalent 0.661 maha). Evidence for FM6."},
+    "exp51_asyminv_20261015_013636": {"status": "EVALUATED_OOD_FAIL", "telemetry": "legacy-train-scans", "verdict": "Engineering win (rank 8-8.7 held, val 0.88, zero guard trips) but OOD fail: all 9 OOD cells degraded vs 021809. Kills H1, halves H2."},
+    "exp52_waveforminv_tokenizer_20261015_130043": {"status": "EVALUATED_FRONTEND_FAIL", "telemetry": "legacy-train-scans", "verdict": "Easy alignment (inv->0.0004) but rank 11->31D noise dims, honest val 0.625 vs telemetry 0.935 (FM2 exhibit), test 0.477. Kills H3."},
+    "exp53_energyadaptive_tokenizer_20261015_160953": {"status": "EVALUATED_BEST_OOD", "telemetry": "canonical-val", "verdict": "Best overall OOD to date: test LP 0.5630/0.0379 (P0), P1u_s2 0.5669/0.0423, MLPraw 0.5732. Driven by TMR rescue (suiteLP 0.486->0.554, P1u_s2 0.387->0.521) while conceding Hall (Air 0.594->0.558, Pot 0.611->0.581). Caveat: confounded (tokenizer + dropped offset/pool-var guards); whitening HURTS TMR here (P1 0.428 < P0 0.554)."},
+    "exp54_selective_oracle_20261015_223926": {"status": "EVALUATED_STAGE0_FAIL", "telemetry": "canonical-val", "verdict": "Stage-0 oracle FAILS the >=0.55 bar: test LP 0.4929/0.0247 (P0), P1u_s2 0.4948; best probe P3 0.5301 still below bar. Rank healthy (7.3D) but pred_loss rose 1.07->1.77 and masked inv stuck at 0.69. Washout is deeper than the mask."}
+  },
+  "edges": [
+    {"src": "exp49_inv_xcov_20261014_021809", "dst": "H1", "rel": "TESTS", "rationale": "No-inv control arm of the inv dose-response series (6 runs: weaker/later inv only delays rank collapse 10->1.4D).", "source": "session scoreboard + runs/exp49_inv_xcov_20261014_021809"},
+    {"src": "exp51_asyminv_20261015_013636", "dst": "H1", "rel": "TESTS", "rationale": "100ep asymmetric inv: rank held yet every OOD cell below 021809.", "source": "runs/exp51_asyminv_20261015_013636"},
+    {"src": "exp51_asyminv_20261015_013636", "dst": "H2", "rel": "TESTS", "rationale": "inv_head MLP BYOL-style; rank fix yes, OOD fix no.", "source": "runs/exp51_asyminv_20261015_013636"},
+    {"src": "exp52_waveforminv_tokenizer_20261015_130043", "dst": "H3", "rel": "TESTS", "rationale": "waveform_invariant tokenizer arm, 34ep.", "source": "runs/exp52_waveforminv_tokenizer_20261015_130043"},
+    {"src": "exp54_selective_oracle_20261015_223926", "dst": "H6", "rel": "TESTS", "rationale": "Oracle GT sound-mask inv, upper-bound ablation (supervised leak by construction).", "source": "src/PECT_JEPA/cross_condition/models/cross_condition_jepa.py: inv_oracle_mask branch"},
+    {"src": "exp53_energyadaptive_tokenizer_20261015_160953", "dst": "H7", "rel": "TESTS", "rationale": "Single-variable mirror of 021809 with energy_adaptive tokenizer.", "source": "runs/exp53_energyadaptive_tokenizer_20261015_160953/config.json"},
+    {"src": "H1", "dst": "FM1", "rel": "REJECTED_BECAUSE", "rationale": "Dose-response over 4 direct-inv runs + exp51: weaker/later inv only delays collapse, never prevents; exp51 degrades all 9 OOD cells.", "source": "session scoreboard (train/val/test LP AUC table)"},
+    {"src": "H3", "dst": "FM1", "rel": "REJECTED_BECAUSE", "rationale": "inv loss ->0.0004 (trivially aligned) while honest val 0.625 / test 0.477: alignment without class signal.", "source": "runs/exp52_waveforminv_tokenizer_20261015_130043"},
+    {"src": "H5", "dst": "FM3", "rel": "REJECTED_BECAUSE", "rationale": "MLPp1u_s2 0.544 < LR-P1u_s2 0.556 on 021809; TMR dead (0.41-0.43) for LR and MLP alike: wrong direction, not missing capacity.", "source": "diagnose_readouts_v4/readout_diagnostics.csv (both runs)"},
+    {"src": "H2", "dst": "FM6", "rel": "ACCEPTED_BECAUSE", "rationale": "Partial: asym-inv holds rank 8-8.7 and val 0.88 with zero guard trips (fixes collapse), but not OOD.", "source": "runs/exp51_asyminv_20261015_013636/metrics_epoch.csv"},
+    {"src": "H4", "dst": "FM2", "rel": "ACCEPTED_BECAUSE", "rationale": "P1u_s2 reproduces supervised P1_s2 without GT (021809: 0.556/0.055); Otsu recovers ~60% of oracle IoU headroom.", "source": "diagnose_readouts_v3/v4 readout_diagnostics.csv"},
+    {"src": "H7", "dst": "FM3", "rel": "ACCEPTED_BECAUSE", "rationale": "Caveat accept: exp53 test LP 0.5630 > 021809 0.5543, driven by TMR rescue (suiteLP 0.486->0.554; P1u_s2 0.387->0.521) at the cost of Hall Air/Pot (0.594->0.558, 0.611->0.581). Confounded by dropped offset/pool-var guards: needs clean single-variable ablation.", "source": "runs/exp53_energyadaptive_tokenizer_20261015_160953/evaluation_results + diagnose_readouts_v4"},
+    {"src": "H6", "dst": "FM1", "rel": "REJECTED_BECAUSE", "rationale": "Stage-0 oracle misses the >=0.55 bar: test LP 0.4929 (P0), P1u_s2 0.4948, best probe P3 0.5301. Pred_loss rose 1.07->1.77 while masked inv stuck at 0.69: washout is deeper than the sound/defect mask split.", "source": "runs/exp54_selective_oracle_20261015_223926/evaluation_results + metrics_epoch.csv"},
+    {"src": "R-MLPraw", "dst": "FM3", "rel": "REJECTED_BECAUSE", "rationale": "Best single probe on exp53 (MLPraw 0.5732 > LR-P1u_s2 0.5669 same ckpt) but TMR stays weak (MLPraw 0.551, MLPp1u_s2 0.466): probe capacity helps only once feature direction is right; it cannot rescue wrong-direction features. Consistent with H5.", "source": "runs/exp53_energyadaptive_tokenizer_20261015_160953/diagnose_readouts_v4"},
+    {"src": "R-P2", "dst": "FM4", "rel": "REJECTED_BECAUSE", "rationale": "corr(P0,P2)=-0.77 exp51 / -0.38 021809: P2 inverts P0, accidentally right on TMR (0.58) where P0 is already wrong (0.38).", "source": "diagnose_readouts_v4/readout_diagnostics.csv"},
+    {"src": "R-maha", "dst": "FM5", "rel": "REJECTED_BECAUSE", "rationale": "Test maha 0.667+-0.003 across 4 runs: no selection power.", "source": "master_benchmark_summary.json (4 runs)"},
+    {"src": "R-MLPp1u_s2", "dst": "FM3", "rel": "REJECTED_BECAUSE", "rationale": "Same as H5: nonlinear probe cannot rescue wrong per-condition direction.", "source": "diagnose_readouts_v4/readout_diagnostics.csv"},
+    {"src": "FM1", "dst": "component:loss=blind_L_inv", "rel": "CAUSED_BY", "rationale": "L_inv over all 16 context tokens incl. defect-coupled pixels.", "source": "src/PECT_JEPA/cross_condition/models/cross_condition_jepa.py"},
+    {"src": "FM6", "dst": "component:loss=blind_L_inv", "rel": "CAUSED_BY", "rationale": "Direct encoder pull shrinks defect norm; exp49-old post-mortem.", "source": "session exp49-old post-mortem"},
+    {"src": "FM2", "dst": "component:telemetry=train_scans", "rel": "CAUSED_BY", "rationale": "Old telemetry monitored 2 TRAIN scans; fixed to 4 canonical val scans with GT.", "source": "src/PECT_JEPA/cross_condition/train.py: canonical-val telemetry loader"},
+    {"src": "component:head=inv_head_MLP", "dst": "FM6", "rel": "FIXES", "rationale": "Asymmetric route: encoder never directly pulled; rank collapse cured (not OOD).", "source": "runs/exp51_asyminv_20261015_013636"},
+    {"src": "component:mask=oracle_sound_mask", "dst": "FM1", "rel": "FIXES", "rationale": "Stage-0 hypothesis: align sound tokens only; verdict pending exp54.", "source": "src/PECT_JEPA/cross_condition/data/paired_dataset.py: context_sound_mask"},
+    {"src": "R-P1u_s2", "dst": "R-P0", "rel": "SUPERSEDES", "rationale": "Default readout going forward: +50% AP, +0.01 AUC, 100% unsupervised calibration.", "source": "diagnose_readouts_v4/readout_diagnostics.csv"},
+    {"src": "R-Otsu", "dst": "R-P0", "rel": "SUPERSEDES", "rationale": "Replaces fixed 0.5 threshold for IoU eval.", "source": "diagnose_readouts_v3/readout_diagnostics.csv"},
+    {"src": "exp51_asyminv_20261015_013636", "dst": "INV1", "rel": "VIOLATES_INVARIANT", "rationale": "Blind cross-condition penalty corrupts the pretraining manifold instead of unsupervised self-calibration.", "source": "GEMINI.md s4 + exp51 OOD degradation"}
+  ],
+  "components": [
+    {"id": "component:loss=blind_L_inv", "label": "L_inv over all context tokens (MSE/cosine, direct encoder pull)"},
+    {"id": "component:head=inv_head_MLP", "label": "inv_head MLP asymmetric predictor (inv_predictor flag)"},
+    {"id": "component:mask=oracle_sound_mask", "label": "Stage-0 oracle sound mask over 16 context probes (inv_oracle_mask)"},
+    {"id": "component:telemetry=train_scans", "label": "Legacy telemetry on TRAIN scans (pre-fix)"},
+    {"id": "component:tokenizer=dual_domain", "label": "dual_domain tokenizer (021809/exp51 lineage)"},
+    {"id": "component:tokenizer=waveform_invariant", "label": "waveform_invariant tokenizer (exp52)"},
+    {"id": "component:tokenizer=energy_adaptive", "label": "energy_adaptive tokenizer (exp53)"}
+  ]
+}

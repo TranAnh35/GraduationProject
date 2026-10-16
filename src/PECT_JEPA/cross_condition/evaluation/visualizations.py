@@ -13,6 +13,7 @@ Provides publication-quality plots:
 
 import os
 import time
+import hashlib
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import matplotlib
@@ -40,6 +41,25 @@ def to_safe_path(path: str) -> str:
     return abs_path
 
 
+def _shorten_long_path(path: str, limit: int = 240) -> str:
+    """Deterministically shortens over-long plot paths (Windows MAX_PATH).
+
+    Eval plot names embed full TDMS basenames (~100 chars) under run dirs,
+    reaching ~300 chars: makedirs/savefig then fail with ENOENT (observed in
+    exp50-case2 eval: metrics fine, all long plots skipped). Shortens only
+    the file STEM (keeps directory + extension + readable tail suffix which
+    encodes the plot type), appending an 8-hex hash of the full stem so
+    names stay unique within a directory. Pure function, safe to unit-test.
+    """
+    if len(path) < limit:
+        return path
+    parent = os.path.dirname(path)
+    stem, ext = os.path.splitext(os.path.basename(path))
+    digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:8]
+    tail = stem[-48:] if len(stem) > 48 else stem
+    return os.path.join(parent, f"{tail}_h{digest}{ext}")
+
+
 def _safe_savefig(fig, save_path: str, **kwargs) -> None:
     """Saves a matplotlib figure robustly on Windows.
 
@@ -48,7 +68,7 @@ def _safe_savefig(fig, save_path: str, **kwargs) -> None:
     long runs) never crashes training. Falls back to a timestamped sibling
     file if the target path stays unwritable.
     """
-    save_path = to_safe_path(save_path)
+    save_path = _shorten_long_path(to_safe_path(save_path))
     parent = os.path.dirname(save_path)
     if parent:
         os.makedirs(parent, exist_ok=True)

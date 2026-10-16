@@ -113,6 +113,22 @@ class CrossConditionJEPA(nn.Module):
         else:
             self.zc_cond_head = None
 
+        # 7. Asymmetric-inv predictor head (BYOL-style): absorbs the
+        # cross-condition alignment work so the z_s encoder itself is never
+        # directly pulled toward the target branch. Created ONLY when both
+        # disentanglement and inv_predictor are on: legacy configs get no new
+        # parameters, so old checkpoints keep loading with strict=True.
+        if getattr(config, "latent_disentanglement", False) and getattr(config, "inv_predictor", False):
+            _D_s = getattr(config, "scattering_dim", config.embed_dim - getattr(config, "carrier_dim", config.embed_dim // 2))
+            _H = max(2 * _D_s, 64)
+            self.inv_head = nn.Sequential(
+                nn.Linear(_D_s, _H),
+                nn.GELU(),
+                nn.Linear(_H, _D_s),
+            )
+        else:
+            self.inv_head = None
+
         # Concentric star partitioning:
         # Indices 0..8: Core 9 probes (center + 8 inner ring probes)
         # Indices 9..24: Outer 16 probes (outer rings)
@@ -150,6 +166,7 @@ class CrossConditionJEPA(nn.Module):
         scan_id: Optional[torch.Tensor] = None,
         inv_scale: float = 1.0,
         xcov_scale: float = 1.0,
+        inv_sound_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass during self-supervised pretraining:
@@ -235,16 +252,36 @@ class CrossConditionJEPA(nn.Module):
                 scan_id=scan_id_expanded,
             )
 
+            # C2) Fix 4: var-hinge on the POOLED scattering vector itself
+            # ([center, mean-rest] = the actual downstream readout quantity).
+            # Token-level VICReg above does not protect the pooled features,
+            # where needle collapse still happens. scan_id used per-patch
+            # (NOT token-expanded): correct grouping at this granularity.
+            pool_var_weight = getattr(self.config, "pool_var_weight", 0.0)
+            if pool_var_weight > 0:
+                H_pool_s = torch.cat([H_ctx_s[:, 0, :], H_ctx_s[:, 1:, :].mean(dim=1)], dim=-1)  # [B, 2*D_s]
+                pool_var_loss, _, _ = compute_vicreg_loss(
+                    H_pool_s,
+                    var_weight=1.0,
+                    cov_weight=0.0,
+                    gamma=self.config.var_gamma,
+                    scan_id=scan_id,
+                )
+            else:
+                pool_var_loss = torch.tensor(0.0, device=device)
+
             # D) EXP-49 L_inv: Cross-condition invariance on z_s.
             # Same physical coordinate seen under condition A (context encoder,
             # grad ON) vs condition B (target encoder, stop-grad/EMA target).
-            # Penalizes any condition drift left inside z_s. Asymmetric by
-            # design: gradient flows only into the A branch, the B branch is
-            # a fixed per-step target (BYOL-style, no collapse).
-            # P0-1 guards (exp49 post-mortem): raw MSE rewards amplitude
-            # shrinkage and learns faster than the predictor path, hijacking
-            # training. eff_inv schedules the term in late; cosine geometry
-            # (inv_cosine) is scale-invariant, killing the shrink shortcut.
+            # Penalizes any condition drift left inside z_s.
+            # Geometry (legacy direct pull): loss(z_s(A), stopgrad(z_s(B))).
+            # This is BYOL-minus-predictor: the EMA target tracks A while A
+            # aligns to B, so both spiral into a shared low-D subspace (rank
+            # 10 -> 1.4 in all 4 inv runs despite cov x4 / inv /4 / ramp x2).
+            # Asymmetric path (inv_predictor): loss(P(z_s(A)),
+            # stopgrad(z_s(B))). The head P does the alignment work; gradient
+            # still reaches the A-encoder through P, but P absorbs the
+            # collapse pressure instead of the encoder directions themselves.
             inv_weight = getattr(self.config, "inv_weight", 0.0)
             eff_inv = inv_weight * inv_scale
             if eff_inv > 0:
@@ -255,13 +292,40 @@ class CrossConditionJEPA(nn.Module):
                     ctx_pos_b = pos_b[batch_arange, ctx_idx]
                     H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b)  # [B, 16, D]
                 H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, N_ctx, D_s] fixed target
-                if getattr(self.config, "inv_cosine", False):
-                    inv_loss = 1.0 - F.cosine_similarity(H_ctx_s, H_ctx_b_s, dim=-1).mean()
+                H_inv_online = self.inv_head(H_ctx_s) if self.inv_head is not None else H_ctx_s
+                # Stage-0 selective inv (oracle mask): align SOUND tokens only.
+                # Defect pixels couple to conditions differently per sensor, so
+                # blind alignment washes class signal (over-invariance: all 9
+                # OOD cells degraded in exp51). Masked mean over sound tokens;
+                # falls back to full mean when <5% tokens qualify (never NaN).
+                # inv_sound_frac is logged for viability monitoring.
+                use_oracle = bool(getattr(self.config, "inv_oracle_mask", False))
+                snd_frac = torch.tensor(1.0, device=device)
+                if use_oracle and inv_sound_mask is not None:
+                    m = inv_sound_mask.reshape(-1).to(dtype=torch.bool)
+                    frac = m.float().mean()
+                    snd_frac = frac.detach()
+                    if m.sum() >= max(1, int(0.05 * m.numel())):
+                        zo = H_inv_online.reshape(-1, H_inv_online.shape[-1])[m]
+                        zt = H_ctx_b_s.reshape(-1, H_ctx_b_s.shape[-1])[m]
+                        if getattr(self.config, "inv_cosine", False):
+                            inv_loss = 1.0 - F.cosine_similarity(zo, zt, dim=-1).mean()
+                        else:
+                            inv_loss = F.mse_loss(zo, zt)
+                    else:
+                        if getattr(self.config, "inv_cosine", False):
+                            inv_loss = 1.0 - F.cosine_similarity(H_inv_online, H_ctx_b_s, dim=-1).mean()
+                        else:
+                            inv_loss = F.mse_loss(H_inv_online, H_ctx_b_s)
+                elif getattr(self.config, "inv_cosine", False):
+                    inv_loss = 1.0 - F.cosine_similarity(H_inv_online, H_ctx_b_s, dim=-1).mean()
                 else:
-                    inv_loss = F.mse_loss(H_ctx_s, H_ctx_b_s)
+                    inv_loss = F.mse_loss(H_inv_online, H_ctx_b_s)
+                inv_sound_frac = snd_frac
             else:
                 # Skipped by schedule: avoid the extra EMA forward entirely.
                 inv_loss = torch.tensor(0.0, device=device)
+                inv_sound_frac = torch.tensor(1.0, device=device)
 
             # E) EXP-49 L_xcov: Cross-subspace decorrelation lock.
             # ||XCov(z_c, z_s)||^2 over the N = B*16 context tokens.
@@ -292,6 +356,21 @@ class CrossConditionJEPA(nn.Module):
             else:
                 zc_cond_loss = torch.tensor(0.0, device=device)
 
+            # G) Fix 1: kill the shared DC offset (needle geometry). The offset
+            # is in the null space of every other term (cancels in branch
+            # differences; VICReg/xcov center first), so it random-walks via
+            # LN gain/bias and makes all cosine reasoning vacuous. Penalize
+            # GLOBAL batch-token mean-square per subspace: per-scan condition
+            # bias in z_c is legitimate and survives, only the shared giant
+            # bias is removed.
+            offset_weight = getattr(self.config, "offset_weight", 0.0)
+            if offset_weight > 0:
+                m_c = H_ctx_c.reshape(-1, H_ctx_c.shape[-1]).mean(dim=0)
+                m_s = H_ctx_s.reshape(-1, H_ctx_s.shape[-1]).mean(dim=0)
+                offset_loss = (m_c.pow(2).mean() + m_s.pow(2).mean())
+            else:
+                offset_loss = torch.tensor(0.0, device=device)
+
             total_loss = (
                 pred_loss
                 + carrier_loss
@@ -299,6 +378,8 @@ class CrossConditionJEPA(nn.Module):
                 + eff_inv * inv_loss
                 + eff_xcov * xcov_loss
                 + zc_cond_weight * zc_cond_loss
+                + offset_weight * offset_loss
+                + pool_var_weight * pool_var_loss
             )
         else:
             # Standard single-space prediction
@@ -322,8 +403,25 @@ class CrossConditionJEPA(nn.Module):
             carrier_loss = torch.tensor(0.0, device=device)
             total_loss = pred_loss + vicreg_loss
             inv_loss = torch.tensor(0.0, device=device)
+            inv_sound_frac = torch.tensor(1.0, device=device)
             xcov_loss = torch.tensor(0.0, device=device)
             zc_cond_loss = torch.tensor(0.0, device=device)
+            offset_loss = torch.tensor(0.0, device=device)
+
+            # Fix 4 (standard branch): pooled hinge on the readout quantity.
+            pool_var_weight = getattr(self.config, "pool_var_weight", 0.0)
+            if pool_var_weight > 0:
+                H_pool = torch.cat([H_ctx_a[:, 0, :], H_ctx_a[:, 1:, :].mean(dim=1)], dim=-1)
+                pool_var_loss, _, _ = compute_vicreg_loss(
+                    H_pool,
+                    var_weight=1.0,
+                    cov_weight=0.0,
+                    gamma=self.config.var_gamma,
+                    scan_id=scan_id,
+                )
+                total_loss = total_loss + pool_var_weight * pool_var_loss
+            else:
+                pool_var_loss = torch.tensor(0.0, device=device)
 
         return {
             "total_loss": total_loss,
@@ -332,8 +430,11 @@ class CrossConditionJEPA(nn.Module):
             "var_loss": var_loss,
             "cov_loss": cov_loss,
             "inv_loss": inv_loss,
+            "inv_sound_frac": inv_sound_frac,
             "xcov_loss": xcov_loss,
             "zc_cond_loss": zc_cond_loss,
+            "offset_loss": offset_loss,
+            "pool_var_loss": pool_var_loss,
             "H_ctx_a": H_ctx_a,
             "H_tgt_b": H_tgt_b,
             "H_pred_b": H_pred_b,

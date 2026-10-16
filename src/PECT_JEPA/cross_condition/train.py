@@ -14,6 +14,7 @@ Features:
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import argparse
+import glob
 from datetime import datetime
 import numpy as np
 import torch
@@ -21,6 +22,7 @@ import torch
 from .configs.config import CrossConditionConfig
 from .data.paired_dataset import PairedPECTDataset
 from .data.preprocessing import load_canonical_cscan_from_tdms
+from .data.split import extract_file_metadata, get_canonical_train_val_test_splits
 from .training.trainer import CrossConditionTrainer
 from .utils.logger import CrossConditionLogger
 
@@ -52,21 +54,26 @@ def parse_args():
     parser.add_argument("--diverge_factor", type=float, default=1.5, help="Val divergence trigger factor over running best")
     parser.add_argument("--early_stopping_metric", type=str, default="composite", choices=["composite", "val_auc", "latent_snr", "loss"], help="Metric to monitor for early stopping and best checkpoint")
     parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4, help="Minimum loss reduction delta for early stopping")
+    parser.add_argument("--best_reff_floor_ratio", type=float, default=0.5, help="Only save best when R_eff >= ratio * max-R_eff-so-far (0 to disable)")
     parser.add_argument("--eval_val_every", type=int, default=1, help="Evaluate validation telemetry every N epochs")
     parser.add_argument("--latent_disentanglement", type=lambda v: v.lower() == "true", default=False, help="Split latent space into [z_c, z_s] (Carrier vs Scattering)")
     parser.add_argument("--carrier_dim", type=int, default=32, help="Dimension of carrier subspace z_c")
     parser.add_argument("--scattering_dim", type=int, default=32, help="Dimension of scattering subspace z_s")
     parser.add_argument("--carrier_flat_weight", type=float, default=1.0, help="Spatial flatness penalty weight on carrier subspace z_c")
     parser.add_argument("--scattering_var_weight", type=float, default=1.0, help="VICReg variance weight on scattering subspace z_s")
-    parser.add_argument("--scattering_cov_weight", type=float, default=1.0, help="VICReg covariance weight on scattering subspace z_s")
+    parser.add_argument("--scattering_cov_weight", type=float, default=0.2, help="VICReg covariance weight on scattering subspace z_s (0.2 holds rank vs inv 0.5; run 161630 collapsed at 0.05)")
     parser.add_argument("--inv_weight", type=float, default=0.0, help="EXP-49 cross-condition invariance MSE(z_s(A), stopgrad(z_s(B))) weight")
     parser.add_argument("--xcov_weight", type=float, default=0.0, help="EXP-49 cross-subspace decorrelation ||XCov(z_c,z_s)||^2 weight")
     parser.add_argument("--inv_cosine", type=lambda v: v.lower() == "true", default=False, help="P0-1: scale-invariant cosine L_inv instead of raw MSE (kills shrink-to-zero shortcut)")
+    parser.add_argument("--inv_predictor", type=lambda v: v.lower() == "true", default=False, help="Asymmetric inv: route L_inv via inv_head MLP (BYOL-style, encoder never directly pulled)")
+    parser.add_argument("--inv_oracle_mask", type=lambda v: v.lower() == "true", default=False, help="Stage-0 selective inv: L_inv over GT sound tokens only (supervised diagnostic, not deployable)")
     parser.add_argument("--inv_start_epoch", type=int, default=1, help="P0-1: first epoch where L_inv may be > 0 (e.g. 11 to skip warmup)")
     parser.add_argument("--inv_ramp_epochs", type=int, default=0, help="P0-1: cosine ramp length for L_inv (0 = constant from start)")
     parser.add_argument("--xcov_start_epoch", type=int, default=1, help="P0-1 schedule start for L_xcov")
     parser.add_argument("--xcov_ramp_epochs", type=int, default=0, help="P0-1 cosine ramp length for L_xcov")
     parser.add_argument("--zc_cond_weight", type=float, default=0.0, help="Grounding job for z_c: MSE(head(mean(z_c)), stopgrad(c_b))")
+    parser.add_argument("--offset_weight", type=float, default=0.0, help="Fix 1: kill shared DC offset, (||mean(zc)||^2+||mean(zs)||^2)/D (try 1e-4)")
+    parser.add_argument("--pool_var_weight", type=float, default=0.0, help="Fix 4: var-hinge on pooled readout vector (try 0.5)")
     parser.add_argument("--scan_centered_vicreg", type=lambda v: v.lower() == "true", default=True, help="Center representations per scan before computing VICReg")
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
@@ -108,6 +115,7 @@ def main():
         diverge_factor=args.diverge_factor,
         early_stopping_metric=args.early_stopping_metric,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        best_reff_floor_ratio=args.best_reff_floor_ratio,
         eval_val_every=args.eval_val_every,
         batch_size=args.batch_size,
         grid_stride=args.grid_stride,
@@ -133,11 +141,15 @@ def main():
         inv_weight=args.inv_weight,
         xcov_weight=args.xcov_weight,
         inv_cosine=args.inv_cosine,
+        inv_predictor=args.inv_predictor,
+        inv_oracle_mask=args.inv_oracle_mask,
         inv_start_epoch=args.inv_start_epoch,
         inv_ramp_epochs=args.inv_ramp_epochs,
         xcov_start_epoch=args.xcov_start_epoch,
         xcov_ramp_epochs=args.xcov_ramp_epochs,
         zc_cond_weight=args.zc_cond_weight,
+        offset_weight=args.offset_weight,
+        pool_var_weight=args.pool_var_weight,
         scan_centered_vicreg=args.scan_centered_vicreg,
         var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,
@@ -162,22 +174,42 @@ def main():
     logger.info(f"Initialized Unified Experiment Directory: {run_dir}")
     logger.info(f"Configuration: {config}")
 
-    # Pre-load canonical validation scans for real-time downstream health telemetry
+    # Pre-load canonical validation scans for real-time downstream health telemetry.
+    # CRITICAL: these must be HELD-OUT canonical val-split scans (the same 4
+    # files the downstream benchmark evaluates), NEVER train files. A previous
+    # version hardcoded 2 TRAIN scans here, inflating every run's "val AUC"
+    # (exp52: telemetry 0.935 vs honest downstream val 0.625) and biasing
+    # early stopping, best-saving, the divergence guard, and the R_eff floor
+    # toward train optimism. Telemetry now matches downstream val exactly.
     val_scans = []
-    val_candidates = [
-        ("data/Hall_Pot_Core/Corrosion/Gauss/corosion_frontside_gaussian_300x300_1khz_amp3.88_z1_20260106_200028.tdms", "data/ground_truth/corrosion/corrosion_gt_mask.npy", "Corrosion_Gauss_z1"),
-        ("data/Hall_Pot_Core/Rivet_v1/Gauss/rivet_frontside_gaussian_300x300_1khz_z1_20260111_015456.tdms", "data/ground_truth/rivet_v1/rivet_v1_gt_mask.npy", "Rivet_v1_Gauss_z1"),
-    ]
-    for tdms_p, gt_p, sname in val_candidates:
-        if os.path.exists(tdms_p) and os.path.exists(gt_p):
-            logger.info(f"Loading Validation Reference Scan: {sname} ({tdms_p})...")
-            cscan = load_canonical_cscan_from_tdms(file_path=tdms_p, apply_transforms=True)
-            gt_mask = np.load(gt_p)
-            val_scans.append({
-                "cscan": cscan,
-                "gt_mask": gt_mask,
-                "name": sname,
-            })
+    _gt_rel = {
+        "Corrosion": os.path.join("ground_truth", "corrosion", "corrosion_gt_mask.npy"),
+        "Rivet_v1": os.path.join("ground_truth", "rivet_v1", "rivet_v1_gt_mask.npy"),
+        "Rivet_v2": os.path.join("ground_truth", "rivet_v2", "rivet_v2_gt_mask.npy"),
+    }
+    _gt_masks = {}
+    for _spec, _rel in _gt_rel.items():
+        _p = os.path.join(args.data_dir, _rel)
+        if os.path.exists(_p):
+            _gt_masks[_spec] = np.load(_p)
+    _all_tdms = sorted(glob.glob(os.path.join(args.data_dir, "**", "*.tdms"), recursive=True))
+    _all_tdms = [f for f in _all_tdms if not f.endswith("_index.tdms") and "checkpoint" not in f]
+    _splits = get_canonical_train_val_test_splits(_all_tdms, val_files_count=4, seed=42)
+    for tdms_p in _splits["val"]:
+        _spec = extract_file_metadata(tdms_p)["specimen"]
+        if _spec not in _gt_masks:
+            logger.info(f"Skipping telemetry scan (no GT mask for specimen {_spec}): {tdms_p}")
+            continue
+        logger.info(f"Loading Validation Reference Scan: {os.path.basename(tdms_p)}...")
+        cscan = load_canonical_cscan_from_tdms(file_path=tdms_p, apply_transforms=True)
+        val_scans.append({
+            "cscan": cscan,
+            "gt_mask": _gt_masks[_spec],
+            "name": os.path.basename(tdms_p),
+        })
+    if len(val_scans) < len(_splits["val"]):
+        logger.info(f"[WARN] Only {len(val_scans)}/{len(_splits['val'])} telemetry scans loaded; "
+                    f"early-stopping/divergence guards run on a reduced val set.")
     logger.info(f"Loaded {len(val_scans)} Validation Reference Scans for Real-time Downstream Telemetry.")
 
     # Build Paired Dataset across all directed pairs
@@ -188,6 +220,7 @@ def main():
         samples_per_epoch=config.samples_per_epoch,
         num_partitions=config.num_partitions,
         transform_csv=config.transform_csv,
+        include_sound_mask=args.inv_oracle_mask,
     )
 
     # Initialize Trainer with logger and validation reference scans

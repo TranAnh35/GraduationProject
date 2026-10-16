@@ -59,9 +59,36 @@ class CrossConditionConfig:
     xcov_start_epoch: int = 1
     xcov_ramp_epochs: int = 0
     inv_cosine: bool = False              # True: scale-invariant cosine L_inv
+    # Asymmetric inv (BYOL-style): current L_inv pulls encoder(A) output
+    # directly toward encoder(B) output. Without a predictor in between this
+    # is BYOL-minus-predictor, a known-collapsing configuration: the EMA
+    # target tracks A, A aligns to B, both spiral into a shared low-D
+    # subspace (rank 10 -> 1.4 in every inv run). With this flag, alignment
+    # work moves into a predictor head P: loss(P(z_s(A)), stopgrad(z_s(B)));
+    # gradient still reaches the A-encoder but P absorbs the collapse
+    # pressure, letting the encoder keep diverse directions.
+    inv_predictor: bool = False           # True: route L_inv via inv_head MLP
+    # Stage-0 selective inv (ORACLE mask, diagnostic only): compute L_inv
+    # over sound-metal tokens only (GT-derived mask via sound_mask batch
+    # key). Tests whether blind alignment washes defect-coupled signal
+    # (exp51: all 9 OOD cells degraded). Supervised leak by construction:
+    # upper-bound ablation, NEVER the deployable recipe (Stage 1 replaces
+    # the oracle with an unsupervised sound estimator).
+    inv_oracle_mask: bool = False         # True: masked inv + inv_sound_frac log
     # Grounding job for z_c (exp48 left z_c with no direct objective, so the
     # split was decorative): predict Condition-B token from pooled z_c.
     zc_cond_weight: float = 0.0           # MSE(head(mean(z_c)), stopgrad(c_b))
+    # Fix 1 (needle geometry): the DC offset lives in the null space of every
+    # loss (shared by both JEPA branches so it cancels in differences;
+    # VICReg/xcov center before measuring). Penalize batch-token mean-square
+    # per subspace so direction (cosine) becomes meaningful again. Global mean
+    # (not per-scan): per-scan condition bias in z_c is legitimate signal and
+    # survives, only the shared giant bias is killed.
+    offset_weight: float = 0.0            # (||mean(z_c)||^2 + ||mean(z_s)||^2)/D
+    # Fix 4 (right granularity): VICReg guards token-level variance but the
+    # readout uses POOLED features ([center, mean-rest]), where collapse still
+    # happens. Var-hinge on the pooled scattering vector itself.
+    pool_var_weight: float = 0.0          # hinge(std(pooled) >= var_gamma)
     # Divergence guard: stop when val recon rises far above its running best
     # for `diverge_patience` consecutive evals (train/val divergence = shortcut
     # or overfit, e.g. exp49 val 0.0275 -> 0.06 while train stayed flat).
@@ -87,6 +114,11 @@ class CrossConditionConfig:
     early_stopping_patience: int = 15  # Early stopping patience in epochs post-warmup (0 to disable)
     early_stopping_metric: str = "composite"  # 'composite' (AUC + SNR + Loss), 'val_auc', 'latent_snr', 'loss'
     early_stopping_min_delta: float = 1e-4
+    # R_eff floor for best-saving (run 161630: rank collapsed 13 -> 1.2 under
+    # L_inv while val AUC kept rising; composite kept saving degenerate
+    # weights). Only save best when R_eff >= ratio * max-R_eff-so-far
+    # (post-warmup). Rank-degenerate metric gains don't count. 0 disables.
+    best_reff_floor_ratio: float = 0.5
     eval_val_every: int = 1     # Evaluate validation metrics every N epochs
     lr: float = 4e-4
     min_lr: float = 1e-5

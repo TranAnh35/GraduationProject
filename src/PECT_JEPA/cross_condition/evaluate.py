@@ -182,6 +182,24 @@ def resolve_paths(args) -> Tuple[str, str]:
     raise ValueError("Must provide either --exp_dir or --checkpoint")
 
 
+def scan_feature_energy(latents: np.ndarray) -> float:
+    """Mean ||z||^2 over pixels: latent-regime fingerprint of a scan.
+
+    Fix 5 (audit finding): in-domain vs OOD scans live in different energy
+    regimes (scattering E ~6500 vs ~2200; carrier ~11 vs ~95). A scan whose
+    regime mismatches training is expected to break fixed readouts.
+    """
+    return float(np.mean(np.sum(latents.astype(np.float64) ** 2, axis=-1)))
+
+
+def regime_flag(energy: float, ref_median: float, band: float = 2.0) -> int:
+    """1 when energy lies outside [ref/band, ref*band]: different latent
+    regime than the training pool -> flag as OOD-regime (expect failure)."""
+    if not ref_median or ref_median <= 0 or not energy or energy <= 0:
+        return 0
+    return int(energy < ref_median / band or energy > ref_median * band)
+
+
 def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int = 2, lookahead: int = 2):
     """Yields (file_path, canonical_cscan) in order, decoding up to `lookahead`
     TDMS files concurrently on background threads while the caller processes
@@ -288,6 +306,7 @@ def main():
     cached_train_latents: Dict[str, np.ndarray] = {}
     train_det_x, train_det_y = [], []
     train_size_x, train_size_y = [], []
+    train_energies: List[float] = []  # Fix 5: regime reference from train pool
 
     # Metadata-only pre-filter (no IO): identical survivor set/order as the
     # old in-loop `continue`, so RNG draws and fitted readouts are unchanged.
@@ -305,6 +324,7 @@ def main():
         gt_mask = gt_masks[sp]["mask"]
         latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
         cached_train_latents[fp] = latents
+        train_energies.append(scan_feature_energy(latents))
 
         flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
         flat_y = gt_mask.reshape(-1).astype(np.int64)
@@ -336,6 +356,8 @@ def main():
     print(f"  - Defect Detection samples: {len(y_train_det)} (Defects: {np.sum(y_train_det == 1)}, Sound: {np.sum(y_train_det == 0)})")
     if y_train_size is not None:
         print(f"  - Flaw Sizing samples:      {len(y_train_size)} defect pixels")
+    ref_energy = float(np.median(train_energies)) if train_energies else 0.0
+    print(f"  - Latent regime reference (median scan E||z||^2): {ref_energy:.1f}", flush=True)
 
     print(f"  Fitting global Logistic Regression & Ridge Regressors...", flush=True)
     global_readouts = suite.fit_global_readouts(
@@ -390,6 +412,11 @@ def main():
                 latents = extractor.extract_full_cscan(next_loaded[1], self_calibrate=args.self_calibration)
                 next_loaded = next(load_stream, None)
 
+            # Fix 5: latent-regime OOD flag (energy vs train-pool reference)
+            E_feat = scan_feature_energy(latents)
+            E_ratio = (E_feat / ref_energy) if ref_energy > 0 else 1.0
+            is_ood_regime = regime_flag(E_feat, ref_energy)
+
             # TASK 1: Anomaly Detection
             # A) Supervised Trained Linear Probe
             det_res = suite.evaluate_global_detection(readouts=global_readouts, features=latents, labels=gt_mask)
@@ -443,6 +470,9 @@ def main():
                 "sizing_r2": sizing_res["r2_score"],
                 "sizing_mae_mm": sizing_res["mae_mm"],
                 "sizing_rmse_mm": sizing_res["rmse_mm"],
+                "feat_energy": round(E_feat, 1),
+                "energy_ratio": round(E_ratio, 3),
+                "regime_ood": is_ood_regime,
             }
             master_results.append(row)
 
@@ -667,6 +697,10 @@ def main():
     print("-" * 75)
     ov = master_summary["overall"]
     print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} ± {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")
+    for sp in args.eval_splits:
+        n_flag = sum(1 for r in master_results if r["split"] == sp and r.get("regime_ood", 0) == 1)
+        n_sp = sum(1 for r in master_results if r["split"] == sp)
+        print(f"[REGIME] {sp.upper():5s}: {n_flag}/{n_sp} files flagged OOD-regime (E||z||^2 outside 2x train median {ref_energy:.1f})")
     print(f"\nAll results saved to: {out_dir}")
     print("=" * 75 + "\n", flush=True)
 
