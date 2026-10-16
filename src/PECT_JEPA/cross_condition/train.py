@@ -75,6 +75,10 @@ def parse_args():
     parser.add_argument("--offset_weight", type=float, default=0.0, help="Fix 1: kill shared DC offset, (||mean(zc)||^2+||mean(zs)||^2)/D (try 1e-4)")
     parser.add_argument("--pool_var_weight", type=float, default=0.0, help="Fix 4: var-hinge on pooled readout vector (try 0.5)")
     parser.add_argument("--scan_centered_vicreg", type=lambda v: v.lower() == "true", default=True, help="Center representations per scan before computing VICReg")
+    parser.add_argument("--continuous_pos_embed", type=lambda v: v.lower() == "true", default=False, help="Option A: continuous 2D coordinate MLP pos_mlp(dr, dc) instead of discrete pos_embed table")
+    parser.add_argument("--contiguous_masking", type=lambda v: v.lower() == "true", default=False, help="Contiguous non-enclosing wedge masking (avoids context inside target and vice versa)")
+    parser.add_argument("--predictor_scattering_only", type=lambda v: v.lower() == "true", default=False, help="Zero out H_ctx_c before predictor so predictor reads only z_s")
+    parser.add_argument("--scan_centered_inv", type=lambda v: v.lower() == "true", default=False, help="Center z_s before cosine L_inv to eliminate LayerNorm DC bias needle")
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
@@ -128,6 +132,10 @@ def main():
         embed_dim=args.embed_dim,
         var_weight=args.var_weight,
         cov_weight=args.cov_weight,
+        continuous_pos_embed=args.continuous_pos_embed,
+        contiguous_masking=args.contiguous_masking,
+        predictor_scattering_only=args.predictor_scattering_only,
+        scan_centered_inv=args.scan_centered_inv,
         relative_target=args.relative_target,
         use_condition_token=args.use_condition_token,
         condition_modulation=args.condition_modulation,

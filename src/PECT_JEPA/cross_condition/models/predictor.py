@@ -126,6 +126,16 @@ class CrossConditionPredictor(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
+        # When Option A continuous_pos_embed is active, decouple predictor mask_token
+        # query projection from tokenizer.pos_mlp so encoder coordinate embeddings
+        # are trained purely by ContextEncoder without mask_token gradient pollution.
+        if getattr(config, "continuous_pos_embed", False):
+            self.target_pos_proj = nn.Linear(config.embed_dim, config.embed_dim)
+            nn.init.eye_(self.target_pos_proj.weight)
+            nn.init.zeros_(self.target_pos_proj.bias)
+        else:
+            self.target_pos_proj = None
+
         # Condition projection layer for query conditioning (only when condition token is active)
         if getattr(config, "use_condition_token", False) and self.modulation == "query_projection":
             self.cond_query_proj = nn.Sequential(
@@ -155,7 +165,8 @@ class CrossConditionPredictor(nn.Module):
         condition_token: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N_tgt, D = target_pos.shape
-        queries = self.mask_token.expand(B, N_tgt, -1) + target_pos
+        tgt_pos_q = self.target_pos_proj(target_pos.detach()) if self.target_pos_proj is not None else target_pos
+        queries = self.mask_token.expand(B, N_tgt, -1) + tgt_pos_q
 
         H_context_kv = H_context
         cond_for_block = None

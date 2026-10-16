@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..configs.config import CrossConditionConfig
+from ..data.topologies import get_contiguous_star_masks
 from .tokenizer import DualDomainTokenizer
 from .context_encoder import ContextEncoder
 from .target_encoder import TargetEncoder
@@ -135,6 +136,15 @@ class CrossConditionJEPA(nn.Module):
         self.register_buffer("target_idx", torch.arange(config.num_target_probes, dtype=torch.long))
         self.register_buffer("context_idx", torch.arange(config.num_target_probes, 25, dtype=torch.long))
 
+        # Contiguous non-enclosing wedge mask bank (16 masks: 8 Family A outer half-plane wedges
+        # with Center 0 in Context + 8 Family B apex-inclusive wedges with Center 0 in Target).
+        # Registered with persistent=False so legacy checkpoints load with strict=True.
+        tgt_bank_np, ctx_bank_np = get_contiguous_star_masks(
+            star_radii=tuple(getattr(config, "star_radii", (1, 3, 7)))
+        )
+        self.register_buffer("target_idx_bank", torch.from_numpy(tgt_bank_np).long(), persistent=False)
+        self.register_buffer("context_idx_bank", torch.from_numpy(ctx_bank_np).long(), persistent=False)
+
     def _init_target_encoder(self):
         """Initialize Target Encoder weights identical to Context Encoder."""
         for p_tgt, p_ctx in zip(self.target_encoder.encoder.parameters(), self.context_encoder.parameters()):
@@ -187,10 +197,23 @@ class CrossConditionJEPA(nn.Module):
         # 2. Extract self-supervised condition token (disabled if use_condition_token is False)
         c_b = self.extract_condition_token(ref_b) if self.config.use_condition_token else None
 
-        # 3. Partition tokens: Context from A (16 outer), Target from B (9 inner)
+        # 3. Partition tokens:
+        # - If contiguous_masking=True: sample from 16 spatially contiguous, non-enclosing
+        #   wedge partitions (neither context inside target nor target surrounded by context),
+        #   ensuring all 25 probes (including Center 0) are trained in ContextEncoder.
+        # - Else (legacy default): fixed 16 outer context (9..24) vs 9 inner target (0..8).
         batch_arange = torch.arange(B, device=device).unsqueeze(1)
-        ctx_idx = self.context_idx.unsqueeze(0).expand(B, -1)  # [B, 16]
-        tgt_idx = self.target_idx.unsqueeze(0).expand(B, -1)   # [B, 9]
+        if getattr(self.config, "contiguous_masking", False):
+            num_masks = self.target_idx_bank.shape[0]
+            if self.training:
+                mask_sel = torch.randint(0, num_masks, (B,), device=device)
+            else:
+                mask_sel = torch.arange(B, device=device) % num_masks
+            ctx_idx = self.context_idx_bank[mask_sel]  # [B, 16]
+            tgt_idx = self.target_idx_bank[mask_sel]   # [B, 9]
+        else:
+            ctx_idx = self.context_idx.unsqueeze(0).expand(B, -1)  # [B, 16]
+            tgt_idx = self.target_idx.unsqueeze(0).expand(B, -1)   # [B, 9]
 
         ctx_tokens_a = tokens_a[batch_arange, ctx_idx]  # [B, 16, D]
         ctx_pos_a = pos_a[batch_arange, ctx_idx]
@@ -232,8 +255,13 @@ class CrossConditionJEPA(nn.Module):
             H_tgt_s = target_signal[..., D_c:]  # [B, 9, D_s]
 
             # A) Scattering Prediction: Predict z_s WITHOUT condition token (unconditioned mapping)
-            # This forces z_s to align sign/polarity across sensors (Hall vs TMR)
-            H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, condition_token=None)  # [B, 9, D]
+            # If predictor_scattering_only=True, zero out H_ctx_c before predictor so predictor
+            # cannot use Condition A's carrier subspace as a domain-translation shortcut.
+            if getattr(self.config, "predictor_scattering_only", False):
+                H_ctx_for_pred = torch.cat([torch.zeros_like(H_ctx_c), H_ctx_s], dim=-1)
+            else:
+                H_ctx_for_pred = H_ctx_a
+            H_pred_b = self.predictor(H_ctx_for_pred, tgt_pos_b, condition_token=None)  # [B, 9, D]
             H_pred_s = H_pred_b[..., D_c:]
             pred_loss = F.l1_loss(H_pred_s, H_tgt_s)
 
@@ -274,14 +302,6 @@ class CrossConditionJEPA(nn.Module):
             # Same physical coordinate seen under condition A (context encoder,
             # grad ON) vs condition B (target encoder, stop-grad/EMA target).
             # Penalizes any condition drift left inside z_s.
-            # Geometry (legacy direct pull): loss(z_s(A), stopgrad(z_s(B))).
-            # This is BYOL-minus-predictor: the EMA target tracks A while A
-            # aligns to B, so both spiral into a shared low-D subspace (rank
-            # 10 -> 1.4 in all 4 inv runs despite cov x4 / inv /4 / ramp x2).
-            # Asymmetric path (inv_predictor): loss(P(z_s(A)),
-            # stopgrad(z_s(B))). The head P does the alignment work; gradient
-            # still reaches the A-encoder through P, but P absorbs the
-            # collapse pressure instead of the encoder directions themselves.
             inv_weight = getattr(self.config, "inv_weight", 0.0)
             eff_inv = inv_weight * inv_scale
             if eff_inv > 0:
@@ -293,16 +313,21 @@ class CrossConditionJEPA(nn.Module):
                     H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b)  # [B, 16, D]
                 H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, N_ctx, D_s] fixed target
                 H_inv_online = self.inv_head(H_ctx_s) if self.inv_head is not None else H_ctx_s
-                # Stage-0 selective inv (oracle mask): align SOUND tokens only.
-                # Defect pixels couple to conditions differently per sensor, so
-                # blind alignment washes class signal (over-invariance: all 9
-                # OOD cells degraded in exp51). Masked mean over sound tokens;
-                # falls back to full mean when <5% tokens qualify (never NaN).
-                # inv_sound_frac is logged for viability monitoring.
+
+                # If scan_centered_inv=True, remove batch/scan DC offset before cosine L_inv
+                # so LayerNorm bias cannot trivially satisfy 1 - cos(mu + dA, mu + dB) -> 0.
+                if getattr(self.config, "scan_centered_inv", False):
+                    H_inv_online = H_inv_online - H_inv_online.mean(dim=(0, 1), keepdim=True)
+                    H_ctx_b_s = H_ctx_b_s - H_ctx_b_s.mean(dim=(0, 1), keepdim=True)
+
                 use_oracle = bool(getattr(self.config, "inv_oracle_mask", False))
                 snd_frac = torch.tensor(1.0, device=device)
                 if use_oracle and inv_sound_mask is not None:
-                    m = inv_sound_mask.reshape(-1).to(dtype=torch.bool)
+                    if inv_sound_mask.ndim == 2 and inv_sound_mask.shape[1] == 25:
+                        m_selected = inv_sound_mask[batch_arange, ctx_idx]
+                    else:
+                        m_selected = inv_sound_mask
+                    m = m_selected.reshape(-1).to(dtype=torch.bool)
                     frac = m.float().mean()
                     snd_frac = frac.detach()
                     if m.sum() >= max(1, int(0.05 * m.numel())):

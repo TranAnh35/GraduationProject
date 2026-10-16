@@ -15,7 +15,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from ..configs.config import CrossConditionConfig
-from ..data.topologies import ConcentricStarTopology
+from ..data.topologies import ConcentricStarTopology, get_spatial_topology_offsets
 
 
 class DualDomainTokenizer(nn.Module):
@@ -67,9 +67,34 @@ class DualDomainTokenizer(nn.Module):
         self.norm = nn.LayerNorm(config.embed_dim)
         self.drop = nn.Dropout(config.dropout)
 
-        # 4. Learnable 2D positional embedding for 25 concentric star probes
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, config.embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # 4. Spatial positional embedding for 25 concentric star probes:
+        # - Option A (continuous_pos_embed=True): Continuous 2D coordinate MLP mapping
+        #   normalized physical probe offsets (dr/r_max, dc/r_max) in [-1, 1]^2 to R^D.
+        # - Legacy (continuous_pos_embed=False): Discrete [1, 25, D] parameter table.
+        self.continuous_pos_embed = bool(getattr(config, "continuous_pos_embed", False))
+        if self.continuous_pos_embed:
+            offsets = get_spatial_topology_offsets(
+                topology=getattr(config, "spatial_topology", "concentric_star"),
+                star_radii=tuple(getattr(config, "star_radii", (1, 3, 7))),
+                grid_size=getattr(config, "grid_size", 5),
+            )
+            max_r = float(max(1.0, float(abs(offsets).max())))
+            norm_coords = torch.tensor(offsets, dtype=torch.float32).unsqueeze(0) / max_r  # [1, 25, 2]
+            self.register_buffer("norm_coords", norm_coords, persistent=False)
+            self.pos_mlp = nn.Sequential(
+                nn.Linear(2, config.embed_dim),
+                nn.GELU(),
+                nn.Linear(config.embed_dim, config.embed_dim),
+            )
+            nn.init.trunc_normal_(self.pos_mlp[0].weight, std=0.02)
+            nn.init.zeros_(self.pos_mlp[0].bias)
+            nn.init.trunc_normal_(self.pos_mlp[2].weight, std=0.02)
+            nn.init.zeros_(self.pos_mlp[2].bias)
+            self.pos_embed = None
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, config.embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+            self.pos_mlp = None
 
         # Precomputed spectral-moment frequency grid (hoisted: avoids rebuilding
         # a linspace tensor on every forward call in the hot training loop)
@@ -169,7 +194,11 @@ class DualDomainTokenizer(nn.Module):
         # 3. Dual-domain fusion
         z_fused = torch.cat([z_time, z_freq], dim=-1)  # [B, 25, D]
         tokens = self.drop(self.norm(z_fused))
-        pos = self.pos_embed.expand(B, -1, -1)
+        if self.continuous_pos_embed:
+            coords = self.norm_coords.to(dtype=tokens.dtype, device=tokens.device)
+            pos = self.pos_mlp(coords).expand(B, -1, -1)
+        else:
+            pos = self.pos_embed.expand(B, -1, -1)
 
         return tokens, pos
 

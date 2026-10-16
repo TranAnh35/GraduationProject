@@ -33,6 +33,10 @@ class CrossConditionConfig:
     # Masking specification (9 core target probes, 16 outer context probes)
     num_target_probes: int = 9
     num_context_probes: int = 16
+    continuous_pos_embed: bool = False    # Option A: continuous 2D coordinate MLP pos_mlp(dr, dc) instead of discrete pos_embed table
+    contiguous_masking: bool = False      # Contiguous non-enclosing wedge masking (avoids context inside target and vice versa)
+    predictor_scattering_only: bool = False  # If True, predictor reads only z_s (blocks carrier z_c shortcut)
+    scan_centered_inv: bool = False       # If True, subtracts scan/batch mean before cosine L_inv (kills LN_bias needle bypass)
     use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
     condition_modulation: str = "none"  # 'query_projection', 'cross_attention', 'adaln', 'additive', 'none'
     tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'continuous_scale_invariant'
