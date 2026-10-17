@@ -9,7 +9,9 @@
     {"id": "H6", "label": "Selective inv on sound-metal tokens only (oracle mask Stage 0) preserves class signal", "status": "REJECTED"},
     {"id": "H7", "label": "Energy-adaptive tokenizer front-end improves Chirp/TMR OOD (trades off Rivet_v2/Sizing contrast)", "status": "ACCEPTED_CAVEAT"},
     {"id": "H8", "label": "Continuous 2D coordinate pos_mlp (Option A) + non-enclosing contiguous wedge masking + scan-centered L_inv fixes FM7/FM8/FM11", "status": "PARTIAL"},
-    {"id": "H9", "label": "Patch-level shared energy normalization (patch_energy_norm, dim=(-2,-1)) preserves spatial contrast and restores Rivet_v2/Sizing without losing Chirp/TMR", "status": "REJECTED"}
+    {"id": "H9", "label": "Patch-level shared energy normalization (patch_energy_norm, dim=(-2,-1)) preserves spatial contrast and restores Rivet_v2/Sizing without losing Chirp/TMR", "status": "REJECTED"},
+    {"id": "H10", "label": "Decoupled Median-Patch Energy Normalization (median_patch_energy on exp56 base: per-probe unit-variance x_norm + 25-probe median std for v_pp/energy_t/mag) fixes FM11 without FM13", "status": "IMPLEMENTED"},
+    {"id": "H11", "label": "Asymmetric Scan-Centered Invariance (scan_centered_inv + inv_predictor + predictor_scattering_only + FP32 VICReg on exp56 base) closes both FM8 and FM6", "status": "IMPLEMENTED"}
   ],
   "failures": [
     {"id": "FM1", "label": "Blind-inv washout: aligning defect-coupled tokens across conditions destroys class signal (over-invariance)"},
@@ -20,10 +22,10 @@
     {"id": "FM6", "label": "L_inv amplitude-shrinkage hijack: direct symmetric L_inv (inv_predictor=False) when FM8 DC offset is blocked collapses rank (23.1D->1.2D in exp57a/b, 10->1.2D in exp49_161630)"},
     {"id": "FM7", "label": "Train-inference spatial token & pos_embed mismatch: ContextEncoder trained only on 16 outer probes (9..24) while pos_embed[0:9] received zero grad in Encoder (trained only in Predictor), yet extract_features feeds all 25 probes to ContextEncoder"},
     {"id": "FM8", "label": "LayerNorm DC-bias needle bypass of L_inv: when offset_weight=0 and scan_centered_inv=False (021809, exp52, exp53, exp56), context_encoder.norm.bias[32:] inflates (max 5.3-13.3) so raw cos=0.985-0.995 while scan-centered cos is only 0.034-0.111"},
-    {"id": "FM9", "label": "Small-group sound-metal noise amplification: scan_id=pair_idx (112 pairs -> 2.28 samples/group in batch 256) with pool_var_weight=0.5 + offset_weight=0.005 forces patch-mean variance on sound noise, driving pred_loss 1.07->1.74 before L_inv starts at ep 15"},
+    {"id": "FM9", "label": "Small-group sound-metal noise amplification: scan_id=pair_idx (112 pairs -> 2.28 samples/group in batch 256) with pool_var_weight=0.5 + offset_weight=0.005 forces patch-mean variance on uncorrelated sound noise, driving pred_loss 1.07->1.74 before L_inv starts at ep 15"},
     {"id": "FM10", "label": "Pretraining val leakage & metric blindness: PairedPECTDataset loads all 16 Base Domain scans (12 train + 4 val = 112 pairs); per-scan Mahalanobis val_auc is blind to cross-condition rotation; global batch R_eff (38.9D) hides within-scan z_s rank (2.57D in exp53 vs 7.21D in exp56)"},
     {"id": "FM11", "label": "Per-probe (dim=-1) temporal normalization erases within-patch spatial amplitude contrast ||x_center||/||x_ring||, degrading Rivet_v2 (0.592->0.486) and Sizing R2 (+0.238->-0.101) in exp53 and collapsing sizing (-5.07) in exp52"},
-    {"id": "FM12", "label": "Rank-dependent ZCA whitening mismatch & carrier shortcut: on low within-scan rank (2.57D in exp53) full 64x64 ZCA needs s2=1e-2 shrinkage, whereas on high within-scan rank (7.21D in exp56) s2=1e-2 over-damps 2nd-7th scattering axes (P1u=0.5893 >> P1u_s2=0.5425)"},
+    {"id": "FM12", "label": "Rank-dependent ZCA whitening mismatch & carrier shortcut: on low within-scan rank (2.57D in exp53) full 64x64 ZCA needs s2=1e-2 shrinkage, whereas on high within-scan rank (7.21D in exp56) s2=1e-2 over-damps 2nd-7th scattering axes (P1u_s5=0.6114 > P1u=0.5893 >> P1u_s2=0.5425)"},
     {"id": "FM13", "label": "Outer-ring (r3=7px) boundary variance coupling in patch_energy_norm: shared 25-probe std divides center probe 0 by outer-ring edge/lift-off steps, doubling sound variance (0.011->0.021) and centroid drift (7.57->19.61) and hurting linear probe on Chirp/Gaussian (0.5301 vs MLP_p1 0.5834)"}
   ],
   "invariants": [
@@ -35,7 +37,9 @@
   ],
   "readouts": [
     {"id": "R-P0", "label": "P0 LR on raw scattering (legacy baseline)", "status": "BASELINE"},
-    {"id": "R-P1u", "label": "P1u LR: unshrunk (eps=1e-4) unsupervised bg ZCA whitening (0.5893 Test AUC on 7.21D exp56, best deployable LR across all runs)", "status": "EVALUATED_BEST_ON_FULLRANK"},
+    {"id": "R-P1u", "label": "P1u LR: unshrunk (eps=1e-4) unsupervised bg ZCA whitening (0.5893 Test AUC on 7.21D exp56)", "status": "EVALUATED_BEST_ON_FULLRANK"},
+    {"id": "R-P1u_s5", "label": "P1u_s5 LR: full-rank (eps=1e-5, keep_q=0.85) unsupervised bg ZCA whitening (0.6114 Test AUC / 0.0899 AP on exp56, TMR 0.5285, Corrosion 0.6404, Rivet_v1 0.7274)", "status": "ADOPTED_FULLRANK"},
+    {"id": "R-P1u_maha", "label": "P1u_maha: hybrid z-score fusion of |P1u - med| + Mahalanobis (0.7094 Test AUC / 0.0936 AP on exp56, Hall_Air 0.7268, Hall_Pot 0.7775, TMR 0.6492)", "status": "ADOPTED_HYBRID"},
     {"id": "R-P1u_s2", "label": "P1u_s2 LR: unsupervised bg stats + shrinkage s2=1e-2 (deploy default on 2.6D exp53 at 0.5669; over-damps 7.21D exp56 to 0.5425)", "status": "ADOPTED"},
     {"id": "R-Otsu", "label": "Otsu threshold replacing fixed 0.5 for IoU (0.0278 IoU / 0.0528 F1 on exp56)", "status": "ADOPTED"},
     {"id": "R-P3", "label": "P3 supervised (best on exp51 only, not transferable)", "status": "EVALUATED"},
@@ -109,7 +113,11 @@
     {"src": "H8", "dst": "FM7", "rel": "ACCEPTED_BECAUSE", "rationale": "Structural arm (exp56 cont-pos + wedge mask) expanded within-scan R_eff 2.57D->7.21D, defect norm 0.666->1.927, and achieved new bests on Test P1u (0.5893), Test Maha (0.7192), Hall LP (0.65-0.68), and Val Sizing R2 (+0.5599).", "source": "runs/exp56_contpos_wedgemask_20261016_185414/evaluation_results"},
     {"src": "H8", "dst": "FM6", "rel": "REJECTED_BECAUSE", "rationale": "Loss arm (exp57a scan_centered_inv without inv_predictor) forked FM8 into FM6: with the LN-bias needle blocked (0.024), direct symmetric L_inv collapsed rank 23.1D->1.27D and triggered FP16 cov_loss=nan at ep 22.", "source": "runs/exp57a_centered_scat_20261016_154637/metrics_epoch.csv"},
     {"src": "H6", "dst": "FM1", "rel": "REJECTED_BECAUSE", "rationale": "Clean retest (exp57b vs exp57a) confirms: 97.4% of tokens are sound metal, so selective sound-token invariance still triggers FM6 rank collapse and lowers Test LP by -0.0404.", "source": "runs/exp57b_centered_scat_oracle_20261016_154813/evaluation_results"},
-    {"src": "H9", "dst": "FM13", "rel": "REJECTED_BECAUSE", "rationale": "While patch_energy_norm fixes FM11 on Sizing R2 (+0.3053) and Only-Rivet_v2 (0.610), outer-ring r3=7px boundary steps inflate std_patch and couple into center probe 0 (FM13), lowering Chirp/Gaussian linear probe to 0.501/0.495.", "source": "runs/exp58a_patch_energy_norm_20261016_232220/evaluation_results"}
+    {"src": "H9", "dst": "FM13", "rel": "REJECTED_BECAUSE", "rationale": "While patch_energy_norm fixes FM11 on Sizing R2 (+0.3053) and Only-Rivet_v2 (0.610), outer-ring r3=7px boundary steps inflate std_patch and couple into center probe 0 (FM13), lowering Chirp/Gaussian linear probe to 0.501/0.495.", "source": "runs/exp58a_patch_energy_norm_20261016_232220/evaluation_results"},
+    {"src": "R-P1u_s5", "dst": "FM12", "rel": "ACCEPTED_BECAUSE", "rationale": "On 7.21D exp56, lowering ZCA shrinkage to eps=1e-5 with keep_q=0.85 trimming preserves 2nd-8th scattering eigenvalues in [1e-5, 1e-3], lifting 65-file Test AUC from 0.5425 (s2) / 0.5893 (1e-4) to 0.6114 (AP 0.0899, Hall_Air 0.6712, Hall_Pot 0.6692, TMR 0.5285, Corrosion 0.6404, Rivet_v1 0.7274).", "source": "src/PECT_JEPA/cross_condition/diagnose_readouts.py"},
+    {"src": "R-P1u_maha", "dst": "FM3", "rel": "ACCEPTED_BECAUSE", "rationale": "Combining directional |P1u - med| z-score with isotropic Mahalanobis z-score reaches 0.7094 Test AUC / 0.0936 AP across 65 Test files on exp56 (Hall_Air 0.7268, Hall_Pot 0.7775, TMR 0.6492).", "source": "src/PECT_JEPA/cross_condition/diagnose_readouts.py"},
+    {"src": "component:tokenizer=median_patch_energy", "dst": "FM11", "rel": "FIXES", "rationale": "Normalizes v_pp, energy_t, and spectral mag by 25-probe median std (removing 56x cross-condition voltage scale while preserving center/ring contrast).", "source": "src/PECT_JEPA/cross_condition/models/tokenizer.py:140-159"},
+    {"src": "component:tokenizer=median_patch_energy", "dst": "FM13", "rel": "FIXES", "rationale": "Keeps x_norm strictly per-probe unit-variance and uses median std (50% breakdown point) so outer-ring r3 boundary steps cannot contaminate center probe 0.", "source": "src/PECT_JEPA/cross_condition/models/tokenizer.py:140-159"}
   ],
   "components": [
     {"id": "component:loss=blind_L_inv", "label": "Uncentered L_inv over all context tokens (MSE/cosine, direct encoder pull)"},
@@ -125,6 +133,7 @@
     {"id": "component:tokenizer=dual_domain", "label": "dual_domain tokenizer (021809/exp51 lineage)"},
     {"id": "component:tokenizer=waveform_invariant", "label": "waveform_invariant tokenizer (exp52)"},
     {"id": "component:tokenizer=energy_adaptive", "label": "energy_adaptive tokenizer (exp53 per-probe dim=-1 norm)"},
-    {"id": "component:tokenizer=patch_energy_adaptive", "label": "patch_energy_adaptive tokenizer (--patch_energy_norm true; shared 25-probe dim=(-2,-1) std norm preserving spatial contrast)"}
+    {"id": "component:tokenizer=patch_energy_adaptive", "label": "patch_energy_adaptive tokenizer (--patch_energy_norm true; shared 25-probe dim=(-2,-1) std norm preserving spatial contrast)"},
+    {"id": "component:tokenizer=median_patch_energy", "label": "median_patch_energy tokenizer (--median_patch_energy true; per-probe unit-variance x_norm + 25-probe median std for amplitude/spectral anchors)"}
   ]
 }

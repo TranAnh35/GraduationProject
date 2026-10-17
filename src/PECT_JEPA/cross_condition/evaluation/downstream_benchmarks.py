@@ -448,18 +448,21 @@ class DownstreamBenchmarkSuite:
         ground_truth_mask: np.ndarray,
     ) -> Dict[str, Any]:
         H, W, D = latents.shape
-        flat_latents = latents.reshape(-1, D)
+        flat_latents = np.nan_to_num(latents.reshape(-1, D).astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
         flat_labels = (ground_truth_mask.reshape(-1) > 0.5).astype(np.int64)
 
         sound_idx = (flat_labels == 0)
         z_sound = flat_latents[sound_idx]
         mu_sound = np.mean(z_sound, axis=0)
         cov_sound = np.cov(z_sound, rowvar=False) + np.eye(D) * 1e-4
-        inv_cov = np.linalg.pinv(cov_sound)
+        try:
+            inv_cov = np.linalg.pinv(cov_sound, hermitian=True)
+        except np.linalg.LinAlgError:
+            inv_cov = np.eye(D)
 
         diff = flat_latents - mu_sound
         dist_sq = np.sum((diff @ inv_cov) * diff, axis=-1)
-        dist = np.sqrt(np.maximum(dist_sq, 0.0))
+        dist = np.nan_to_num(np.sqrt(np.maximum(dist_sq, 0.0)), nan=0.0, posinf=0.0, neginf=0.0)
 
         auc = float(roc_auc_score(flat_labels, dist))
         ap = float(average_precision_score(flat_labels, dist))

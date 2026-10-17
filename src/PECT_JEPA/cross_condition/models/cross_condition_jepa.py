@@ -41,30 +41,31 @@ def compute_vicreg_loss(
     instead of one Python-level masked pass per unique scan (~100 kernel-launch
     rounds per training step -> 3 kernels). Singletons keep z unchanged.
     """
+    z_f = z.float()
     if scan_id is not None:
         # z: [N, D], scan_id: [N] (arbitrary ids)
         uniq, inv = torch.unique(scan_id, return_inverse=True)  # inv: [N] in 0..S-1
         n_groups = uniq.numel()
-        # float32 accumulators for stable means under AMP fp16 inputs
+        # float32 accumulators for stable means and covariance under AMP fp16 inputs
         counts = torch.bincount(inv, minlength=n_groups)  # [S] int64
-        sums = torch.zeros(n_groups, z.shape[1], device=z.device, dtype=torch.float32)
-        sums.index_add_(0, inv, z.float())
+        sums = torch.zeros(n_groups, z_f.shape[1], device=z_f.device, dtype=torch.float32)
+        sums.index_add_(0, inv, z_f)
         means = sums / counts.clamp_min(1).unsqueeze(1).float()  # [S, D]
-        m = means[inv].to(z.dtype)  # [N, D]
+        m = means[inv]  # [N, D] float32
         singleton = (counts[inv] <= 1).unsqueeze(1)  # [N, 1]
-        z_cent = torch.where(singleton, z, z - m)
+        z_cent = torch.where(singleton, z_f, z_f - m)
         # Standard deviation computed strictly on within-scan centered perturbations
         std = torch.sqrt(z_cent.var(dim=0, unbiased=False) + eps)
     else:
-        std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)
-        z_cent = z - z.mean(dim=0, keepdim=True)
+        std = torch.sqrt(z_f.var(dim=0, unbiased=False) + eps)
+        z_cent = z_f - z_f.mean(dim=0, keepdim=True)
 
     var_loss = torch.mean(F.relu(gamma - std))
 
     N = z_cent.shape[0]
     cov = (z_cent.T @ z_cent) / max(N - 1, 1)
     cov_off = cov - torch.diag(torch.diag(cov))
-    cov_loss = (cov_off ** 2).sum() / z.shape[1]
+    cov_loss = (cov_off ** 2).sum() / z_f.shape[1]
 
     total = var_weight * var_loss + cov_weight * cov_loss
     return total, var_loss, cov_loss
@@ -366,10 +367,11 @@ class CrossConditionJEPA(nn.Module):
             xcov_weight = getattr(self.config, "xcov_weight", 0.0)
             eff_xcov = xcov_weight * xcov_scale
             if eff_xcov > 0:
-                flat_ctx_c = H_ctx_c.reshape(B * H_ctx_c.shape[1], -1)  # [N, D_c]
+                flat_ctx_c = H_ctx_c.reshape(B * H_ctx_c.shape[1], -1).float()  # [N, D_c]
+                flat_ctx_s_f = flat_ctx_s.float()
                 N = flat_ctx_c.shape[0]
                 zc_cent = flat_ctx_c - flat_ctx_c.mean(dim=0, keepdim=True)
-                zs_cent = flat_ctx_s - flat_ctx_s.mean(dim=0, keepdim=True)
+                zs_cent = flat_ctx_s_f - flat_ctx_s_f.mean(dim=0, keepdim=True)
                 xcov = (zc_cent.T @ zs_cent) / max(N - 1, 1)  # [D_c, D_s]
                 xcov_loss = (xcov ** 2).sum() / (D_c * D_s)
             else:

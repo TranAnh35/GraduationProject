@@ -41,6 +41,7 @@ class DualDomainTokenizer(nn.Module):
         self.patch_energy_norm = bool(getattr(config, "patch_energy_norm", False)) or (
             self.tokenizer_type == "patch_energy_adaptive"
         )
+        self.median_patch_energy = bool(getattr(config, "median_patch_energy", False))
 
         self.time_dim = config.embed_dim // 2
         self.freq_dim = config.embed_dim - self.time_dim
@@ -138,6 +139,26 @@ class DualDomainTokenizer(nn.Module):
                 v_pp = torch.log1p(torch.clamp(v_max - v_min, min=0.0))
                 energy_t = torch.log1p(torch.mean(x_norm ** 2, dim=-1, keepdim=True))
                 x_fp32 = x_norm.float()
+            elif self.median_patch_energy:
+                # Decoupled Median-Patch Energy Normalization (fixes FM11 without FM13):
+                # 1. Keeps x_norm strictly per-probe unit-variance ((x - mean_t) / std_t) so
+                #    the 128 waveform shape samples are 100% immune to outer-ring boundary steps (FM13).
+                # 2. Normalizes amplitude/spectral anchors (v_pp, energy_t, mag) by the robust
+                #    25-probe median std (50% breakdown point), removing the 56x cross-condition
+                #    voltage scale while preserving relative center/ring amplitude contrast (FM11).
+                x_zero = x_flat - mean_t
+                std_t = x_zero.std(dim=-1, keepdim=True) + 1e-6  # [B, 25, 1]
+                x_norm = x_zero / std_t
+
+                std_med = torch.median(std_t, dim=1, keepdim=True).values  # [B, 1, 1]
+                x_amp = x_zero / std_med
+
+                t_peak = torch.argmax(torch.abs(x_norm), dim=-1, keepdim=True).float() / float(C)
+                v_max = x_amp.max(dim=-1, keepdim=True).values
+                v_min = x_amp.min(dim=-1, keepdim=True).values
+                v_pp = torch.log1p(torch.clamp(v_max - v_min, min=0.0))
+                energy_t = torch.log1p(torch.mean(x_amp ** 2, dim=-1, keepdim=True))
+                x_fp32 = x_amp.float()
             else:
                 std_t = x_flat.std(dim=-1, keepdim=True) + 1e-6
                 x_norm = (x_flat - mean_t) / std_t

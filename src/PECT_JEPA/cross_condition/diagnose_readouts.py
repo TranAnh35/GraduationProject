@@ -313,12 +313,14 @@ def main():
     bg_stats_uns: Dict[str, tuple] = {}
     bg_stats_uns_s2: Dict[str, tuple] = {}
     bg_stats_uns_trim_s2: Dict[str, tuple] = {}
+    bg_stats_uns_s5: Dict[str, tuple] = {}
     for fp in train_eval_files:
         flat_all = cached[fp].reshape(-1, cached[fp].shape[-1]).astype(np.float32)
         valid_all = gt_of[fp].reshape(-1) >= 0
         bg_stats_uns[fp] = unsup_bg_stats(flat_all, valid_all)
         bg_stats_uns_s2[fp] = unsup_bg_stats(flat_all, valid_all, eps=SHRINK_EPS)
         bg_stats_uns_trim_s2[fp] = unsup_trimmed_bg_stats(flat_all, valid_all, eps=SHRINK_EPS, keep_q=0.75)
+        bg_stats_uns_s5[fp] = unsup_trimmed_bg_stats(flat_all, valid_all, eps=1e-5, keep_q=0.85)
 
     def _wblack(stats: Dict[str, tuple], fp: str, X: np.ndarray) -> np.ndarray:
         mu, W = stats[fp]
@@ -332,6 +334,8 @@ def main():
         [_wblack(bg_stats_uns_s2, p["fp"], p["X"]) for p in pool_parts], axis=0), y_det)
     lr1u_trim_s2 = fit_lr(np.concatenate(
         [_wblack(bg_stats_uns_trim_s2, p["fp"], p["X"]) for p in pool_parts], axis=0), y_det)
+    lr1u_s5 = fit_lr(np.concatenate(
+        [_wblack(bg_stats_uns_s5, p["fp"], p["X"]) for p in pool_parts], axis=0), y_det)
 
     # (iii) halo-cleaned P0 refit: same scaler s0 (feature scaling fixed),
     # only the FITTING labels drop the halo ring around defect boundaries.
@@ -471,6 +475,7 @@ def main():
                 muW_s2 = bg_stats_s2[fp]
                 muW_uns_s2 = bg_stats_uns_s2[fp]
                 muW_uns_trim_s2 = bg_stats_uns_trim_s2[fp]
+                muW_uns_s5 = bg_stats_uns_s5[fp]
             else:
                 assert nxt is not None and nxt[0] == fp
                 gt_mask = gt_masks[meta["specimen"]]["mask"]
@@ -487,6 +492,7 @@ def main():
                 muW_s2 = whiten_stats(flat_all_l[bgm], eps=SHRINK_EPS)
                 muW_uns_s2 = unsup_bg_stats(flat_all_l, v0, eps=SHRINK_EPS)
                 muW_uns_trim_s2 = unsup_trimmed_bg_stats(flat_all_l, v0, eps=SHRINK_EPS, keep_q=0.75)
+                muW_uns_s5 = unsup_trimmed_bg_stats(flat_all_l, v0, eps=1e-5, keep_q=0.85)
 
             flat = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
             y = gt_mask.reshape(-1).astype(np.int64)
@@ -524,6 +530,7 @@ def main():
             fw_u = _wapp(muW_uns, flat)[valid]
             fw_u_s2 = _wapp(muW_uns_s2, flat)[valid]
             fw_u_trim_s2 = _wapp(muW_uns_trim_s2, flat)[valid]
+            fw_u_s5 = _wapp(muW_uns_s5, flat)[valid]
 
             def _aup(lr_, Xs_):
                 a = auc_of(lr_, Xs_, yv)
@@ -533,6 +540,17 @@ def main():
             auc_p1u, ap_p1u = _aup(lr1u, fw_u)
             auc_p1u_s2, ap_p1u_s2 = _aup(lr1u_s2, fw_u_s2)
             auc_p1u_trim_s2, ap_p1u_trim_s2 = _aup(lr1u_trim_s2, fw_u_trim_s2)
+            auc_p1u_s5, ap_p1u_s5 = _aup(lr1u_s5, fw_u_s5)
+
+            # v6: Hybrid directional + isotropic anomaly fusion (P1u + Mahalanobis z-score)
+            dec_u = lr1u.decision_function(fw_u)
+            dec_u_c = np.abs(dec_u - np.median(dec_u))
+            z_dec_u = dec_u_c / (np.std(dec_u_c) + 1e-6)
+            z_m = (m - np.mean(m)) / (np.std(m) + 1e-6)
+            score_p1u_maha = 0.5 * z_dec_u + 0.5 * z_m
+            auc_p1u_maha = float(roc_auc_score(yv, score_p1u_maha)) if len(np.unique(yv)) > 1 else 0.0
+            ap_p1u_maha = float(average_precision_score(yv, score_p1u_maha)) if len(np.unique(yv)) > 1 else 0.0
+
             auc_p0h, ap_p0h = _aup(lr0h, feats_sv)
             auc_p2h, ap_p2h = _aup(lr2h, feats_sv)
             # v4: MLP combo scores
@@ -569,13 +587,15 @@ def main():
                 "auc_p1u": round(auc_p1u, 4), "ap_p1u": round(ap_p1u, 4),
                 "auc_p1u_s2": round(auc_p1u_s2, 4), "ap_p1u_s2": round(ap_p1u_s2, 4),
                 "auc_p1u_trim_s2": round(auc_p1u_trim_s2, 4), "ap_p1u_trim_s2": round(ap_p1u_trim_s2, 4),
+                "auc_p1u_s5": round(auc_p1u_s5, 4), "ap_p1u_s5": round(ap_p1u_s5, 4),
+                "auc_p1u_maha": round(auc_p1u_maha, 4), "ap_p1u_maha": round(ap_p1u_maha, 4),
                 "auc_p0h": round(auc_p0h, 4), "ap_p0h": round(ap_p0h, 4),
                 "auc_p2h": round(auc_p2h, 4), "ap_p2h": round(ap_p2h, 4),
                 "auc_mlp_raw": round(auc_mlp_raw, 4), "ap_mlp_raw": round(ap_mlp_raw, 4),
                 "auc_mlp_p1": round(auc_mlp_p1, 4), "ap_mlp_p1": round(ap_mlp_p1, 4),
                 "auc_mlp_p1u_s2": round(auc_mlp_p1u_s2, 4), "ap_mlp_p1u_s2": round(ap_mlp_p1u_s2, 4),
                 "auc_p2": round(auc_p2, 4), "ap_p2": round(ap_p2, 4),
-                "auc_p3": round(auc_p3, 4), "ap_p3": round(auc_p3, 4),
+                "auc_p3": round(auc_p3, 4), "ap_p3": round(ap_p3, 4),
                 "iou_05": iou05["iou"], "iou_opt": iouopt["iou"],
                 "opt_thresh": iouopt["optimal_threshold"],
                 "iou_otsu": iou_otsu_d["iou"], "f1_otsu": iou_otsu_d["dice"],
@@ -596,7 +616,7 @@ def main():
         v = [r[key] for r in rs if isinstance(r[key], (int, float))]
         return float(np.mean(v)) if v else 0.0
 
-    print("\n==== READOUT DIAGNOSTICS v2 ====", flush=True)
+    print("\n==== READOUT DIAGNOSTICS v6 ====", flush=True)
     for sp in args.eval_splits:
         rs = [r for r in rows if r["split"] == sp]
         print(f"[{sp.upper():5s}] n={len(rs)} "
@@ -607,11 +627,13 @@ def main():
               f"maha={mean('maha_auc',rs):.4f} "
               f"iou05={mean('iou_05',rs):.4f}/{mean('iou05_p3',rs):.4f} "
               f"iouOpt={mean('iou_opt',rs):.4f}/{mean('iouOpt_p3',rs):.4f}", flush=True)
-        print(f"[{sp.upper():5s}-v3] n={len(rs)} "
+        print(f"[{sp.upper():5s}-v3/v6] n={len(rs)} "
               f"P1_s2={mean('auc_p1_s2',rs):.4f}/{mean('ap_p1_s2',rs):.4f} "
               f"P1u={mean('auc_p1u',rs):.4f}/{mean('ap_p1u',rs):.4f} "
               f"P1u_s2={mean('auc_p1u_s2',rs):.4f}/{mean('ap_p1u_s2',rs):.4f} "
               f"P1u_trim_s2={mean('auc_p1u_trim_s2',rs):.4f}/{mean('ap_p1u_trim_s2',rs):.4f} "
+              f"P1u_s5={mean('auc_p1u_s5',rs):.4f}/{mean('ap_p1u_s5',rs):.4f} "
+              f"P1u_maha={mean('auc_p1u_maha',rs):.4f}/{mean('ap_p1u_maha',rs):.4f} "
               f"P0h={mean('auc_p0h',rs):.4f}/{mean('ap_p0h',rs):.4f} "
               f"P2h={mean('auc_p2h',rs):.4f}/{mean('ap_p2h',rs):.4f} "
               f"iouOtsu={mean('iou_otsu',rs):.4f}/f1Otsu={mean('f1_otsu',rs):.4f}", flush=True)

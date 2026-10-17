@@ -70,7 +70,9 @@ def q2(cur):
             ver = mid.split(":")[3] if mid.startswith("metric:") else "?"
             flag = {"auc_oracle": "(oracle-UB, needs GT)", "auc_p1_s2": "(needs GT bg)",
                     "auc_p1": "(needs GT bg, unshrunk)",
-                    "auc_p1u": "<DEPLOYABLE, unshrunk bg (best when within-scan R_eff>=6D)>",
+                    "auc_p1u": "<DEPLOYABLE, unshrunk bg (eps=1e-4)>",
+                    "auc_p1u_s5": "<DEPLOYABLE, full-rank trimmed bg (eps=1e-5, keep_q=0.85)>",
+                    "auc_p1u_maha": "<DEPLOYABLE, P1u + Mahalanobis z-score fusion>",
                     "auc_p1u_s2": "<DEPLOYABLE, shrunk s2>",
                     "auc_p1u_trim_s2": "<DEPLOYABLE, trimmed bg>",
                     "auc_mlp_p1u_s2": "(supervised probe)",
@@ -87,6 +89,8 @@ def q3(cur):
     for rid in runs:
         for pat, tag in (("suite:test:sensor:%:lp_auc", "suiteLP"),
                          ("readout:%:test:sensor:%:auc_p1u", "P1u"),
+                         ("readout:%:test:sensor:%:auc_p1u_s5", "P1u_s5"),
+                         ("readout:%:test:sensor:%:auc_p1u_maha", "P1u_maha"),
                          ("readout:%:test:sensor:%:auc_p1u_s2", "P1u_s2"),
                          ("readout:%:test:sensor:%:maha_auc", "maha")):
             rows = cur.execute(

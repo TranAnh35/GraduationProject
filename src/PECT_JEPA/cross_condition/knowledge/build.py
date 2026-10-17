@@ -127,6 +127,7 @@ def parse_suite_metrics(run_dir):
 
 
 READOUT_CANDIDATES = [
+    ("diagnose_readouts_v6", "v6"),
     ("diagnose_readouts_v5", "v5"),
     ("diagnose_readouts_v4", "v4"),
     ("diagnose_readouts_v3", "v3"),
@@ -159,8 +160,9 @@ def parse_readout_metrics(run_dir):
             m = mean([fnum(r.get(c)) for r in grp])
             if m is not None:
                 recs.append((f"readout:{version}:{split}:{c}", c, m, split, "all", version))
-    key_cols = [c for c in ("auc_raw", "auc_p1u", "auc_p1u_s2", "auc_p1u_trim_s2", "auc_mlp_p1u_s2", "auc_p2",
-                            "auc_p3", "maha_auc") if c in (rows[0].keys() or [])]
+    key_cols = [c for c in ("auc_raw", "auc_p1u", "auc_p1u_s5", "auc_p1u_maha", "auc_p1u_s2",
+                            "auc_p1u_trim_s2", "auc_mlp_p1u_s2", "auc_p2", "auc_p3", "maha_auc")
+                if c in (rows[0].keys() or [])]
     for sensor in sorted({r.get("sensor", "?") for r in rows if r.get("split") == "test"}):
         for c in key_cols:
             m = mean([fnum(r.get(c)) for r in rows
