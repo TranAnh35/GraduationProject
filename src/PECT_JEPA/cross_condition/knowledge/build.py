@@ -159,7 +159,7 @@ def parse_readout_metrics(run_dir):
             m = mean([fnum(r.get(c)) for r in grp])
             if m is not None:
                 recs.append((f"readout:{version}:{split}:{c}", c, m, split, "all", version))
-    key_cols = [c for c in ("auc_raw", "auc_p1u_s2", "auc_p1u_trim_s2", "auc_mlp_p1u_s2", "auc_p2",
+    key_cols = [c for c in ("auc_raw", "auc_p1u", "auc_p1u_s2", "auc_p1u_trim_s2", "auc_mlp_p1u_s2", "auc_p2",
                             "auc_p3", "maha_auc") if c in (rows[0].keys() or [])]
     for sensor in sorted({r.get("sensor", "?") for r in rows if r.get("split") == "test"}):
         for c in key_cols:
