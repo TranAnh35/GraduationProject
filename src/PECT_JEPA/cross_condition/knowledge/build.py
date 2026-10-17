@@ -151,6 +151,11 @@ def parse_readout_metrics(run_dir):
         return [], None, None
     if not rows:
         return [], None, None
+    if version == "v2":
+        if "auc_p1u_s5" in rows[0]:
+            version = "v6"
+        elif "auc_p1u_trim_s2" in rows[0]:
+            version = "v5"
     cols = [c for c in rows[0].keys()
             if c.startswith("auc_") or c.startswith("ap_") or c in ("iou_otsu", "f1_otsu")]
     recs = []
@@ -199,7 +204,9 @@ def build(runs_dir, db_path, seed_path):
     report = []
     for run in run_dirs:
         rdir = os.path.join(runs_dir, run)
-        cfg = read_json(os.path.join(rdir, "config.json")) or {}
+        cfg = (read_json(os.path.join(rdir, "config.json"))
+               or read_json(os.path.join(rdir, "config_resume.json"))
+               or {})
         git = read_json(os.path.join(rdir, "git_info.json")) or {}
         commit = git.get("commit", "")
         ov = (seed.get("run_overrides") or {}).get(run, {})

@@ -22,6 +22,26 @@ from .target_encoder import TargetEncoder
 from .predictor import CrossConditionPredictor
 
 
+def center_by_group(z_f: torch.Tensor, group_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Center a 2D tensor z_f [N, D] (float32) per group_id [N] if provided,
+    or globally across N if group_id is None. Singletons fallback to global mean
+    so no sample remains uncentered.
+    """
+    if group_id is None:
+        return z_f - z_f.mean(dim=0, keepdim=True)
+    uniq, inv = torch.unique(group_id, return_inverse=True)  # inv: [N] in 0..S-1
+    n_groups = uniq.numel()
+    counts = torch.bincount(inv, minlength=n_groups)  # [S] int64
+    sums = torch.zeros(n_groups, z_f.shape[1], device=z_f.device, dtype=torch.float32)
+    sums.index_add_(0, inv, z_f)
+    means = sums / counts.clamp_min(1).unsqueeze(1).float()  # [S, D]
+    m = means[inv]  # [N, D] float32
+    singleton = (counts[inv] <= 1).unsqueeze(1)  # [N, 1]
+    global_mean = z_f.mean(dim=0, keepdim=True)
+    return torch.where(singleton, z_f - global_mean, z_f - m)
+
+
 def compute_vicreg_loss(
     z: torch.Tensor,
     var_weight: float = 1.0,
@@ -315,11 +335,20 @@ class CrossConditionJEPA(nn.Module):
                 H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, N_ctx, D_s] fixed target
                 H_inv_online = self.inv_head(H_ctx_s) if self.inv_head is not None else H_ctx_s
 
-                # If scan_centered_inv=True, remove batch/scan DC offset before cosine L_inv
-                # so LayerNorm bias cannot trivially satisfy 1 - cos(mu + dA, mu + dB) -> 0.
+                # If scan_centered_inv=True, remove per-scan (or batch) DC offset before cosine L_inv
+                # so LayerNorm bias and condition centroids cannot trivially satisfy 1 - cos(mu + dA, mu + dB) -> 0.
                 if getattr(self.config, "scan_centered_inv", False):
-                    H_inv_online = H_inv_online - H_inv_online.mean(dim=(0, 1), keepdim=True)
-                    H_ctx_b_s = H_ctx_b_s - H_ctx_b_s.mean(dim=(0, 1), keepdim=True)
+                    _grp = (
+                        scan_id.unsqueeze(1).expand(-1, H_inv_online.shape[1]).reshape(-1)
+                        if scan_id is not None
+                        else None
+                    )
+                    H_inv_online = center_by_group(
+                        H_inv_online.reshape(-1, H_inv_online.shape[-1]).float(), _grp
+                    ).reshape_as(H_inv_online)
+                    H_ctx_b_s = center_by_group(
+                        H_ctx_b_s.reshape(-1, H_ctx_b_s.shape[-1]).float(), _grp
+                    ).reshape_as(H_ctx_b_s)
 
                 use_oracle = bool(getattr(self.config, "inv_oracle_mask", False))
                 snd_frac = torch.tensor(1.0, device=device)
