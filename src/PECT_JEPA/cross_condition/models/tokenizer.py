@@ -45,6 +45,7 @@ class DualDomainTokenizer(nn.Module):
         self.clean_phasor_token = bool(getattr(config, "clean_phasor_token", False))
         self.relative_energy_anchor = bool(getattr(config, "relative_energy_anchor", False))
         self.patch_polarity_align = bool(getattr(config, "patch_polarity_align", False))
+        self.bi_directional_relative_energy = bool(getattr(config, "bi_directional_relative_energy", False))
 
         self.time_dim = config.embed_dim // 2
         self.freq_dim = config.embed_dim - self.time_dim
@@ -54,8 +55,15 @@ class DualDomainTokenizer(nn.Module):
             # x_aligned [C] + t_peak [1] + V_pp [1] + energy [1] + 5 diffusion arrival quantiles [5] = C + 8
             self.time_proj = nn.Linear(self.temporal_samples + 8, self.time_dim)
         elif self.tokenizer_type in ("energy_adaptive", "patch_energy_adaptive"):
-            # x_norm [C] + peak_time [1] + V_pp [1] + energy [1] (+ rel_energy [1] if relative_energy_anchor)
-            extra_time = 4 if self.relative_energy_anchor else 3
+            # x_norm [C] + peak_time [1] + V_pp [1] + energy [1]
+            # (+ rel_energy [1] if relative_energy_anchor)
+            # (+ abs_rel_energy [1] if bi_directional_relative_energy)
+            if self.bi_directional_relative_energy:
+                extra_time = 5
+            elif self.relative_energy_anchor:
+                extra_time = 4
+            else:
+                extra_time = 3
             self.time_proj = nn.Linear(self.temporal_samples + extra_time, self.time_dim)
         elif self.tokenizer_type == "waveform_invariant":
             # x_shape [C] + log_energy [1] + t_peak [1] = C + 2
@@ -249,7 +257,15 @@ class DualDomainTokenizer(nn.Module):
                 energy_t = torch.log1p(torch.mean(x_flat_aligned ** 2, dim=-1, keepdim=True))
                 x_fp32 = x_flat_aligned.float()
 
-                if self.relative_energy_anchor:
+                if self.bi_directional_relative_energy:
+                    # Bi-directional spatial energy contrast (fixes Rivet_v2 half-space sign inversion in latent space):
+                    # Relative probe energy compared to surrounding context probes (probes 1..24)
+                    e_probe = std_t ** 2  # [B, 25, 1]
+                    e_context = e_probe[:, 1:, :].mean(dim=1, keepdim=True) + 1e-8  # [B, 1, 1]
+                    rel_energy = torch.log1p(e_probe) - torch.log1p(e_context)  # [B, 25, 1]
+                    abs_rel_energy = torch.abs(rel_energy)  # [B, 25, 1]
+                    time_feat = torch.cat([x_norm, t_peak, v_pp, energy_t, rel_energy, abs_rel_energy], dim=-1)
+                elif self.relative_energy_anchor:
                     # Decoupled spatial energy contrast (fixes FM11 on Rivet_v2 without FM13/FM14):
                     # Relative probe energy compared to surrounding context probes (probes 1..24)
                     e_probe = std_t ** 2  # [B, 25, 1]
