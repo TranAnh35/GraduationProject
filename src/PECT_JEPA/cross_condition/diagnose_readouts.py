@@ -551,6 +551,32 @@ def main():
             auc_p1u_maha = float(roc_auc_score(yv, score_p1u_maha)) if len(np.unique(yv)) > 1 else 0.0
             ap_p1u_maha = float(average_precision_score(yv, score_p1u_maha)) if len(np.unique(yv)) > 1 else 0.0
 
+            # Direction 2: Unsupervised Absolute Deviation & Skewness-Calibrated Readouts
+            auc_p1u_abs = float(roc_auc_score(yv, dec_u_c)) if len(np.unique(yv)) > 1 else 0.0
+            ap_p1u_abs = float(average_precision_score(yv, dec_u_c)) if len(np.unique(yv)) > 1 else 0.0
+
+            std_u = np.std(dec_u) + 1e-6
+            skew_u = float(np.mean(((dec_u - np.mean(dec_u)) / std_u) ** 3))
+            dec_u_skew = dec_u if skew_u >= 0 else -dec_u
+            auc_p1u_skew = float(roc_auc_score(yv, dec_u_skew)) if len(np.unique(yv)) > 1 else 0.0
+            ap_p1u_skew = float(average_precision_score(yv, dec_u_skew)) if len(np.unique(yv)) > 1 else 0.0
+
+            dec_s2 = lr1u_s2.decision_function(fw_u_s2)
+            dec_s2_c = np.abs(dec_s2 - np.median(dec_s2))
+            auc_p1u_s2_abs = float(roc_auc_score(yv, dec_s2_c)) if len(np.unique(yv)) > 1 else 0.0
+            ap_p1u_s2_abs = float(average_precision_score(yv, dec_s2_c)) if len(np.unique(yv)) > 1 else 0.0
+
+            std_s2 = np.std(dec_s2) + 1e-6
+            skew_s2 = float(np.mean(((dec_s2 - np.mean(dec_s2)) / std_s2) ** 3))
+            dec_s2_skew = dec_s2 if skew_s2 >= 0 else -dec_s2
+            auc_p1u_s2_skew = float(roc_auc_score(yv, dec_s2_skew)) if len(np.unique(yv)) > 1 else 0.0
+            ap_p1u_s2_skew = float(average_precision_score(yv, dec_s2_skew)) if len(np.unique(yv)) > 1 else 0.0
+
+            z_dec_s2 = dec_s2_c / (np.std(dec_s2_c) + 1e-6)
+            score_p1u_s2_maha = 0.5 * z_dec_s2 + 0.5 * z_m
+            auc_p1u_s2_maha = float(roc_auc_score(yv, score_p1u_s2_maha)) if len(np.unique(yv)) > 1 else 0.0
+            ap_p1u_s2_maha = float(average_precision_score(yv, score_p1u_s2_maha)) if len(np.unique(yv)) > 1 else 0.0
+
             auc_p0h, ap_p0h = _aup(lr0h, feats_sv)
             auc_p2h, ap_p2h = _aup(lr2h, feats_sv)
             # v4: MLP combo scores
@@ -589,6 +615,11 @@ def main():
                 "auc_p1u_trim_s2": round(auc_p1u_trim_s2, 4), "ap_p1u_trim_s2": round(ap_p1u_trim_s2, 4),
                 "auc_p1u_s5": round(auc_p1u_s5, 4), "ap_p1u_s5": round(ap_p1u_s5, 4),
                 "auc_p1u_maha": round(auc_p1u_maha, 4), "ap_p1u_maha": round(ap_p1u_maha, 4),
+                "auc_p1u_abs": round(auc_p1u_abs, 4), "ap_p1u_abs": round(ap_p1u_abs, 4),
+                "auc_p1u_skew": round(auc_p1u_skew, 4), "ap_p1u_skew": round(ap_p1u_skew, 4),
+                "auc_p1u_s2_abs": round(auc_p1u_s2_abs, 4), "ap_p1u_s2_abs": round(ap_p1u_s2_abs, 4),
+                "auc_p1u_s2_skew": round(auc_p1u_s2_skew, 4), "ap_p1u_s2_skew": round(ap_p1u_s2_skew, 4),
+                "auc_p1u_s2_maha": round(auc_p1u_s2_maha, 4), "ap_p1u_s2_maha": round(ap_p1u_s2_maha, 4),
                 "auc_p0h": round(auc_p0h, 4), "ap_p0h": round(ap_p0h, 4),
                 "auc_p2h": round(auc_p2h, 4), "ap_p2h": round(ap_p2h, 4),
                 "auc_mlp_raw": round(auc_mlp_raw, 4), "ap_mlp_raw": round(ap_mlp_raw, 4),
@@ -637,6 +668,12 @@ def main():
               f"P0h={mean('auc_p0h',rs):.4f}/{mean('ap_p0h',rs):.4f} "
               f"P2h={mean('auc_p2h',rs):.4f}/{mean('ap_p2h',rs):.4f} "
               f"iouOtsu={mean('iou_otsu',rs):.4f}/f1Otsu={mean('f1_otsu',rs):.4f}", flush=True)
+        print(f"[{sp.upper():5s}-v7_test] n={len(rs)} "
+              f"P1u_abs={mean('auc_p1u_abs',rs):.4f}/{mean('ap_p1u_abs',rs):.4f} "
+              f"P1u_skew={mean('auc_p1u_skew',rs):.4f}/{mean('ap_p1u_skew',rs):.4f} "
+              f"P1u_s2_abs={mean('auc_p1u_s2_abs',rs):.4f}/{mean('ap_p1u_s2_abs',rs):.4f} "
+              f"P1u_s2_skew={mean('auc_p1u_s2_skew',rs):.4f}/{mean('ap_p1u_s2_skew',rs):.4f} "
+              f"P1u_s2_maha={mean('auc_p1u_s2_maha',rs):.4f}/{mean('ap_p1u_s2_maha',rs):.4f}", flush=True)
         print(f"[{sp.upper():5s}-v4] n={len(rs)} "
               f"MLPraw={mean('auc_mlp_raw',rs):.4f}/{mean('ap_mlp_raw',rs):.4f} "
               f"MLPp1={mean('auc_mlp_p1',rs):.4f}/{mean('ap_mlp_p1',rs):.4f} "
