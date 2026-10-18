@@ -31,7 +31,19 @@ class ContextEncoder(nn.Module):
             )
             for _ in range(config.encoder_depth)
         ])
-        self.norm = nn.LayerNorm(config.embed_dim)
+        self.subspace_norm = bool(getattr(config, "subspace_norm", False)) and bool(
+            getattr(config, "latent_disentanglement", False)
+        )
+        if self.subspace_norm:
+            self.carrier_dim = int(getattr(config, "carrier_dim", config.embed_dim // 2))
+            self.scattering_dim = int(getattr(config, "scattering_dim", config.embed_dim - self.carrier_dim))
+            self.norm = None
+            self.norm_c = nn.LayerNorm(self.carrier_dim)
+            self.norm_s = nn.LayerNorm(self.scattering_dim, bias=False)
+        else:
+            self.norm = nn.LayerNorm(config.embed_dim)
+            self.norm_c = None
+            self.norm_s = None
 
     def forward(
         self,
@@ -48,4 +60,8 @@ class ContextEncoder(nn.Module):
         h = context_tokens + context_pos
         for blk in self.blocks:
             h = blk(h)
+        if self.subspace_norm:
+            h_c = self.norm_c(h[..., :self.carrier_dim])
+            h_s = self.norm_s(h[..., self.carrier_dim:])
+            return torch.cat([h_c, h_s], dim=-1)
         return self.norm(h)

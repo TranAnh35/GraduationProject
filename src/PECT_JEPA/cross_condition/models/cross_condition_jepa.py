@@ -413,7 +413,19 @@ class CrossConditionJEPA(nn.Module):
             zc_cond_weight = getattr(self.config, "zc_cond_weight", 0.0)
             if zc_cond_weight > 0 and self.zc_cond_head is not None and c_b is not None:
                 zc_pred = self.zc_cond_head(H_ctx_c.mean(dim=1))  # [B, D]
-                zc_cond_loss = F.mse_loss(zc_pred, c_b.squeeze(1).detach())
+                if getattr(self.config, "subspace_norm", False) or getattr(self.config, "clean_phasor_token", False):
+                    # Self-consistent carrier grounding (fixes FM19):
+                    # 1. H_ctx_c (Condition A) reconstructs Condition A's own dual-domain token mean
+                    #    instead of predicting an independent randomly-paired Condition B.
+                    # 2. cond_proj (c_b from Condition B) aligns with Condition B's target carrier H_tgt_c,
+                    #    restoring non-zero gradient flow to cond_proj.
+                    cond_a_target = tokens_a.mean(dim=1).detach()  # [B, D]
+                    cond_b_target = H_tgt_c.mean(dim=1).detach()   # [B, D_c]
+                    zc_cond_loss = F.mse_loss(zc_pred, cond_a_target) + F.mse_loss(
+                        c_b.squeeze(1)[..., :D_c], cond_b_target
+                    )
+                else:
+                    zc_cond_loss = F.mse_loss(zc_pred, c_b.squeeze(1).detach())
             else:
                 zc_cond_loss = torch.tensor(0.0, device=device)
 

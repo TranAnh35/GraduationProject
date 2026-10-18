@@ -81,6 +81,8 @@ def parse_args():
     parser.add_argument("--scan_centered_inv", type=lambda v: v.lower() == "true", default=False, help="Center z_s before cosine L_inv to eliminate LayerNorm DC bias needle")
     parser.add_argument("--patch_energy_norm", type=lambda v: v.lower() == "true", default=False, help="Normalize temporal amplitude by shared 25-probe patch std (dim=(-2,-1)) instead of per-probe (dim=-1)")
     parser.add_argument("--median_patch_energy", type=lambda v: v.lower() == "true", default=False, help="Keep per-probe unit-variance x_norm while normalizing amplitude/spectral anchors by 25-probe median std")
+    parser.add_argument("--clean_phasor_token", type=lambda v: v.lower() == "true", default=False, help="Canonical peak-polarity alignment + 5 diffusion energy quantiles + root-saliency complex phasors (fixes FM16 & FM18)")
+    parser.add_argument("--subspace_norm", type=lambda v: v.lower() == "true", default=False, help="Independent LayerNorm(D_c) and bias-free LayerNorm(D_s, bias=False) on [z_c, z_s] (fixes FM17 & FM8)")
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
@@ -140,6 +142,8 @@ def main():
         scan_centered_inv=args.scan_centered_inv,
         patch_energy_norm=args.patch_energy_norm,
         median_patch_energy=args.median_patch_energy,
+        clean_phasor_token=args.clean_phasor_token,
+        subspace_norm=args.subspace_norm,
         relative_target=args.relative_target,
         use_condition_token=args.use_condition_token,
         condition_modulation=args.condition_modulation,

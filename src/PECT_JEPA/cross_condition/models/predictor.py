@@ -156,7 +156,19 @@ class CrossConditionPredictor(nn.Module):
             )
             for _ in range(config.predictor_depth)
         ])
-        self.norm = nn.LayerNorm(config.embed_dim)
+        self.subspace_norm = bool(getattr(config, "subspace_norm", False)) and bool(
+            getattr(config, "latent_disentanglement", False)
+        )
+        if self.subspace_norm:
+            self.carrier_dim = int(getattr(config, "carrier_dim", config.embed_dim // 2))
+            self.scattering_dim = int(getattr(config, "scattering_dim", config.embed_dim - self.carrier_dim))
+            self.norm = None
+            self.norm_c = nn.LayerNorm(self.carrier_dim)
+            self.norm_s = nn.LayerNorm(self.scattering_dim, bias=False)
+        else:
+            self.norm = nn.LayerNorm(config.embed_dim)
+            self.norm_c = None
+            self.norm_s = None
 
     def forward(
         self,
@@ -192,4 +204,8 @@ class CrossConditionPredictor(nn.Module):
         for blk in self.blocks:
             q = blk(target_queries=q, H_context=H_context_kv, condition_vec=cond_for_block)
 
+        if self.subspace_norm:
+            q_c = self.norm_c(q[..., :self.carrier_dim])
+            q_s = self.norm_s(q[..., self.carrier_dim:])
+            return torch.cat([q_c, q_s], dim=-1)
         return self.norm(q)

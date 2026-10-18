@@ -39,6 +39,8 @@ class CrossConditionConfig:
     scan_centered_inv: bool = False       # If True, subtracts scan/batch mean before cosine L_inv (kills LN_bias needle bypass)
     patch_energy_norm: bool = False       # If True (or tokenizer_type='patch_energy_adaptive'), normalizes temporal amplitude by shared 25-probe patch std (dim=(-2,-1)) instead of per-probe (dim=-1), preserving within-patch spatial contrast (fixes FM11)
     median_patch_energy: bool = False     # If True, keeps per-probe unit-variance x_norm for waveform shape while normalizing amplitude/spectral anchors (v_pp, energy_t, mag) by robust 25-probe median std (fixes FM11 without FM13 outer-ring coupling)
+    clean_phasor_token: bool = False      # If True, uses canonical peak-polarity alignment + 5 diffusion energy arrival quantiles + root-saliency complex phasors (eliminates FM16 stopband +-pi phase-wrap noise and FM18 TMR polarity inversion)
+    subspace_norm: bool = False           # If True, normalizes [z_c, z_s] with independent LayerNorm(D_c) and bias-free LayerNorm(D_s, bias=False) instead of shared LayerNorm(D) (eliminates FM17 z_s variance starvation and FM8 DC needle)
     use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
     condition_modulation: str = "none"  # 'query_projection', 'cross_attention', 'adaln', 'additive', 'none'
     tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'patch_energy_adaptive', 'waveform_invariant'
