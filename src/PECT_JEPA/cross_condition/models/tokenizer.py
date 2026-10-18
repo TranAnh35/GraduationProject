@@ -43,6 +43,8 @@ class DualDomainTokenizer(nn.Module):
         )
         self.median_patch_energy = bool(getattr(config, "median_patch_energy", False))
         self.clean_phasor_token = bool(getattr(config, "clean_phasor_token", False))
+        self.relative_energy_anchor = bool(getattr(config, "relative_energy_anchor", False))
+        self.patch_polarity_align = bool(getattr(config, "patch_polarity_align", False))
 
         self.time_dim = config.embed_dim // 2
         self.freq_dim = config.embed_dim - self.time_dim
@@ -52,8 +54,9 @@ class DualDomainTokenizer(nn.Module):
             # x_aligned [C] + t_peak [1] + V_pp [1] + energy [1] + 5 diffusion arrival quantiles [5] = C + 8
             self.time_proj = nn.Linear(self.temporal_samples + 8, self.time_dim)
         elif self.tokenizer_type in ("energy_adaptive", "patch_energy_adaptive"):
-            # x_norm [C] + peak_time [1] + V_pp [1] + energy [1] = C + 3
-            self.time_proj = nn.Linear(self.temporal_samples + 3, self.time_dim)
+            # x_norm [C] + peak_time [1] + V_pp [1] + energy [1] (+ rel_energy [1] if relative_energy_anchor)
+            extra_time = 4 if self.relative_energy_anchor else 3
+            self.time_proj = nn.Linear(self.temporal_samples + extra_time, self.time_dim)
         elif self.tokenizer_type == "waveform_invariant":
             # x_shape [C] + log_energy [1] + t_peak [1] = C + 2
             self.time_proj = nn.Linear(self.temporal_samples + 2, self.time_dim)
@@ -227,15 +230,35 @@ class DualDomainTokenizer(nn.Module):
                 std_t = x_flat.std(dim=-1, keepdim=True) + 1e-6
                 x_norm = (x_flat - mean_t) / std_t
 
+                if self.patch_polarity_align:
+                    # Determine patch-wide polarity from center probe 0 dominant peak
+                    idx_p0 = torch.argmax(torch.abs(x_norm[:, 0:1, :]), dim=-1, keepdim=True)  # [B, 1, 1]
+                    val_p0 = torch.gather(x_norm[:, 0:1, :], -1, idx_p0)  # [B, 1, 1]
+                    sign_patch = torch.where(val_p0 >= 0, torch.ones_like(val_p0), -torch.ones_like(val_p0))  # [B, 1, 1]
+                    x_norm = x_norm * sign_patch
+                    x_flat_aligned = x_flat * sign_patch
+                else:
+                    sign_patch = None
+                    x_flat_aligned = x_flat
+
                 # Transient physical anchors (waveform-agnostic)
                 t_peak = torch.argmax(torch.abs(x_norm), dim=-1, keepdim=True).float() / float(C)
-                v_max = x_flat.max(dim=-1, keepdim=True).values
-                v_min = x_flat.min(dim=-1, keepdim=True).values
+                v_max = x_flat_aligned.max(dim=-1, keepdim=True).values
+                v_min = x_flat_aligned.min(dim=-1, keepdim=True).values
                 v_pp = torch.log1p(torch.clamp(v_max - v_min, min=0.0))
-                energy_t = torch.log1p(torch.mean(x_flat ** 2, dim=-1, keepdim=True))
-                x_fp32 = x_flat.float()
+                energy_t = torch.log1p(torch.mean(x_flat_aligned ** 2, dim=-1, keepdim=True))
+                x_fp32 = x_flat_aligned.float()
 
-            time_feat = torch.cat([x_norm, t_peak, v_pp, energy_t], dim=-1)
+                if self.relative_energy_anchor:
+                    # Decoupled spatial energy contrast (fixes FM11 on Rivet_v2 without FM13/FM14):
+                    # Relative probe energy compared to surrounding context probes (probes 1..24)
+                    e_probe = std_t ** 2  # [B, 25, 1]
+                    e_context = e_probe[:, 1:, :].mean(dim=1, keepdim=True) + 1e-8  # [B, 1, 1]
+                    rel_energy = torch.log1p(e_probe) - torch.log1p(e_context)  # [B, 25, 1]
+                    time_feat = torch.cat([x_norm, t_peak, v_pp, energy_t, rel_energy], dim=-1)
+                else:
+                    time_feat = torch.cat([x_norm, t_peak, v_pp, energy_t], dim=-1)
+
             z_time = self.time_proj(time_feat)  # [B, 25, time_dim]
 
             # --- 2. Spectral domain branch with energy-weighted Dodd-Deeds gating ---

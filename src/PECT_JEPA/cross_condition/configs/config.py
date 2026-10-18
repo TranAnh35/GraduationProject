@@ -41,6 +41,8 @@ class CrossConditionConfig:
     median_patch_energy: bool = False     # If True, keeps per-probe unit-variance x_norm for waveform shape while normalizing amplitude/spectral anchors (v_pp, energy_t, mag) by robust 25-probe median std (fixes FM11 without FM13 outer-ring coupling)
     clean_phasor_token: bool = False      # If True, uses canonical peak-polarity alignment + 5 diffusion energy arrival quantiles + root-saliency complex phasors (eliminates FM16 stopband +-pi phase-wrap noise and FM18 TMR polarity inversion)
     subspace_norm: bool = False           # If True, normalizes [z_c, z_s] with independent LayerNorm(D_c) and bias-free LayerNorm(D_s, bias=False) instead of shared LayerNorm(D) (eliminates FM17 z_s variance starvation and FM8 DC needle)
+    relative_energy_anchor: bool = False  # If True, appends spatial energy ratio log(1 + E_i) - log(1 + E_context) to time branch without outer-ring boundary coupling (fixes FM11 on Rivet_v2 & Sizing without FM13/FM14)
+    patch_polarity_align: bool = False    # If True, aligns patch polarity using center probe 0 dominant peak without checkerboard flips or root-saliency spectral starvation (resolves TMR polarity while preserving broadband Dodd-Deeds phase)
     use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
     condition_modulation: str = "none"  # 'query_projection', 'cross_attention', 'adaln', 'additive', 'none'
     tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'patch_energy_adaptive', 'waveform_invariant'

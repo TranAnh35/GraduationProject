@@ -83,6 +83,8 @@ def parse_args():
     parser.add_argument("--median_patch_energy", type=lambda v: v.lower() == "true", default=False, help="Keep per-probe unit-variance x_norm while normalizing amplitude/spectral anchors by 25-probe median std")
     parser.add_argument("--clean_phasor_token", type=lambda v: v.lower() == "true", default=False, help="Canonical peak-polarity alignment + 5 diffusion energy quantiles + root-saliency complex phasors (fixes FM16 & FM18)")
     parser.add_argument("--subspace_norm", type=lambda v: v.lower() == "true", default=False, help="Independent LayerNorm(D_c) and bias-free LayerNorm(D_s, bias=False) on [z_c, z_s] (fixes FM17 & FM8)")
+    parser.add_argument("--relative_energy_anchor", type=lambda v: v.lower() == "true", default=False, help="Append spatial energy ratio log(1 + E_i) - log(1 + E_context) to time branch (fixes FM11 on Rivet_v2 without FM13/FM14)")
+    parser.add_argument("--patch_polarity_align", type=lambda v: v.lower() == "true", default=False, help="Align patch polarity using center probe 0 dominant peak (fixes TMR polarity without FM18 spectral starvation)")
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
@@ -144,6 +146,8 @@ def main():
         median_patch_energy=args.median_patch_energy,
         clean_phasor_token=args.clean_phasor_token,
         subspace_norm=args.subspace_norm,
+        relative_energy_anchor=args.relative_energy_anchor,
+        patch_polarity_align=args.patch_polarity_align,
         relative_target=args.relative_target,
         use_condition_token=args.use_condition_token,
         condition_modulation=args.condition_modulation,
