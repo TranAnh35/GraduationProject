@@ -242,12 +242,18 @@ class CrossConditionJEPA(nn.Module):
         tgt_tokens_b = tokens_b[batch_arange, tgt_idx]  # [B, 9, D]
         tgt_pos_b = pos_b[batch_arange, tgt_idx]
 
+        # Extract 2D probe coordinates for Green's diffusion attention
+        diff_attn = bool(getattr(self.config, "diffusion_attention", False))
+        norm_coords_all = self.tokenizer.norm_coords.expand(B, -1, -1)  # [B, 25, 2]
+        ctx_coords_a = norm_coords_all[batch_arange, ctx_idx] if diff_attn else None
+        tgt_coords_b = norm_coords_all[batch_arange, tgt_idx] if diff_attn else None
+
         # 4. Context Encoder encodes visible context from Condition A
-        H_ctx_a = self.context_encoder(ctx_tokens_a, ctx_pos_a)  # [B, 16, D]
+        H_ctx_a = self.context_encoder(ctx_tokens_a, ctx_pos_a, coords=ctx_coords_a)  # [B, 16, D]
 
         # 5. Target Encoder encodes masked core from Condition B (stop-gradient)
         with torch.no_grad():
-            H_tgt_b = self.target_encoder(tgt_tokens_b, tgt_pos_b)  # [B, 9, D]
+            H_tgt_b = self.target_encoder(tgt_tokens_b, tgt_pos_b, coords=tgt_coords_b)  # [B, 9, D]
 
         # Target relative perturbation: Delta H_tgt = H_tgt - c_b
         use_relative = getattr(self.config, "relative_target", True)
@@ -275,16 +281,51 @@ class CrossConditionJEPA(nn.Module):
             H_tgt_c = target_signal[..., :D_c]  # [B, 9, D_c]
             H_tgt_s = target_signal[..., D_c:]  # [B, 9, D_s]
 
-            # A) Scattering Prediction: Predict z_s WITHOUT condition token (unconditioned mapping)
+            # A) Scattering Prediction
             # If predictor_scattering_only=True, zero out H_ctx_c before predictor so predictor
             # cannot use Condition A's carrier subspace as a domain-translation shortcut.
             if getattr(self.config, "predictor_scattering_only", False):
                 H_ctx_for_pred = torch.cat([torch.zeros_like(H_ctx_c), H_ctx_s], dim=-1)
             else:
                 H_ctx_for_pred = H_ctx_a
-            H_pred_b = self.predictor(H_ctx_for_pred, tgt_pos_b, condition_token=None)  # [B, 9, D]
-            H_pred_s = H_pred_b[..., D_c:]
-            pred_loss = F.l1_loss(H_pred_s, H_tgt_s)
+
+            if getattr(self.config, "grounded_condition_pred", False):
+                # Direction C: Grounded Condition Transfer Function Prediction
+                # Normalize c_b to unit sphere: extracts condition transfer orientation/angle
+                # without passing DC magnitude (blocks identity shortcut and instant collapse!)
+                cond_in = F.normalize(c_b, p=2.0, dim=-1) if c_b is not None else None
+                H_pred_b = self.predictor(
+                    H_ctx_for_pred,
+                    tgt_pos_b,
+                    condition_token=cond_in,
+                    tgt_coords=tgt_coords_b,
+                    ctx_coords=ctx_coords_a,
+                )
+                H_pred_s = H_pred_b[..., D_c:]
+                pred_cos = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1).mean()
+                h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
+                h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
+                pred_shape = F.l1_loss(h_pred_norm, h_tgt_norm)
+                pred_loss = pred_cos + pred_shape
+            else:
+                H_pred_b = self.predictor(
+                    H_ctx_for_pred,
+                    tgt_pos_b,
+                    condition_token=None,
+                    tgt_coords=tgt_coords_b,
+                    ctx_coords=ctx_coords_a,
+                )
+                H_pred_s = H_pred_b[..., D_c:]
+                pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
+                if pred_loss_type == "smooth_l1":
+                    pred_loss = F.smooth_l1_loss(H_pred_s, H_tgt_s)
+                elif pred_loss_type == "cosine_normalized_l1":
+                    pred_cos = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1).mean()
+                    h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
+                    h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
+                    pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
+                else:
+                    pred_loss = F.l1_loss(H_pred_s, H_tgt_s)
 
             # B) Spatial Flatness on Carrier z_c: In a local 5x5 patch and across the scan, z_c should be spatially flat
             # Penalize variance across the 16 context probes for each patch
@@ -331,7 +372,7 @@ class CrossConditionJEPA(nn.Module):
                 with torch.no_grad():
                     ctx_tokens_b = tokens_b[batch_arange, ctx_idx]  # [B, 16, D]
                     ctx_pos_b = pos_b[batch_arange, ctx_idx]
-                    H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b)  # [B, 16, D]
+                    H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b, coords=ctx_coords_a)  # [B, 16, D]
                 H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, N_ctx, D_s] fixed target
                 H_inv_online = self.inv_head(H_ctx_s) if self.inv_head is not None else H_ctx_s
 
@@ -456,8 +497,29 @@ class CrossConditionJEPA(nn.Module):
             )
         else:
             # Standard single-space prediction
-            H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, c_b)  # [B, 9, D]
-            pred_loss = F.l1_loss(H_pred_b, target_signal)
+            diff_attn = bool(getattr(self.config, "diffusion_attention", False))
+            if getattr(self.config, "grounded_condition_pred", False):
+                cond_in = F.normalize(c_b, p=2.0, dim=-1) if c_b is not None else None
+                H_pred_b = self.predictor(
+                    H_ctx_a,
+                    tgt_pos_b,
+                    condition_token=cond_in,
+                    tgt_coords=tgt_coords_b if diff_attn else None,
+                    ctx_coords=ctx_coords_a if diff_attn else None,
+                )
+                pred_cos = 1.0 - F.cosine_similarity(H_pred_b, target_signal, dim=-1).mean()
+                h_pred_norm = F.normalize(H_pred_b, p=2.0, dim=-1)
+                h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
+                pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
+            else:
+                H_pred_b = self.predictor(
+                    H_ctx_a,
+                    tgt_pos_b,
+                    condition_token=c_b,
+                    tgt_coords=tgt_coords_b if diff_attn else None,
+                    ctx_coords=ctx_coords_a if diff_attn else None,
+                )
+                pred_loss = F.l1_loss(H_pred_b, target_signal)
 
             flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
             if self.config.var_weight > 0 or self.config.cov_weight > 0:
@@ -525,7 +587,9 @@ class CrossConditionJEPA(nn.Module):
         Default: Concatenated [B, 2*D] vector [h_center, h_context_pool].
         """
         tokens, pos = self.tokenizer(x)  # [B, 25, D]
-        h_all = self.context_encoder(tokens, pos)  # [B, 25, D]
+        diff_attn = bool(getattr(self.config, "diffusion_attention", False))
+        coords = self.tokenizer.norm_coords.expand(tokens.shape[0], -1, -1) if diff_attn else None
+        h_all = self.context_encoder(tokens, pos, coords=coords)  # [B, 25, D]
 
         if getattr(self.config, "latent_disentanglement", False):
             D_c = getattr(self.config, "carrier_dim", self.config.embed_dim // 2)

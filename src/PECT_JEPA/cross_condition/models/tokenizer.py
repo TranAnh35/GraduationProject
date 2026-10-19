@@ -94,15 +94,17 @@ class DualDomainTokenizer(nn.Module):
         #   normalized physical probe offsets (dr/r_max, dc/r_max) in [-1, 1]^2 to R^D.
         # - Legacy (continuous_pos_embed=False): Discrete [1, 25, D] parameter table.
         self.continuous_pos_embed = bool(getattr(config, "continuous_pos_embed", False))
+        # Always precalculate normalized 2D physical coordinates in [-1, 1]^2 for Green's diffusion attention
+        offsets = get_spatial_topology_offsets(
+            topology=getattr(config, "spatial_topology", "concentric_star"),
+            star_radii=tuple(getattr(config, "star_radii", (1, 3, 7))),
+            grid_size=getattr(config, "grid_size", 5),
+        )
+        max_r = float(max(1.0, float(abs(offsets).max())))
+        norm_coords = torch.tensor(offsets, dtype=torch.float32).unsqueeze(0) / max_r  # [1, 25, 2]
+        self.register_buffer("norm_coords", norm_coords, persistent=False)
+
         if self.continuous_pos_embed:
-            offsets = get_spatial_topology_offsets(
-                topology=getattr(config, "spatial_topology", "concentric_star"),
-                star_radii=tuple(getattr(config, "star_radii", (1, 3, 7))),
-                grid_size=getattr(config, "grid_size", 5),
-            )
-            max_r = float(max(1.0, float(abs(offsets).max())))
-            norm_coords = torch.tensor(offsets, dtype=torch.float32).unsqueeze(0) / max_r  # [1, 25, 2]
-            self.register_buffer("norm_coords", norm_coords, persistent=False)
             self.pos_mlp = nn.Sequential(
                 nn.Linear(2, config.embed_dim),
                 nn.GELU(),

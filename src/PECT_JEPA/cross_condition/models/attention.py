@@ -134,26 +134,40 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN Transformer Block."""
+    """Pre-LN Transformer Block with optional physically-grounded Green's diffusion distance bias."""
     def __init__(
         self,
         embed_dim: int = 64,
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        diffusion_attention: bool = False,
     ):
         super().__init__()
+        self.num_heads = num_heads
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = MultiheadSelfAttention(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp = MLP(in_features=embed_dim, hidden_features=int(embed_dim * mlp_ratio), dropout=dropout)
+        self.diffusion_attention = diffusion_attention
+        if self.diffusion_attention:
+            # Learnable log decay rate gamma_h per attention head (strictly positive via exp)
+            self.gamma_log = nn.Parameter(torch.zeros(num_heads))
 
     def forward(
         self,
         x: torch.Tensor,
         return_attention: bool = False,
         attn_bias: Optional[torch.Tensor] = None,
+        coords: Optional[torch.Tensor] = None,
     ):
+        if self.diffusion_attention and coords is not None:
+            # coords: [B, N, 2] in [-1, 1]^2
+            dist_sq = torch.cdist(coords, coords, p=2.0) ** 2  # [B, N, N]
+            gamma = torch.exp(self.gamma_log).view(1, self.num_heads, 1, 1)  # [1, H, 1, 1]
+            diff_bias = -gamma * dist_sq.unsqueeze(1)  # [B, H, N, N]
+            attn_bias = (attn_bias + diff_bias) if attn_bias is not None else diff_bias
+
         if return_attention:
             attn_out, attn_weights = self.attn(self.norm1(x), return_attention=True, attn_bias=attn_bias)
             x = x + attn_out
