@@ -66,6 +66,7 @@ from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
     plot_cscan_anomaly_map,
     plot_sizing_calibration,
     plot_defect_contours_and_iou,
+    plot_uda_summary_map,
 )
 
 
@@ -252,10 +253,21 @@ def main():
         "anomaly": os.path.join(out_dir, "1_Anomaly_Detection"),
         "sizing": os.path.join(out_dir, "2_Defect_Sizing"),
         "segmentation": os.path.join(out_dir, "3_Segmentation_IoU"),
+        "domain_adaptation": os.path.join(out_dir, "4. Domain Adaptation"),
     }
-    for tdir in task_dirs.values():
+    for tname, tdir in task_dirs.items():
+        if tname != "domain_adaptation":
+            for sp in ["train", "val", "test"]:
+                os.makedirs(os.path.join(tdir, sp), exist_ok=True)
+
+    uda_model_names = ["CORAL", "DANN", "DAN", "CDAN", "SHOT"]
+    uda_dirs = {
+        m: os.path.join(task_dirs["domain_adaptation"], m)
+        for m in uda_model_names
+    }
+    for mdir in uda_dirs.values():
         for sp in ["train", "val", "test"]:
-            os.makedirs(os.path.join(tdir, sp), exist_ok=True)
+            os.makedirs(os.path.join(mdir, sp), exist_ok=True)
 
     print("\n" + "=" * 75)
     print("PECT-JEPA Unified Downstream Benchmark Evaluation")
@@ -470,6 +482,10 @@ def main():
         sp: {"anomaly": [], "sizing": [], "segmentation": []}
         for sp in args.eval_splits
     }
+    uda_task_results: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        m: {sp: [] for sp in args.eval_splits}
+        for m in uda_model_names
+    }
 
     for split_name in args.eval_splits:
         split_files = splits.get(split_name, [])
@@ -517,47 +533,60 @@ def main():
             # B) Unsupervised Mahalanobis Distance
             anom_res = suite.compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
 
-            # C) UDA Models (CORAL & DANN)
+            # C) UDA Models (CORAL, DANN, DAN, CDAN, SHOT)
             flat_feats = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
             flat_labels = gt_mask.reshape(-1).astype(np.int64)
             valid = np.where(flat_labels >= 0)[0]
             y_v = flat_labels[valid]
             has_both_classes = len(np.unique(y_v)) > 1
 
+            H, W = latents.shape[0], latents.shape[1]
+            uda_eval_map: Dict[str, Dict[str, Any]] = {}
+
             coral_auc, coral_ap = 0.0, 0.0
             if coral_model is not None:
                 prob_coral = coral_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                prob_coral_map = prob_coral.reshape(H, W)
                 if has_both_classes:
                     coral_auc = float(roc_auc_score(y_v, prob_coral[valid]))
                     coral_ap = float(average_precision_score(y_v, prob_coral[valid]))
+                uda_eval_map["CORAL"] = {"prob_map": prob_coral_map, "auc": coral_auc, "ap": coral_ap}
 
             dann_auc, dann_ap = 0.0, 0.0
             if dann_model is not None:
                 prob_dann = dann_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                prob_dann_map = prob_dann.reshape(H, W)
                 if has_both_classes:
                     dann_auc = float(roc_auc_score(y_v, prob_dann[valid]))
                     dann_ap = float(average_precision_score(y_v, prob_dann[valid]))
+                uda_eval_map["DANN"] = {"prob_map": prob_dann_map, "auc": dann_auc, "ap": dann_ap}
 
             dan_auc, dan_ap = 0.0, 0.0
             if dan_model is not None:
                 prob_dan = dan_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                prob_dan_map = prob_dan.reshape(H, W)
                 if has_both_classes:
                     dan_auc = float(roc_auc_score(y_v, prob_dan[valid]))
                     dan_ap = float(average_precision_score(y_v, prob_dan[valid]))
+                uda_eval_map["DAN"] = {"prob_map": prob_dan_map, "auc": dan_auc, "ap": dan_ap}
 
             cdan_auc, cdan_ap = 0.0, 0.0
             if cdan_model is not None:
                 prob_cdan = cdan_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                prob_cdan_map = prob_cdan.reshape(H, W)
                 if has_both_classes:
                     cdan_auc = float(roc_auc_score(y_v, prob_cdan[valid]))
                     cdan_ap = float(average_precision_score(y_v, prob_cdan[valid]))
+                uda_eval_map["CDAN"] = {"prob_map": prob_cdan_map, "auc": cdan_auc, "ap": cdan_ap}
 
             shot_auc, shot_ap = 0.0, 0.0
             if shot_model is not None:
                 prob_shot = shot_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                prob_shot_map = prob_shot.reshape(H, W)
                 if has_both_classes:
                     shot_auc = float(roc_auc_score(y_v, prob_shot[valid]))
                     shot_ap = float(average_precision_score(y_v, prob_shot[valid]))
+                uda_eval_map["SHOT"] = {"prob_map": prob_shot_map, "auc": shot_auc, "ap": shot_ap}
 
             # TASK 2: Defect Sizing Hurdle Protocol
             sizing_res = {"r2_score": 0.0, "mae_mm": 0.0, "rmse_mm": 0.0, "y_true": np.array([]), "y_pred": np.array([])}
@@ -699,6 +728,49 @@ def main():
                 "recall": iou_res["recall"],
             })
 
+            # 4. Domain Adaptation: Save per-model probability heatmaps & 3-panel comparisons
+            for m_name, m_info in uda_eval_map.items():
+                m_prob = m_info["prob_map"]
+                if m_prob is not None:
+                    m_auc = m_info["auc"]
+                    m_ap = m_info["ap"]
+                    m_split_dir = os.path.join(uda_dirs[m_name], split_name)
+
+                    # A) Standalone Probability Heatmap (cmap='jet', matching linear probe)
+                    uda_prob_path = os.path.join(m_split_dir, f"{bname}_{m_name.lower()}_prob.png")
+                    plot_probability_heatmap(
+                        prob_map=m_prob,
+                        save_path=uda_prob_path,
+                        title=f"{m_name} Adapted P(Defect | z) [{split_name.upper()}]\n{specimen} - {sensor} - {waveform} | AUC: {m_auc:.4f} | AP: {m_ap:.4f}",
+                        cmap="jet",
+                    )
+
+                    # B) 3-Panel Side-by-Side Comparison: Zero-Shot LP vs UDA vs CAD GT
+                    uda_comp_path = os.path.join(m_split_dir, f"{bname}_{m_name.lower()}_comparison.png")
+                    plot_uda_summary_map(
+                        lp_prob_map=prob_map,
+                        uda_prob_map=m_prob,
+                        ground_truth_mask=gt_mask,
+                        model_name=m_name,
+                        file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform} | {liftoff}",
+                        save_path=uda_comp_path,
+                        lp_metrics={"auc": det_res["auc_roc"], "ap": det_res["average_precision"]},
+                        uda_metrics={"auc": m_auc, "ap": m_ap},
+                    )
+
+                    uda_task_results[m_name][split_name].append({
+                        "file": fname,
+                        "specimen": specimen,
+                        "sensor": sensor,
+                        "waveform": waveform,
+                        "liftoff": liftoff,
+                        "auc": m_auc,
+                        "ap": m_ap,
+                        "lp_auc": det_res["auc_roc"],
+                        "lp_ap": det_res["average_precision"],
+                        "delta_auc": round(m_auc - det_res["auc_roc"], 4),
+                    })
+
             pbar.set_postfix({
                 "LP_AUC": f"{det_res['auc_roc']:.4f}",
                 "LP_AP": f"{det_res['average_precision']:.4f}",
@@ -730,6 +802,25 @@ def main():
                         num_summary[f"std_{k}"] = float(np.std(vals))
                 with open(t_json, "w", encoding="utf-8") as f:
                     json.dump({"split": sp, "task": tname, "count": len(trows), "metrics": num_summary}, f, indent=2)
+
+        for m_name in uda_model_names:
+            u_rows = uda_task_results[m_name][sp]
+            if u_rows:
+                u_csv = os.path.join(uda_dirs[m_name], sp, "split_metrics.csv")
+                with open(u_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(u_rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(u_rows)
+
+                u_json = os.path.join(uda_dirs[m_name], sp, "split_summary.json")
+                num_summary = {}
+                for k in ["auc", "ap", "lp_auc", "lp_ap", "delta_auc"]:
+                    vals = [r[k] for r in u_rows if isinstance(r.get(k), (int, float))]
+                    if vals:
+                        num_summary[f"mean_{k}"] = float(np.mean(vals))
+                        num_summary[f"std_{k}"] = float(np.std(vals))
+                with open(u_json, "w", encoding="utf-8") as f:
+                    json.dump({"split": sp, "model": m_name, "count": len(u_rows), "metrics": num_summary}, f, indent=2)
 
     # 7. STEP 4: Save Master Reports
     master_csv = os.path.join(out_dir, "master_benchmark_metrics.csv")

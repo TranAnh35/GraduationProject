@@ -202,6 +202,65 @@ def plot_detection_summary_map(
     plt.close(fig)
 
 
+def plot_uda_summary_map(
+    lp_prob_map: np.ndarray,
+    uda_prob_map: np.ndarray,
+    ground_truth_mask: np.ndarray,
+    model_name: str,
+    file_title: str,
+    save_path: str,
+    lp_metrics: Optional[Dict[str, float]] = None,
+    uda_metrics: Optional[Dict[str, float]] = None,
+    dpi: int = 150,
+) -> None:
+    """
+    Side-by-side 3-panel figure showing:
+    - Panel 1: Baseline Zero-Shot Linear Probe Probability (cmap='jet')
+    - Panel 2: UDA Adapted Probability (cmap='jet')
+    - Panel 3: CAD Ground Truth Mask
+    """
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5), dpi=dpi)
+
+    # 1. Baseline Linear Probe
+    p0 = np.clip(lp_prob_map, 0.0, 1.0)
+    im0 = axes[0].imshow(p0, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    t0 = "Baseline Zero-Shot Linear Probe"
+    if lp_metrics:
+        t0 += f"\nAUC: {lp_metrics.get('auc', 0.0):.4f} | AP: {lp_metrics.get('ap', 0.0):.4f}"
+    axes[0].set_title(t0, fontsize=10, fontweight="bold")
+    axes[0].set_xlabel("X (pixels)")
+    axes[0].set_ylabel("Y (pixels)")
+    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+    # 2. UDA Adapted Model
+    p1 = np.clip(uda_prob_map, 0.0, 1.0)
+    im1 = axes[1].imshow(p1, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    t1 = f"Adapted Model: {model_name}"
+    if uda_metrics:
+        u_auc = uda_metrics.get("auc", 0.0)
+        u_ap = uda_metrics.get("ap", 0.0)
+        diff = u_auc - (lp_metrics.get("auc", 0.0) if lp_metrics else 0.0)
+        diff_str = f"+{diff:.4f}" if diff >= 0 else f"{diff:.4f}"
+        t1 += f"\nAUC: {u_auc:.4f} (Δ {diff_str}) | AP: {u_ap:.4f}"
+    axes[1].set_title(t1, fontsize=10, fontweight="bold")
+    axes[1].set_xlabel("X (pixels)")
+    axes[1].set_ylabel("Y (pixels)")
+    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+    # 3. CAD Ground Truth Mask
+    im2 = axes[2].imshow(ground_truth_mask, cmap="Blues", origin="lower", vmin=0, vmax=1)
+    axes[2].set_title(f"CAD Ground Truth Mask\n{file_title}", fontsize=10, fontweight="bold")
+    axes[2].set_xlabel("X (pixels)")
+    axes[2].set_ylabel("Y (pixels)")
+    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    _safe_savefig(fig, save_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_cscan_anomaly_map(
     anomaly_map: np.ndarray,
     ground_truth_mask: np.ndarray,
