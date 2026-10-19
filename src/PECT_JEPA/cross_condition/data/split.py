@@ -142,3 +142,40 @@ def get_canonical_train_val_test_splits(
         "val": val_files,
         "test": test_files,
     }
+
+
+def get_canonical_shift_files(
+    file_list: List[str],
+    shift_mode: str,
+) -> Tuple[List[str], List[str]]:
+    """
+    Partitions files for a controlled single-variable domain adaptation scenario:
+    - Source Domain (16 files): Entire Base Domain (train + val).
+      [Sensors: Air/Pot, Waveforms: Square/Gauss, Liftoff: z1/z3, Specimens: Corrosion/Rivet_v1].
+    - Target Domain (8 files): Expands ONLY 1 single condition, keeping all other 3 in Base Domain:
+      * 'cross_sensor':   Sensor == 'TMR' (8 files)
+      * 'cross_waveform': Waveform == 'Chirp' (8 files)
+      * 'cross_specimen': Specimen == 'Rivet_v2' (8 files)
+      * 'cross_liftoff':  Liftoff == 'z2' (8 files)
+    """
+    base_files = [fp for fp in file_list if is_base_domain_file(extract_file_metadata(fp))]
+    source_files = sorted(base_files)
+
+    target_files = []
+    for fp in file_list:
+        meta = extract_file_metadata(fp)
+        s, w, z, sp = meta["sensor"], meta["waveform"], meta["liftoff"], meta["specimen"]
+        if shift_mode == "cross_sensor":
+            if s == "TMR" and w in ["Square", "Gaussian"] and z in ["z1", "z3"] and sp in ["Corrosion", "Rivet_v1"]:
+                target_files.append(fp)
+        elif shift_mode == "cross_waveform":
+            if w == "Chirp" and s in ["Hall_Air_Core", "Hall_Pot_Core"] and z in ["z1", "z3"] and sp in ["Corrosion", "Rivet_v1"]:
+                target_files.append(fp)
+        elif shift_mode == "cross_specimen":
+            if sp == "Rivet_v2" and s in ["Hall_Air_Core", "Hall_Pot_Core"] and w in ["Square", "Gaussian"] and z in ["z1", "z3"]:
+                target_files.append(fp)
+        elif shift_mode == "cross_liftoff":
+            if z == "z2" and s in ["Hall_Air_Core", "Hall_Pot_Core"] and w in ["Square", "Gaussian"] and sp in ["Corrosion", "Rivet_v1"]:
+                target_files.append(fp)
+
+    return source_files, sorted(target_files)

@@ -57,7 +57,16 @@ from src.PECT_JEPA.cross_condition.data.preprocessing import (
 from src.PECT_JEPA.cross_condition.data.split import (
     extract_file_metadata,
     get_canonical_train_val_test_splits,
+    get_canonical_shift_files,
+    is_base_domain_file,
 )
+from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.coral import CORALAdapter
+from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dann import DANNModel
+from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dan_mmd import DANModel
+from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.cdan import CDANModel
+from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.shot import SHOTModel
+from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.otda import OTDAModel
+from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.cbst import CBSTModel
 from src.PECT_JEPA.cross_condition.evaluation.cscan_extractor import CScanFeatureExtractor
 from src.PECT_JEPA.cross_condition.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
 from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
@@ -236,6 +245,223 @@ def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int =
             yield fp, cscan
 
 
+def evaluate_canonical_domain_adaptation(
+    downstream_dir: str,
+    out_dir: str,
+    all_files: List[str],
+    gt_masks: Dict[str, Any],
+    cached_latents: Dict[str, np.ndarray],
+    extractor: CScanFeatureExtractor,
+    self_calibration: bool,
+    lr_probe: Any,
+    scaler_det: Any,
+    device: torch.device,
+    in_dim: int,
+) -> Dict[str, Any]:
+    """
+    Evaluates UDA Suite across the 4 canonical single-variable domain shifts:
+    - cross_sensor:   Source (16 Base files) -> Target (8 TMR-only files)
+    - cross_waveform: Source (16 Base files) -> Target (8 Chirp-only files)
+    - cross_specimen: Source (16 Base files) -> Target (8 Rivet_v2-only files)
+    - cross_liftoff:  Source (16 Base files) -> Target (8 z2-only files)
+    
+    Structure:
+      4. Domain Adaptation/<shift>/<MODEL_NAME>/source/
+      4. Domain Adaptation/<shift>/<MODEL_NAME>/target/
+      4. Domain Adaptation/<shift>/uda_summary.csv
+      4. Domain Adaptation/<shift>/uda_summary.json
+    """
+    canonical_shifts = ["cross_sensor", "cross_waveform", "cross_specimen", "cross_liftoff"]
+    shift_results: Dict[str, Any] = {}
+
+    uda_constructors = {
+        "CORAL": (CORALAdapter, "coral_model.pt"),
+        "DANN": (DANNModel, "dann_model.pt"),
+        "DAN": (DANModel, "dan_model.pt"),
+        "CDAN": (CDANModel, "cdan_model.pt"),
+        "SHOT": (SHOTModel, "shot_model.pt"),
+        "OTDA": (OTDAModel, "otda_model.pt"),
+        "CBST": (CBSTModel, "cbst_model.pt"),
+    }
+
+    print("\n" + "=" * 75)
+    print("STEP 4: Canonical Domain Adaptation Benchmark (Single-Variable Controlled Shifts)")
+    print("=" * 75, flush=True)
+
+    for shift in canonical_shifts:
+        shift_dir = os.path.join(downstream_dir, shift)
+        if not os.path.isdir(shift_dir):
+            shift_dir = downstream_dir
+
+        loaded_models: Dict[str, Any] = {}
+        for m_name, (cls, weight_file) in uda_constructors.items():
+            w_path = os.path.join(shift_dir, weight_file)
+            if os.path.exists(w_path):
+                try:
+                    m = cls(in_dim=in_dim, hidden_dim=64).to(device)
+                    m.load_state_dict(torch.load(w_path, map_location=device, weights_only=True))
+                    m.eval()
+                    loaded_models[m_name] = m
+                except Exception as e:
+                    print(f"    [WARN] Failed to load {m_name} from {w_path}: {e}")
+
+        if not loaded_models:
+            continue
+
+        src_files, tgt_files = get_canonical_shift_files(all_files, shift)
+        shift_out_dir = os.path.join(out_dir, "4. Domain Adaptation", shift)
+        for m_name in loaded_models:
+            os.makedirs(os.path.join(shift_out_dir, m_name, "source"), exist_ok=True)
+            os.makedirs(os.path.join(shift_out_dir, m_name, "target"), exist_ok=True)
+
+        print("\n" + "-" * 75)
+        print(f"Evaluating Canonical Shift [{shift.upper()}]: {len(loaded_models)} Models Loaded")
+        print(f"  Source Domain: {len(src_files)} Base files | Target Domain: {len(tgt_files)} Single-Shift files")
+        print("-" * 75, flush=True)
+
+        shift_rows: List[Dict[str, Any]] = []
+
+        for set_name, f_list in [("source", src_files), ("target", tgt_files)]:
+            for fp in f_list:
+                fname = os.path.basename(fp)
+                bname = os.path.splitext(fname)[0]
+                meta = extract_file_metadata(fp)
+                sp = meta["specimen"]
+                if sp not in gt_masks:
+                    continue
+                gt_mask = gt_masks[sp]["mask"]
+                valid = np.where(gt_mask.reshape(-1) >= 0)[0]
+                has_both = len(np.unique(gt_mask.reshape(-1)[valid])) > 1
+
+                # Retrieve or extract latents
+                if fp in cached_latents:
+                    latents = cached_latents[fp]
+                else:
+                    cscan = load_canonical_cscan_from_tdms(fp)
+                    latents = extractor.extract_full_cscan(cscan, self_calibrate=self_calibration)
+                    cached_latents[fp] = latents
+
+                H, W = latents.shape[0], latents.shape[1]
+                flat_feats = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
+
+                # Linear Probe baseline prediction
+                lp_prob = None
+                lp_auc, lp_ap = 0.0, 0.0
+                if lr_probe is not None and scaler_det is not None:
+                    flat_scaled = scaler_det.transform(flat_feats)
+                    lp_prob = lr_probe.predict_proba(flat_scaled)[:, 1]
+                    if has_both:
+                        lp_auc = float(roc_auc_score(gt_mask.reshape(-1)[valid], lp_prob[valid]))
+                        lp_ap = float(average_precision_score(gt_mask.reshape(-1)[valid], lp_prob[valid]))
+                lp_prob_map = lp_prob.reshape(H, W) if lp_prob is not None else np.zeros((H, W), dtype=np.float32)
+
+                # Evaluate each UDA model
+                for m_name, m_net in loaded_models.items():
+                    prob = m_net.predict_proba(flat_feats, device=str(device))
+                    prob_map = prob.reshape(H, W)
+                    m_auc, m_ap = 0.0, 0.0
+                    if has_both:
+                        m_auc = float(roc_auc_score(gt_mask.reshape(-1)[valid], prob[valid]))
+                        m_ap = float(average_precision_score(gt_mask.reshape(-1)[valid], prob[valid]))
+
+                    # Save visualizations
+                    save_dir = os.path.join(shift_out_dir, m_name, set_name)
+                    prob_path = os.path.join(save_dir, f"{bname}_{m_name.lower()}_prob.png")
+                    plot_probability_heatmap(
+                        prob_map=prob_map,
+                        save_path=prob_path,
+                        title=f"{m_name} [{shift.upper()} | {set_name.upper()}]\n{sp} - {meta['sensor']} - {meta['waveform']} | AUC: {m_auc:.4f} | AP: {m_ap:.4f}",
+                        cmap="jet",
+                    )
+
+                    comp_path = os.path.join(save_dir, f"{bname}_{m_name.lower()}_comparison.png")
+                    plot_uda_summary_map(
+                        lp_prob_map=lp_prob_map,
+                        uda_prob_map=prob_map,
+                        ground_truth_mask=gt_mask,
+                        model_name=m_name,
+                        file_title=f"[{shift.upper()} | {set_name.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
+                        save_path=comp_path,
+                        lp_metrics={"auc": lp_auc, "ap": lp_ap},
+                        uda_metrics={"auc": m_auc, "ap": m_ap},
+                    )
+
+                    shift_rows.append({
+                        "shift": shift,
+                        "domain_set": set_name,
+                        "model": m_name,
+                        "file": fname,
+                        "specimen": sp,
+                        "sensor": meta["sensor"],
+                        "waveform": meta["waveform"],
+                        "liftoff": meta["liftoff"],
+                        "auc": round(m_auc, 4),
+                        "ap": round(m_ap, 4),
+                        "lp_auc": round(lp_auc, 4),
+                        "lp_ap": round(lp_ap, 4),
+                        "delta_auc": round(m_auc - lp_auc, 4),
+                    })
+
+        # Save Shift CSV & Summary
+        if shift_rows:
+            csv_path = os.path.join(shift_out_dir, "uda_summary.csv")
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(shift_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(shift_rows)
+
+            shift_summary: Dict[str, Any] = {"shift": shift, "models": {}}
+            for m_name in loaded_models:
+                shift_summary["models"][m_name] = {}
+                for s_name in ["source", "target"]:
+                    rows = [r for r in shift_rows if r["model"] == m_name and r["domain_set"] == s_name]
+                    aucs = [r["auc"] for r in rows]
+                    aps = [r["ap"] for r in rows]
+                    lp_aucs = [r["lp_auc"] for r in rows]
+                    deltas = [r["delta_auc"] for r in rows]
+                    shift_summary["models"][m_name][s_name] = {
+                        "count": len(rows),
+                        "auc_mean": float(np.mean(aucs)) if aucs else 0.0,
+                        "auc_std": float(np.std(aucs)) if aucs else 0.0,
+                        "ap_mean": float(np.mean(aps)) if aps else 0.0,
+                        "lp_auc_mean": float(np.mean(lp_aucs)) if lp_aucs else 0.0,
+                        "delta_auc_mean": float(np.mean(deltas)) if deltas else 0.0,
+                    }
+
+            json_path = os.path.join(shift_out_dir, "uda_summary.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(shift_summary, f, indent=2)
+
+            # Print Console Summary Table
+            tgt_rows = [r for r in shift_rows if r["domain_set"] == "target"]
+            lp_tgt_mean = np.mean([r["lp_auc"] for r in tgt_rows if r["model"] == list(loaded_models.keys())[0]]) if tgt_rows else 0.0
+            lp_tgt_ap = np.mean([r["lp_ap"] for r in tgt_rows if r["model"] == list(loaded_models.keys())[0]]) if tgt_rows else 0.0
+
+            src_rows = [r for r in shift_rows if r["domain_set"] == "source"]
+            lp_src_mean = np.mean([r["lp_auc"] for r in src_rows if r["model"] == list(loaded_models.keys())[0]]) if src_rows else 0.0
+
+            print("\n" + "=" * 90)
+            print(f"CANONICAL UDA BENCHMARK SUMMARY: [{shift.upper()}]")
+            print(f"  Source Domain: {len(src_files)} files (Train/Val Pool) | Target Domain: {len(tgt_files)} files (1-Variable Shift)")
+            print("=" * 90)
+            print(f"{'Model / Method':<24} | {'Source AUC (Retention)':<22} | {'Target AUC (Adaptation)':<23} | {'Target AP':<9} | {'Δ AUC vs LP':<12}")
+            print("-" * 90)
+            print(f"{'Linear Probe (Zero-Shot)':<24} | {lp_src_mean:<22.4f} | {lp_tgt_mean:<23.4f} | {lp_tgt_ap:<9.4f} | {'baseline':<12}")
+            for m_name in loaded_models:
+                m_src = shift_summary["models"][m_name]["source"]["auc_mean"]
+                m_tgt = shift_summary["models"][m_name]["target"]["auc_mean"]
+                m_tgt_std = shift_summary["models"][m_name]["target"]["auc_std"]
+                m_ap = shift_summary["models"][m_name]["target"]["ap_mean"]
+                delta = shift_summary["models"][m_name]["target"]["delta_auc_mean"]
+                sign = "+" if delta >= 0 else ""
+                print(f"{m_name:<24} | {m_src:<22.4f} | {m_tgt:.4f} ± {m_tgt_std:<15.4f} | {m_ap:<9.4f} | {sign}{delta:<11.4f}")
+            print("=" * 90 + "\n", flush=True)
+
+            shift_results[shift] = shift_summary
+
+    return shift_results
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
@@ -253,21 +479,10 @@ def main():
         "anomaly": os.path.join(out_dir, "1_Anomaly_Detection"),
         "sizing": os.path.join(out_dir, "2_Defect_Sizing"),
         "segmentation": os.path.join(out_dir, "3_Segmentation_IoU"),
-        "domain_adaptation": os.path.join(out_dir, "4. Domain Adaptation"),
     }
     for tname, tdir in task_dirs.items():
-        if tname != "domain_adaptation":
-            for sp in ["train", "val", "test"]:
-                os.makedirs(os.path.join(tdir, sp), exist_ok=True)
-
-    uda_model_names = ["CORAL", "DANN", "DAN", "CDAN", "SHOT"]
-    uda_dirs = {
-        m: os.path.join(task_dirs["domain_adaptation"], m)
-        for m in uda_model_names
-    }
-    for mdir in uda_dirs.values():
         for sp in ["train", "val", "test"]:
-            os.makedirs(os.path.join(mdir, sp), exist_ok=True)
+            os.makedirs(os.path.join(tdir, sp), exist_ok=True)
 
     print("\n" + "=" * 75)
     print("PECT-JEPA Unified Downstream Benchmark Evaluation")
@@ -335,9 +550,7 @@ def main():
                 break
 
     global_readouts = None
-    coral_model = None
-    dann_model = None
-    cached_train_latents: Dict[str, np.ndarray] = {}
+    cached_all_latents: Dict[str, np.ndarray] = {}
     train_energies: List[float] = []
 
     if downstream_dir is not None and os.path.exists(os.path.join(downstream_dir, "standard_probes.joblib")):
@@ -355,54 +568,8 @@ def main():
             global_readouts["ridge_size"] = size_bundle.ridge_regressor
             global_readouts["mlp_size"] = size_bundle.mlp_regressor
 
-        # Load UDA models if available
-        in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
-
-        coral_path = os.path.join(downstream_dir, "coral_model.pt")
-        if os.path.exists(coral_path):
-            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.coral import CORALAdapter
-            coral_model = CORALAdapter(in_dim=in_dim, hidden_dim=64).to(device)
-            coral_model.load_state_dict(torch.load(coral_path, map_location=device, weights_only=True))
-            coral_model.eval()
-            print("  [INFO] Loaded pre-trained CORAL UDA model!")
-
-        dann_path = os.path.join(downstream_dir, "dann_model.pt")
-        if os.path.exists(dann_path):
-            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dann import DANNModel
-            dann_model = DANNModel(in_dim=in_dim, hidden_dim=64).to(device)
-            dann_model.load_state_dict(torch.load(dann_path, map_location=device, weights_only=True))
-            dann_model.eval()
-            print("  [INFO] Loaded pre-trained DANN UDA model!")
-
-        dan_model = None
-        dan_path = os.path.join(downstream_dir, "dan_model.pt")
-        if os.path.exists(dan_path):
-            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dan_mmd import DANModel
-            dan_model = DANModel(in_dim=in_dim, hidden_dim=64).to(device)
-            dan_model.load_state_dict(torch.load(dan_path, map_location=device, weights_only=True))
-            dan_model.eval()
-            print("  [INFO] Loaded pre-trained DAN (MK-MMD) UDA model!")
-
-        cdan_model = None
-        cdan_path = os.path.join(downstream_dir, "cdan_model.pt")
-        if os.path.exists(cdan_path):
-            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.cdan import CDANModel
-            cdan_model = CDANModel(in_dim=in_dim, hidden_dim=64).to(device)
-            cdan_model.load_state_dict(torch.load(cdan_path, map_location=device, weights_only=True))
-            cdan_model.eval()
-            print("  [INFO] Loaded pre-trained CDAN UDA model!")
-
-        shot_model = None
-        shot_path = os.path.join(downstream_dir, "shot_model.pt")
-        if os.path.exists(shot_path):
-            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.shot import SHOTModel
-            shot_model = SHOTModel(in_dim=in_dim, hidden_dim=64).to(device)
-            shot_model.load_state_dict(torch.load(shot_path, map_location=device, weights_only=True))
-            shot_model.eval()
-            print("  [INFO] Loaded pre-trained SHOT UDA model!")
-
         ref_energy = 0.0
-        print("  Pre-trained downstream models loaded successfully!\n", flush=True)
+        print("  Pre-trained standard downstream models loaded successfully!\n", flush=True)
     else:
         print("\n" + "!" * 75)
         print("  [WARNING] No pre-trained downstream models found!")
@@ -482,10 +649,6 @@ def main():
         sp: {"anomaly": [], "sizing": [], "segmentation": []}
         for sp in args.eval_splits
     }
-    uda_task_results: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
-        m: {sp: [] for sp in args.eval_splits}
-        for m in uda_model_names
-    }
 
     for split_name in args.eval_splits:
         split_files = splits.get(split_name, [])
@@ -494,8 +657,7 @@ def main():
         # Metadata-only pre-filter (same survivor set/order as old `continue`)
         eval_files = [fp for fp in split_files
                       if extract_file_metadata(fp)["specimen"] in gt_masks]
-        uncached = [fp for fp in eval_files
-                    if not (split_name == "train" and fp in cached_train_latents)]
+        uncached = [fp for fp in eval_files if fp not in cached_all_latents]
         load_stream = iter(_iter_with_prefetch(uncached, args.prefetch))
         next_loaded = next(load_stream, None)
 
@@ -512,13 +674,14 @@ def main():
             gt_mask = gt_masks[specimen]["mask"]
 
             # Load or retrieve cached latents (prefetched in order)
-            if split_name == "train" and fp in cached_train_latents:
-                latents = cached_train_latents[fp]
+            if fp in cached_all_latents:
+                latents = cached_all_latents[fp]
             else:
                 assert next_loaded is not None and next_loaded[0] == fp, \
                     "Prefetch stream out of order"
                 latents = extractor.extract_full_cscan(next_loaded[1], self_calibrate=args.self_calibration)
                 next_loaded = next(load_stream, None)
+                cached_all_latents[fp] = latents
 
             # Fix 5: latent-regime OOD flag (energy vs train-pool reference)
             E_feat = scan_feature_energy(latents)
@@ -532,61 +695,6 @@ def main():
 
             # B) Unsupervised Mahalanobis Distance
             anom_res = suite.compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
-
-            # C) UDA Models (CORAL, DANN, DAN, CDAN, SHOT)
-            flat_feats = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
-            flat_labels = gt_mask.reshape(-1).astype(np.int64)
-            valid = np.where(flat_labels >= 0)[0]
-            y_v = flat_labels[valid]
-            has_both_classes = len(np.unique(y_v)) > 1
-
-            H, W = latents.shape[0], latents.shape[1]
-            uda_eval_map: Dict[str, Dict[str, Any]] = {}
-
-            coral_auc, coral_ap = 0.0, 0.0
-            if coral_model is not None:
-                prob_coral = coral_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
-                prob_coral_map = prob_coral.reshape(H, W)
-                if has_both_classes:
-                    coral_auc = float(roc_auc_score(y_v, prob_coral[valid]))
-                    coral_ap = float(average_precision_score(y_v, prob_coral[valid]))
-                uda_eval_map["CORAL"] = {"prob_map": prob_coral_map, "auc": coral_auc, "ap": coral_ap}
-
-            dann_auc, dann_ap = 0.0, 0.0
-            if dann_model is not None:
-                prob_dann = dann_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
-                prob_dann_map = prob_dann.reshape(H, W)
-                if has_both_classes:
-                    dann_auc = float(roc_auc_score(y_v, prob_dann[valid]))
-                    dann_ap = float(average_precision_score(y_v, prob_dann[valid]))
-                uda_eval_map["DANN"] = {"prob_map": prob_dann_map, "auc": dann_auc, "ap": dann_ap}
-
-            dan_auc, dan_ap = 0.0, 0.0
-            if dan_model is not None:
-                prob_dan = dan_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
-                prob_dan_map = prob_dan.reshape(H, W)
-                if has_both_classes:
-                    dan_auc = float(roc_auc_score(y_v, prob_dan[valid]))
-                    dan_ap = float(average_precision_score(y_v, prob_dan[valid]))
-                uda_eval_map["DAN"] = {"prob_map": prob_dan_map, "auc": dan_auc, "ap": dan_ap}
-
-            cdan_auc, cdan_ap = 0.0, 0.0
-            if cdan_model is not None:
-                prob_cdan = cdan_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
-                prob_cdan_map = prob_cdan.reshape(H, W)
-                if has_both_classes:
-                    cdan_auc = float(roc_auc_score(y_v, prob_cdan[valid]))
-                    cdan_ap = float(average_precision_score(y_v, prob_cdan[valid]))
-                uda_eval_map["CDAN"] = {"prob_map": prob_cdan_map, "auc": cdan_auc, "ap": cdan_ap}
-
-            shot_auc, shot_ap = 0.0, 0.0
-            if shot_model is not None:
-                prob_shot = shot_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
-                prob_shot_map = prob_shot.reshape(H, W)
-                if has_both_classes:
-                    shot_auc = float(roc_auc_score(y_v, prob_shot[valid]))
-                    shot_ap = float(average_precision_score(y_v, prob_shot[valid]))
-                uda_eval_map["SHOT"] = {"prob_map": prob_shot_map, "auc": shot_auc, "ap": shot_ap}
 
             # TASK 2: Defect Sizing Hurdle Protocol
             sizing_res = {"r2_score": 0.0, "mae_mm": 0.0, "rmse_mm": 0.0, "y_true": np.array([]), "y_pred": np.array([])}
@@ -623,16 +731,6 @@ def main():
                 "linear_probe_acc": det_res["accuracy"],
                 "mlp_probe_auc": det_res["mlp_auc_roc"],
                 "mlp_probe_ap": det_res["mlp_average_precision"],
-                "coral_auc": round(coral_auc, 4),
-                "coral_ap": round(coral_ap, 4),
-                "dann_auc": round(dann_auc, 4),
-                "dann_ap": round(dann_ap, 4),
-                "dan_auc": round(dan_auc, 4),
-                "dan_ap": round(dan_ap, 4),
-                "cdan_auc": round(cdan_auc, 4),
-                "cdan_ap": round(cdan_ap, 4),
-                "shot_auc": round(shot_auc, 4),
-                "shot_ap": round(shot_ap, 4),
                 "mahalanobis_auc": anom_res["auc_roc"],
                 "mahalanobis_ap": anom_res["average_precision"],
                 "cnr": anom_res["cnr"],
@@ -728,48 +826,7 @@ def main():
                 "recall": iou_res["recall"],
             })
 
-            # 4. Domain Adaptation: Save per-model probability heatmaps & 3-panel comparisons
-            for m_name, m_info in uda_eval_map.items():
-                m_prob = m_info["prob_map"]
-                if m_prob is not None:
-                    m_auc = m_info["auc"]
-                    m_ap = m_info["ap"]
-                    m_split_dir = os.path.join(uda_dirs[m_name], split_name)
 
-                    # A) Standalone Probability Heatmap (cmap='jet', matching linear probe)
-                    uda_prob_path = os.path.join(m_split_dir, f"{bname}_{m_name.lower()}_prob.png")
-                    plot_probability_heatmap(
-                        prob_map=m_prob,
-                        save_path=uda_prob_path,
-                        title=f"{m_name} Adapted P(Defect | z) [{split_name.upper()}]\n{specimen} - {sensor} - {waveform} | AUC: {m_auc:.4f} | AP: {m_ap:.4f}",
-                        cmap="jet",
-                    )
-
-                    # B) 3-Panel Side-by-Side Comparison: Zero-Shot LP vs UDA vs CAD GT
-                    uda_comp_path = os.path.join(m_split_dir, f"{bname}_{m_name.lower()}_comparison.png")
-                    plot_uda_summary_map(
-                        lp_prob_map=prob_map,
-                        uda_prob_map=m_prob,
-                        ground_truth_mask=gt_mask,
-                        model_name=m_name,
-                        file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform} | {liftoff}",
-                        save_path=uda_comp_path,
-                        lp_metrics={"auc": det_res["auc_roc"], "ap": det_res["average_precision"]},
-                        uda_metrics={"auc": m_auc, "ap": m_ap},
-                    )
-
-                    uda_task_results[m_name][split_name].append({
-                        "file": fname,
-                        "specimen": specimen,
-                        "sensor": sensor,
-                        "waveform": waveform,
-                        "liftoff": liftoff,
-                        "auc": m_auc,
-                        "ap": m_ap,
-                        "lp_auc": det_res["auc_roc"],
-                        "lp_ap": det_res["average_precision"],
-                        "delta_auc": round(m_auc - det_res["auc_roc"], 4),
-                    })
 
             pbar.set_postfix({
                 "LP_AUC": f"{det_res['auc_roc']:.4f}",
@@ -803,26 +860,25 @@ def main():
                 with open(t_json, "w", encoding="utf-8") as f:
                     json.dump({"split": sp, "task": tname, "count": len(trows), "metrics": num_summary}, f, indent=2)
 
-        for m_name in uda_model_names:
-            u_rows = uda_task_results[m_name][sp]
-            if u_rows:
-                u_csv = os.path.join(uda_dirs[m_name], sp, "split_metrics.csv")
-                with open(u_csv, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=list(u_rows[0].keys()))
-                    writer.writeheader()
-                    writer.writerows(u_rows)
+    # 7. STEP 4: Canonical Domain Adaptation Benchmark (Single-Variable Controlled Shifts)
+    in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
+    canonical_uda_results = None
+    if downstream_dir is not None and os.path.isdir(downstream_dir):
+        canonical_uda_results = evaluate_canonical_domain_adaptation(
+            downstream_dir=downstream_dir,
+            out_dir=out_dir,
+            all_files=all_files,
+            gt_masks=gt_masks,
+            cached_latents=cached_all_latents,
+            extractor=extractor,
+            self_calibration=args.self_calibration,
+            lr_probe=global_readouts.get("lr_probe") if global_readouts else None,
+            scaler_det=global_readouts.get("scaler_det") if global_readouts else None,
+            device=device,
+            in_dim=in_dim,
+        )
 
-                u_json = os.path.join(uda_dirs[m_name], sp, "split_summary.json")
-                num_summary = {}
-                for k in ["auc", "ap", "lp_auc", "lp_ap", "delta_auc"]:
-                    vals = [r[k] for r in u_rows if isinstance(r.get(k), (int, float))]
-                    if vals:
-                        num_summary[f"mean_{k}"] = float(np.mean(vals))
-                        num_summary[f"std_{k}"] = float(np.std(vals))
-                with open(u_json, "w", encoding="utf-8") as f:
-                    json.dump({"split": sp, "model": m_name, "count": len(u_rows), "metrics": num_summary}, f, indent=2)
-
-    # 7. STEP 4: Save Master Reports
+    # 8. STEP 5: Save Master Reports
     master_csv = os.path.join(out_dir, "master_benchmark_metrics.csv")
     with open(master_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(master_results[0].keys()))
@@ -840,7 +896,7 @@ def main():
         dice = [r["segmentation_dice"] for r in rows]
         sz_r2 = [r["sizing_r2"] for r in rows if r["specimen"] == "Corrosion"]
         sz_mae = [r["sizing_mae_mm"] for r in rows if r["specimen"] == "Corrosion"]
-        res = {
+        return {
             "count": len(rows),
             "linear_probe_auc_mean": float(np.mean(lp_auc)),
             "linear_probe_auc_std": float(np.std(lp_auc)),
@@ -853,17 +909,6 @@ def main():
             "sizing_r2_mean": float(np.mean(sz_r2)) if sz_r2 else 0.0,
             "sizing_mae_mean": float(np.mean(sz_mae)) if sz_mae else 0.0,
         }
-        for uda_name in ["coral", "dann", "dan", "cdan", "shot"]:
-            key_auc = f"{uda_name}_auc"
-            key_ap = f"{uda_name}_ap"
-            if key_auc in rows[0] and any(r.get(key_auc, 0) > 0 for r in rows):
-                u_auc = [r[key_auc] for r in rows]
-                u_ap = [r[key_ap] for r in rows]
-                res[f"{uda_name}_auc_mean"] = float(np.mean(u_auc))
-                res[f"{uda_name}_auc_std"] = float(np.std(u_auc))
-                res[f"{uda_name}_ap_mean"] = float(np.mean(u_ap))
-                res[f"{uda_name}_ap_std"] = float(np.std(u_ap))
-        return res
 
     master_summary = {
         "evaluation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -891,6 +936,7 @@ def main():
             sp: compute_stats([r for r in master_results if r["specimen"] == sp])
             for sp in ["Corrosion", "Rivet_v1", "Rivet_v2"]
         },
+        "canonical_domain_adaptation": canonical_uda_results,
     }
 
     master_json = os.path.join(out_dir, "master_benchmark_summary.json")
@@ -907,7 +953,7 @@ def main():
 
         f.write("## 1. Split Performance Breakdown\n\n")
         f.write("| Split | Files | Linear Probe AUC | Linear Probe AP | CNR | Mahalanobis AUC | Seg IoU | Sizing R² |\n")
-        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
+        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for sp in args.eval_splits:
             st = master_summary["by_split"].get(sp, {})
             if st:
@@ -915,52 +961,56 @@ def main():
 
         f.write("\n## 2. Generalization Disaggregation\n\n")
         f.write("### By Waveform\n")
-        f.write("| Waveform | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :---: |\n")
+        f.write("| Waveform | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
         for wf, st in master_summary["by_waveform"].items():
             if st.get("count", 0) > 0:
                 f.write(f"| {wf} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
         f.write("\n### By Sensor\n")
-        f.write("| Sensor | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :---: |\n")
+        f.write("| Sensor | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
         for sn, st in master_summary["by_sensor"].items():
             if st.get("count", 0) > 0:
                 f.write(f"| {sn} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
         f.write("\n### By Lift-off\n")
-        f.write("| Lift-off | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :---: |\n")
+        f.write("| Lift-off | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
         for lo, st in master_summary["by_liftoff"].items():
             if st.get("count", 0) > 0:
                 f.write(f"| {lo} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
-        # Section 3: UDA Benchmark
-        has_uda = any("coral_auc_mean" in master_summary["by_split"].get(sp, {}) for sp in args.eval_splits)
-        if has_uda:
-            f.write("\n## 3. Unsupervised Domain Adaptation (UDA) Benchmark\n\n")
-            f.write("| Split | Method | Target AUC | Target AP | Δ AUC vs Zero-Shot LP | Adaptation Strategy |\n")
-            f.write("| :--- | :--- | :---: | :---: | :---: | :--- |\n")
-            uda_meta = [
-                ("coral", "CORAL", "Feature Covariance Alignment"),
-                ("dann", "DANN", "Adversarial Domain Invariance (GRL)"),
-                ("dan", "DAN (MK-MMD)", "Multi-Kernel Maximum Mean Discrepancy"),
-                ("cdan", "CDAN", "Multilinear Conditioning Adversarial"),
-                ("shot", "SHOT", "Information Maximization + Diversity"),
-            ]
-            for sp in args.eval_splits:
-                st = master_summary["by_split"].get(sp, {})
-                if not st:
+        # Section 3: Canonical UDA Benchmark
+        if canonical_uda_results:
+            f.write("\n## 3. Canonical Domain Adaptation (UDA) Benchmark (Controlled Single-Variable Shifts)\n\n")
+            f.write("| Shift | Model | Source AUC (Retention) | Target AUC (Adaptation) | Target AP | Δ AUC vs Zero-Shot LP | Adaptation Strategy |\n")
+            f.write("| :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n")
+            uda_meta = {
+                "CORAL": "Feature Covariance Alignment",
+                "DANN": "Adversarial Domain Invariance (GRL)",
+                "DAN": "Multi-Kernel Maximum Mean Discrepancy",
+                "CDAN": "Multilinear Conditioning Adversarial",
+                "SHOT": "Information Maximization (Source-Free)",
+                "OTDA": "Wasserstein Sinkhorn Optimal Transport",
+                "CBST": "Class-Balanced Self-Training",
+            }
+            for s_name, s_data in canonical_uda_results.items():
+                m_dict = s_data.get("models", {})
+                if not m_dict:
                     continue
-                lp_auc = st.get("linear_probe_auc_mean", 0.0)
-                lp_ap = st.get("linear_probe_ap_mean", 0.0)
-                f.write(f"| **{sp.upper()}** | **Zero-Shot Linear Probe (Baseline)** | {lp_auc:.4f} | {lp_ap:.4f} | *baseline* | Source-only frozen readout |\n")
-                for key, label, strat in uda_meta:
-                    if f"{key}_auc_mean" in st:
-                        u_auc = st[f"{key}_auc_mean"]
-                        u_ap = st[f"{key}_ap_mean"]
-                        diff = u_auc - lp_auc
-                        diff_str = f"+{diff:.4f}" if diff >= 0 else f"{diff:.4f}"
-                        f.write(f"| **{sp.upper()}** | {label} | {u_auc:.4f} | {u_ap:.4f} | **{diff_str}** | {strat} |\n")
+                first_m = list(m_dict.keys())[0]
+                lp_src = m_dict[first_m]["source"]["lp_auc_mean"]
+                lp_tgt = m_dict[first_m]["target"]["lp_auc_mean"]
+                f.write(f"| **{s_name.upper()}** | **Zero-Shot Linear Probe (Baseline)** | {lp_src:.4f} | {lp_tgt:.4f} | - | *baseline* | Source-only frozen readout |\n")
+                for m_name, m_res in m_dict.items():
+                    s_auc = m_res["source"]["auc_mean"]
+                    t_auc = m_res["target"]["auc_mean"]
+                    t_std = m_res["target"]["auc_std"]
+                    t_ap = m_res["target"]["ap_mean"]
+                    delta = m_res["target"]["delta_auc_mean"]
+                    sign = "+" if delta >= 0 else ""
+                    strat = uda_meta.get(m_name, "Domain Adaptation")
+                    f.write(f"| **{s_name.upper()}** | {m_name} | {s_auc:.4f} | {t_auc:.4f} ± {t_std:.4f} | {t_ap:.4f} | **{sign}{delta:.4f}** | {strat} |\n")
 
-    # 8. Terminal Output
+    # 9. Terminal Output
     print("\n" + "=" * 80)
     print("MASTER BENCHMARK EVALUATION SUMMARY")
     print("=" * 80)
@@ -972,42 +1022,36 @@ def main():
     ov = master_summary["overall"]
     print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} ± {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")
 
-    # UDA Summary in Console
-    has_uda = any("coral_auc_mean" in master_summary["by_split"].get(sp, {}) for sp in args.eval_splits)
-    if has_uda:
+    # Canonical UDA Summary in Console
+    if canonical_uda_results:
         print("\n" + "=" * 80)
-        print("UNSUPERVISED DOMAIN ADAPTATION (UDA) BENCHMARK SUMMARY")
+        print("CANONICAL DOMAIN ADAPTATION (UDA) BENCHMARK SUMMARY")
         print("=" * 80)
-        print(f"{'Split':<7} | {'Model / Method':<24} | {'AUC':<15} | {'AP':<8} | {'Δ vs LP AUC':<12}")
-        print("-" * 80)
-        uda_meta = [
-            ("coral", "CORAL"),
-            ("dann", "DANN"),
-            ("dan", "DAN (MK-MMD)"),
-            ("cdan", "CDAN"),
-            ("shot", "SHOT"),
-        ]
-        for sp in args.eval_splits:
-            st = master_summary["by_split"].get(sp, {})
-            if not st:
+        for s_name, s_data in canonical_uda_results.items():
+            m_dict = s_data.get("models", {})
+            if not m_dict:
                 continue
-            lp_auc = st.get("linear_probe_auc_mean", 0.0)
-            lp_ap = st.get("linear_probe_ap_mean", 0.0)
-            print(f"{sp.upper():<7} | {'Linear Probe (Zero-Shot)':<24} | {lp_auc:<15.4f} | {lp_ap:<8.4f} | {'baseline':<12}")
-            for key, label in uda_meta:
-                if f"{key}_auc_mean" in st:
-                    u_auc = st[f"{key}_auc_mean"]
-                    u_std = st.get(f"{key}_auc_std", 0.0)
-                    u_ap = st[f"{key}_ap_mean"]
-                    diff = u_auc - lp_auc
-                    diff_str = f"+{diff:.4f}" if diff >= 0 else f"{diff:.4f}"
-                    auc_str = f"{u_auc:.4f} ± {u_std:.4f}"
-                    print(f"{sp.upper():<7} | {label:<24} | {auc_str:<15} | {u_ap:<8.4f} | {diff_str:<12}")
+            first_m = list(m_dict.keys())[0]
+            lp_src = m_dict[first_m]["source"]["lp_auc_mean"]
+            lp_tgt = m_dict[first_m]["target"]["lp_auc_mean"]
+            print(f"\n--- Shift: [{s_name.upper()}] ---")
+            print(f"{'Model / Method':<24} | {'Source AUC':<12} | {'Target AUC':<16} | {'Target AP':<10} | {'Δ vs LP AUC':<12}")
             print("-" * 80)
+            print(f"{'Linear Probe (Zero-Shot)':<24} | {lp_src:<12.4f} | {lp_tgt:<16.4f} | {'-':<10} | {'baseline':<12}")
+            for m_name, m_res in m_dict.items():
+                s_auc = m_res["source"]["auc_mean"]
+                t_auc = m_res["target"]["auc_mean"]
+                t_std = m_res["target"]["auc_std"]
+                t_ap = m_res["target"]["ap_mean"]
+                delta = m_res["target"]["delta_auc_mean"]
+                sign = "+" if delta >= 0 else ""
+                auc_str = f"{t_auc:.4f} ± {t_std:.4f}"
+                print(f"{m_name:<24} | {s_auc:<12.4f} | {auc_str:<16} | {t_ap:<10.4f} | {sign}{delta:<12.4f}")
+        print("=" * 80)
     else:
         print("\n" + "!" * 80)
-        print("[NOTICE] No pre-trained UDA models were loaded for this evaluation.")
-        print("To evaluate UDA models (CORAL, DANN, DAN, CDAN, SHOT):")
+        print("[NOTICE] No pre-trained UDA models were evaluated.")
+        print("To train and evaluate UDA models (CORAL, DANN, DAN, CDAN, SHOT, OTDA, CBST):")
         print("  1. Run downstream training first:")
         print(f"     python -m src.PECT_JEPA.cross_condition.downstream.train_downstream --checkpoint {ckpt_path} --data_dir {args.data_dir}")
         print("  2. Re-run evaluate:")

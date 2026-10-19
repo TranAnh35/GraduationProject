@@ -3,6 +3,8 @@ from .dann import DANNModel, grad_reverse
 from .dan_mmd import DANModel, MultiKernelMMD
 from .cdan import CDANModel
 from .shot import SHOTModel
+from .otda import OTDAModel, wasserstein_distance
+from .cbst import CBSTModel
 
 __all__ = [
     "CORALAdapter",
@@ -13,4 +15,7 @@ __all__ = [
     "MultiKernelMMD",
     "CDANModel",
     "SHOTModel",
+    "OTDAModel",
+    "wasserstein_distance",
+    "CBSTModel",
 ]
