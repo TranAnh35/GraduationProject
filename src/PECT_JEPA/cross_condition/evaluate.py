@@ -40,6 +40,8 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import torch
+import joblib
+from sklearn.metrics import roc_auc_score, average_precision_score
 from tqdm import tqdm
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -131,6 +133,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8192, help="Batch size for feature extraction")
     parser.add_argument("--prefetch", type=lambda v: v.lower() == "true", default=True, help="Overlap next-file TDMS load with current-file GPU/CPU processing")
     parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True, help="Enable unsupervised spatial self-calibration (zero-centering C-scan against sound-metal background median)")
+    parser.add_argument("--downstream_dir", type=str, default=None, help="Directory containing pre-trained downstream models (standard_probes.joblib, coral_model.pt, dann_model.pt)")
     return parser.parse_args()
 
 
@@ -298,75 +301,120 @@ def main():
     print(f"  - Val Split (Base Domain):       {len(splits['val'])} files")
     print(f"  - Test Split (Held-out OOD):     {len(splits['test'])} files\n", flush=True)
 
-    # 4. STEP 1: Fit Global Readout Probes Strictly on Train Pool
+    # 4. STEP 1: Load Pre-trained Downstream Models or Fit on Train Pool
     print("=" * 75)
-    print("STEP 1: Extracting Train Pool Latents & Fitting Global Readout Probes")
+    print("STEP 1: Downstream Probes & UDA Models Setup")
     print("=" * 75, flush=True)
 
+    downstream_dir = args.downstream_dir
+    if downstream_dir is None:
+        cand_dir = os.path.join(os.path.dirname(out_dir) if os.path.basename(out_dir) == "evaluation_results" else os.path.dirname(ckpt_path), "downstream_models")
+        if os.path.exists(cand_dir) and os.path.exists(os.path.join(cand_dir, "standard_probes.joblib")):
+            downstream_dir = cand_dir
+
+    global_readouts = None
+    coral_model = None
+    dann_model = None
     cached_train_latents: Dict[str, np.ndarray] = {}
-    train_det_x, train_det_y = [], []
-    train_size_x, train_size_y = [], []
-    train_energies: List[float] = []  # Fix 5: regime reference from train pool
+    train_energies: List[float] = []
 
-    # Metadata-only pre-filter (no IO): identical survivor set/order as the
-    # old in-loop `continue`, so RNG draws and fitted readouts are unchanged.
-    train_eval_files = [fp for fp in splits["train"]
-                        if extract_file_metadata(fp)["specimen"] in gt_masks]
-    pbar_train = tqdm(_iter_with_prefetch(train_eval_files, args.prefetch),
-                      total=len(train_eval_files),
-                      desc="Fitting Readouts on Train Pool", file=sys.stdout, dynamic_ncols=True)
-    rng = np.random.RandomState(42)
+    if downstream_dir is not None and os.path.exists(os.path.join(downstream_dir, "standard_probes.joblib")):
+        print(f"  [INFO] Loading pre-trained downstream models from: {downstream_dir}")
+        bundle = joblib.load(os.path.join(downstream_dir, "standard_probes.joblib"))
+        det_bundle = bundle["detection"]
+        size_bundle = bundle.get("sizing")
+        global_readouts = {
+            "scaler_det": det_bundle.scaler,
+            "lr_probe": det_bundle.linear_probe,
+            "mlp_probe": det_bundle.mlp_probe,
+        }
+        if size_bundle is not None:
+            global_readouts["scaler_size"] = size_bundle.scaler
+            global_readouts["ridge_size"] = size_bundle.ridge_regressor
+            global_readouts["mlp_size"] = size_bundle.mlp_regressor
 
-    for fp, cscan in pbar_train:
-        meta = extract_file_metadata(fp)
-        sp = meta["specimen"]
+        # Load CORAL if available
+        coral_path = os.path.join(downstream_dir, "coral_model.pt")
+        if os.path.exists(coral_path):
+            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.coral import CORALAdapter
+            in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
+            coral_model = CORALAdapter(in_dim=in_dim, hidden_dim=64).to(device)
+            coral_model.load_state_dict(torch.load(coral_path, map_location=device, weights_only=True))
+            coral_model.eval()
+            print("  [INFO] Loaded pre-trained CORAL UDA model!")
 
-        gt_mask = gt_masks[sp]["mask"]
-        latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
-        cached_train_latents[fp] = latents
-        train_energies.append(scan_feature_energy(latents))
+        # Load DANN if available
+        dann_path = os.path.join(downstream_dir, "dann_model.pt")
+        if os.path.exists(dann_path):
+            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dann import DANNModel
+            in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
+            dann_model = DANNModel(in_dim=in_dim, hidden_dim=64).to(device)
+            dann_model.load_state_dict(torch.load(dann_path, map_location=device, weights_only=True))
+            dann_model.eval()
+            print("  [INFO] Loaded pre-trained DANN UDA model!")
 
-        flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
-        flat_y = gt_mask.reshape(-1).astype(np.int64)
+        ref_energy = 0.0
+        print("  Pre-trained downstream models loaded successfully!\n", flush=True)
+    else:
+        print("  [NOTE] No pre-trained downstream models found. Fitting readouts on train pool as fallback...")
+        train_det_x, train_det_y = [], []
+        train_size_x, train_size_y = [], []
 
-        # Defect Detection Points (all defect + balanced sound subsample)
-        pos_idx = np.where(flat_y == 1)[0]
-        neg_idx = np.where(flat_y == 0)[0]
-        if len(pos_idx) > 0 and len(neg_idx) > 0:
-            sub_neg_count = min(len(neg_idx), max(len(pos_idx) * 4, 2500))
-            sub_neg = rng.choice(neg_idx, size=sub_neg_count, replace=False)
-            sel = np.concatenate([pos_idx, sub_neg])
-            train_det_x.append(flat_z[sel])
-            train_det_y.append(flat_y[sel])
+        train_eval_files = [fp for fp in splits["train"]
+                            if extract_file_metadata(fp)["specimen"] in gt_masks]
+        pbar_train = tqdm(_iter_with_prefetch(train_eval_files, args.prefetch),
+                          total=len(train_eval_files),
+                          desc="Fitting Readouts on Train Pool", file=sys.stdout, dynamic_ncols=True)
+        rng = np.random.RandomState(42)
 
-        # Sizing Points (from Corrosion specimens)
-        if sp == "Corrosion" and corr_d_map is not None:
-            flat_d = corr_d_map.reshape(-1).astype(np.float32)
-            def_idx = np.where(flat_d > 0.0)[0]
-            if len(def_idx) > 0:
-                train_size_x.append(flat_z[def_idx])
-                train_size_y.append(flat_d[def_idx])
+        for fp, cscan in pbar_train:
+            meta = extract_file_metadata(fp)
+            sp = meta["specimen"]
 
-    X_train_det = np.concatenate(train_det_x, axis=0)
-    y_train_det = np.concatenate(train_det_y, axis=0)
-    X_train_size = np.concatenate(train_size_x, axis=0) if train_size_x else None
-    y_train_size = np.concatenate(train_size_y, axis=0) if train_size_y else None
+            gt_mask = gt_masks[sp]["mask"]
+            latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
+            cached_train_latents[fp] = latents
+            train_energies.append(scan_feature_energy(latents))
 
-    print(f"\n  [Train Pool Aggregation]")
-    print(f"  - Defect Detection samples: {len(y_train_det)} (Defects: {np.sum(y_train_det == 1)}, Sound: {np.sum(y_train_det == 0)})")
-    if y_train_size is not None:
-        print(f"  - Flaw Sizing samples:      {len(y_train_size)} defect pixels")
-    ref_energy = float(np.median(train_energies)) if train_energies else 0.0
-    print(f"  - Latent regime reference (median scan E||z||^2): {ref_energy:.1f}", flush=True)
+            flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
+            flat_y = gt_mask.reshape(-1).astype(np.int64)
 
-    print(f"  Fitting global Logistic Regression & Ridge Regressors...", flush=True)
-    global_readouts = suite.fit_global_readouts(
-        X_det=X_train_det,
-        y_det=y_train_det,
-        X_size=X_train_size,
-        y_size=y_train_size,
-    )
-    print("  Global readouts successfully fitted and frozen!\n", flush=True)
+            pos_idx = np.where(flat_y == 1)[0]
+            neg_idx = np.where(flat_y == 0)[0]
+            if len(pos_idx) > 0 and len(neg_idx) > 0:
+                sub_neg_count = min(len(neg_idx), max(len(pos_idx) * 4, 2500))
+                sub_neg = rng.choice(neg_idx, size=sub_neg_count, replace=False)
+                sel = np.concatenate([pos_idx, sub_neg])
+                train_det_x.append(flat_z[sel])
+                train_det_y.append(flat_y[sel])
+
+            if sp == "Corrosion" and corr_d_map is not None:
+                flat_d = corr_d_map.reshape(-1).astype(np.float32)
+                def_idx = np.where(flat_d > 0.0)[0]
+                if len(def_idx) > 0:
+                    train_size_x.append(flat_z[def_idx])
+                    train_size_y.append(flat_d[def_idx])
+
+        X_train_det = np.concatenate(train_det_x, axis=0)
+        y_train_det = np.concatenate(train_det_y, axis=0)
+        X_train_size = np.concatenate(train_size_x, axis=0) if train_size_x else None
+        y_train_size = np.concatenate(train_size_y, axis=0) if train_size_y else None
+
+        print(f"\n  [Train Pool Aggregation]")
+        print(f"  - Defect Detection samples: {len(y_train_det)} (Defects: {np.sum(y_train_det == 1)}, Sound: {np.sum(y_train_det == 0)})")
+        if y_train_size is not None:
+            print(f"  - Flaw Sizing samples:      {len(y_train_size)} defect pixels")
+        ref_energy = float(np.median(train_energies)) if train_energies else 0.0
+        print(f"  - Latent regime reference (median scan E||z||^2): {ref_energy:.1f}", flush=True)
+
+        print(f"  Fitting global Logistic Regression & Ridge Regressors...", flush=True)
+        global_readouts = suite.fit_global_readouts(
+            X_det=X_train_det,
+            y_det=y_train_det,
+            X_size=X_train_size,
+            y_size=y_train_size,
+        )
+        print("  Global readouts successfully fitted and frozen!\n", flush=True)
 
     # 5. STEP 2: Multi-Task Evaluation across all splits
     print("=" * 75)
@@ -425,6 +473,27 @@ def main():
             # B) Unsupervised Mahalanobis Distance
             anom_res = suite.compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
 
+            # C) UDA Models (CORAL & DANN)
+            flat_feats = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
+            flat_labels = gt_mask.reshape(-1).astype(np.int64)
+            valid = np.where(flat_labels >= 0)[0]
+            y_v = flat_labels[valid]
+            has_both_classes = len(np.unique(y_v)) > 1
+
+            coral_auc, coral_ap = 0.0, 0.0
+            if coral_model is not None:
+                prob_coral = coral_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                if has_both_classes:
+                    coral_auc = float(roc_auc_score(y_v, prob_coral[valid]))
+                    coral_ap = float(average_precision_score(y_v, prob_coral[valid]))
+
+            dann_auc, dann_ap = 0.0, 0.0
+            if dann_model is not None:
+                prob_dann = dann_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                if has_both_classes:
+                    dann_auc = float(roc_auc_score(y_v, prob_dann[valid]))
+                    dann_ap = float(average_precision_score(y_v, prob_dann[valid]))
+
             # TASK 2: Defect Sizing Hurdle Protocol
             sizing_res = {"r2_score": 0.0, "mae_mm": 0.0, "rmse_mm": 0.0, "y_true": np.array([]), "y_pred": np.array([])}
             if specimen == "Corrosion" and corr_d_map is not None:
@@ -460,6 +529,10 @@ def main():
                 "linear_probe_acc": det_res["accuracy"],
                 "mlp_probe_auc": det_res["mlp_auc_roc"],
                 "mlp_probe_ap": det_res["mlp_average_precision"],
+                "coral_auc": round(coral_auc, 4),
+                "coral_ap": round(coral_ap, 4),
+                "dann_auc": round(dann_auc, 4),
+                "dann_ap": round(dann_ap, 4),
                 "mahalanobis_auc": anom_res["auc_roc"],
                 "mahalanobis_ap": anom_res["average_precision"],
                 "cnr": anom_res["cnr"],
@@ -605,7 +678,7 @@ def main():
         dice = [r["segmentation_dice"] for r in rows]
         sz_r2 = [r["sizing_r2"] for r in rows if r["specimen"] == "Corrosion"]
         sz_mae = [r["sizing_mae_mm"] for r in rows if r["specimen"] == "Corrosion"]
-        return {
+        res = {
             "count": len(rows),
             "linear_probe_auc_mean": float(np.mean(lp_auc)),
             "linear_probe_auc_std": float(np.std(lp_auc)),
@@ -618,6 +691,17 @@ def main():
             "sizing_r2_mean": float(np.mean(sz_r2)) if sz_r2 else 0.0,
             "sizing_mae_mean": float(np.mean(sz_mae)) if sz_mae else 0.0,
         }
+        if "coral_auc" in rows[0] and any(r.get("coral_auc", 0) > 0 for r in rows):
+            c_auc = [r["coral_auc"] for r in rows]
+            c_ap = [r["coral_ap"] for r in rows]
+            res["coral_auc_mean"] = float(np.mean(c_auc))
+            res["coral_ap_mean"] = float(np.mean(c_ap))
+        if "dann_auc" in rows[0] and any(r.get("dann_auc", 0) > 0 for r in rows):
+            d_auc = [r["dann_auc"] for r in rows]
+            d_ap = [r["dann_ap"] for r in rows]
+            res["dann_auc_mean"] = float(np.mean(d_auc))
+            res["dann_ap_mean"] = float(np.mean(d_ap))
+        return res
 
     master_summary = {
         "evaluation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
