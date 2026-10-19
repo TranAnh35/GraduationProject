@@ -85,6 +85,8 @@ def parse_args():
     # Domain Definition & Shift Mode
     parser.add_argument(
         "--adaptation_mode",
+        "--condition_shift",
+        dest="adaptation_mode",
         type=str,
         default="all_test",
         choices=["all_test", "cross_sensor", "cross_waveform", "cross_specimen", "cross_liftoff"],
@@ -99,7 +101,7 @@ def parse_args():
     parser.add_argument("--dan_weight", type=float, default=0.5, help="Weight lambda for DAN MK-MMD loss")
     parser.add_argument("--cdan_weight", type=float, default=0.1, help="Weight lambda for CDAN discriminator loss")
     parser.add_argument("--shot_div_weight", type=float, default=2.0, help="Weight for SHOT diversity regularizer")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate for UDA optimizers")
+    parser.add_argument("--learning_rate", "--lr", dest="learning_rate", type=float, default=1e-3, help="Learning rate for UDA optimizers")
     parser.add_argument("--target_sample_size", type=int, default=50000, help="Number of unlabeled target pixels to subsample for UDA")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
