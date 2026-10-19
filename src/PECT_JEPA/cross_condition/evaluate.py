@@ -333,25 +333,51 @@ def main():
             global_readouts["ridge_size"] = size_bundle.ridge_regressor
             global_readouts["mlp_size"] = size_bundle.mlp_regressor
 
-        # Load CORAL if available
+        # Load UDA models if available
+        in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
+
         coral_path = os.path.join(downstream_dir, "coral_model.pt")
         if os.path.exists(coral_path):
             from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.coral import CORALAdapter
-            in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
             coral_model = CORALAdapter(in_dim=in_dim, hidden_dim=64).to(device)
             coral_model.load_state_dict(torch.load(coral_path, map_location=device, weights_only=True))
             coral_model.eval()
             print("  [INFO] Loaded pre-trained CORAL UDA model!")
 
-        # Load DANN if available
         dann_path = os.path.join(downstream_dir, "dann_model.pt")
         if os.path.exists(dann_path):
             from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dann import DANNModel
-            in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
             dann_model = DANNModel(in_dim=in_dim, hidden_dim=64).to(device)
             dann_model.load_state_dict(torch.load(dann_path, map_location=device, weights_only=True))
             dann_model.eval()
             print("  [INFO] Loaded pre-trained DANN UDA model!")
+
+        dan_model = None
+        dan_path = os.path.join(downstream_dir, "dan_model.pt")
+        if os.path.exists(dan_path):
+            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dan_mmd import DANModel
+            dan_model = DANModel(in_dim=in_dim, hidden_dim=64).to(device)
+            dan_model.load_state_dict(torch.load(dan_path, map_location=device, weights_only=True))
+            dan_model.eval()
+            print("  [INFO] Loaded pre-trained DAN (MK-MMD) UDA model!")
+
+        cdan_model = None
+        cdan_path = os.path.join(downstream_dir, "cdan_model.pt")
+        if os.path.exists(cdan_path):
+            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.cdan import CDANModel
+            cdan_model = CDANModel(in_dim=in_dim, hidden_dim=64).to(device)
+            cdan_model.load_state_dict(torch.load(cdan_path, map_location=device, weights_only=True))
+            cdan_model.eval()
+            print("  [INFO] Loaded pre-trained CDAN UDA model!")
+
+        shot_model = None
+        shot_path = os.path.join(downstream_dir, "shot_model.pt")
+        if os.path.exists(shot_path):
+            from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.shot import SHOTModel
+            shot_model = SHOTModel(in_dim=in_dim, hidden_dim=64).to(device)
+            shot_model.load_state_dict(torch.load(shot_path, map_location=device, weights_only=True))
+            shot_model.eval()
+            print("  [INFO] Loaded pre-trained SHOT UDA model!")
 
         ref_energy = 0.0
         print("  Pre-trained downstream models loaded successfully!\n", flush=True)
@@ -494,6 +520,27 @@ def main():
                     dann_auc = float(roc_auc_score(y_v, prob_dann[valid]))
                     dann_ap = float(average_precision_score(y_v, prob_dann[valid]))
 
+            dan_auc, dan_ap = 0.0, 0.0
+            if dan_model is not None:
+                prob_dan = dan_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                if has_both_classes:
+                    dan_auc = float(roc_auc_score(y_v, prob_dan[valid]))
+                    dan_ap = float(average_precision_score(y_v, prob_dan[valid]))
+
+            cdan_auc, cdan_ap = 0.0, 0.0
+            if cdan_model is not None:
+                prob_cdan = cdan_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                if has_both_classes:
+                    cdan_auc = float(roc_auc_score(y_v, prob_cdan[valid]))
+                    cdan_ap = float(average_precision_score(y_v, prob_cdan[valid]))
+
+            shot_auc, shot_ap = 0.0, 0.0
+            if shot_model is not None:
+                prob_shot = shot_model.predict_proba(flat_feats, batch_size=args.batch_size, device=args.device)
+                if has_both_classes:
+                    shot_auc = float(roc_auc_score(y_v, prob_shot[valid]))
+                    shot_ap = float(average_precision_score(y_v, prob_shot[valid]))
+
             # TASK 2: Defect Sizing Hurdle Protocol
             sizing_res = {"r2_score": 0.0, "mae_mm": 0.0, "rmse_mm": 0.0, "y_true": np.array([]), "y_pred": np.array([])}
             if specimen == "Corrosion" and corr_d_map is not None:
@@ -533,6 +580,12 @@ def main():
                 "coral_ap": round(coral_ap, 4),
                 "dann_auc": round(dann_auc, 4),
                 "dann_ap": round(dann_ap, 4),
+                "dan_auc": round(dan_auc, 4),
+                "dan_ap": round(dan_ap, 4),
+                "cdan_auc": round(cdan_auc, 4),
+                "cdan_ap": round(cdan_ap, 4),
+                "shot_auc": round(shot_auc, 4),
+                "shot_ap": round(shot_ap, 4),
                 "mahalanobis_auc": anom_res["auc_roc"],
                 "mahalanobis_ap": anom_res["average_precision"],
                 "cnr": anom_res["cnr"],
@@ -691,16 +744,14 @@ def main():
             "sizing_r2_mean": float(np.mean(sz_r2)) if sz_r2 else 0.0,
             "sizing_mae_mean": float(np.mean(sz_mae)) if sz_mae else 0.0,
         }
-        if "coral_auc" in rows[0] and any(r.get("coral_auc", 0) > 0 for r in rows):
-            c_auc = [r["coral_auc"] for r in rows]
-            c_ap = [r["coral_ap"] for r in rows]
-            res["coral_auc_mean"] = float(np.mean(c_auc))
-            res["coral_ap_mean"] = float(np.mean(c_ap))
-        if "dann_auc" in rows[0] and any(r.get("dann_auc", 0) > 0 for r in rows):
-            d_auc = [r["dann_auc"] for r in rows]
-            d_ap = [r["dann_ap"] for r in rows]
-            res["dann_auc_mean"] = float(np.mean(d_auc))
-            res["dann_ap_mean"] = float(np.mean(d_ap))
+        for uda_name in ["coral", "dann", "dan", "cdan", "shot"]:
+            key_auc = f"{uda_name}_auc"
+            key_ap = f"{uda_name}_ap"
+            if key_auc in rows[0] and any(r.get(key_auc, 0) > 0 for r in rows):
+                u_auc = [r[key_auc] for r in rows]
+                u_ap = [r[key_ap] for r in rows]
+                res[f"{uda_name}_auc_mean"] = float(np.mean(u_auc))
+                res[f"{uda_name}_ap_mean"] = float(np.mean(u_ap))
         return res
 
     master_summary = {
