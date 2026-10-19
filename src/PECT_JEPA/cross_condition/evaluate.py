@@ -307,10 +307,20 @@ def main():
     print("=" * 75, flush=True)
 
     downstream_dir = args.downstream_dir
+    parent_out = os.path.dirname(out_dir) if os.path.basename(out_dir) == "evaluation_results" else out_dir
+    parent_ckpt = os.path.dirname(ckpt_path)
+    grandparent_ckpt = os.path.dirname(parent_ckpt) if os.path.basename(parent_ckpt) == "checkpoints" else parent_ckpt
+
+    candidates = [
+        os.path.join(parent_out, "downstream_models"),
+        os.path.join(grandparent_ckpt, "downstream_models"),
+        os.path.join(parent_ckpt, "downstream_models"),
+    ]
     if downstream_dir is None:
-        cand_dir = os.path.join(os.path.dirname(out_dir) if os.path.basename(out_dir) == "evaluation_results" else os.path.dirname(ckpt_path), "downstream_models")
-        if os.path.exists(cand_dir) and os.path.exists(os.path.join(cand_dir, "standard_probes.joblib")):
-            downstream_dir = cand_dir
+        for cand in candidates:
+            if os.path.exists(cand) and os.path.exists(os.path.join(cand, "standard_probes.joblib")):
+                downstream_dir = cand
+                break
 
     global_readouts = None
     coral_model = None
@@ -382,7 +392,15 @@ def main():
         ref_energy = 0.0
         print("  Pre-trained downstream models loaded successfully!\n", flush=True)
     else:
-        print("  [NOTE] No pre-trained downstream models found. Fitting readouts on train pool as fallback...")
+        print("\n" + "!" * 75)
+        print("  [WARNING] No pre-trained downstream models found!")
+        print("  Checked candidate paths:")
+        for cand in candidates:
+            print(f"    - {cand} (exists: {os.path.exists(cand)})")
+        print("  Fitting readouts on train pool as fallback (UDA models will NOT be evaluated).")
+        print("  To train and evaluate UDA models, run train_downstream.py first:")
+        print(f"    python -m src.PECT_JEPA.cross_condition.downstream.train_downstream --checkpoint {ckpt_path} --data_dir {args.data_dir}")
+        print("!" * 75 + "\n", flush=True)
         train_det_x, train_det_y = [], []
         train_size_x, train_size_y = [], []
 
@@ -751,7 +769,9 @@ def main():
                 u_auc = [r[key_auc] for r in rows]
                 u_ap = [r[key_ap] for r in rows]
                 res[f"{uda_name}_auc_mean"] = float(np.mean(u_auc))
+                res[f"{uda_name}_auc_std"] = float(np.std(u_auc))
                 res[f"{uda_name}_ap_mean"] = float(np.mean(u_ap))
+                res[f"{uda_name}_ap_std"] = float(np.std(u_ap))
         return res
 
     master_summary = {
@@ -821,23 +841,94 @@ def main():
             if st.get("count", 0) > 0:
                 f.write(f"| {lo} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
+        # Section 3: UDA Benchmark
+        has_uda = any("coral_auc_mean" in master_summary["by_split"].get(sp, {}) for sp in args.eval_splits)
+        if has_uda:
+            f.write("\n## 3. Unsupervised Domain Adaptation (UDA) Benchmark\n\n")
+            f.write("| Split | Method | Target AUC | Target AP | Δ AUC vs Zero-Shot LP | Adaptation Strategy |\n")
+            f.write("| :--- | :--- | :---: | :---: | :---: | :--- |\n")
+            uda_meta = [
+                ("coral", "CORAL", "Feature Covariance Alignment"),
+                ("dann", "DANN", "Adversarial Domain Invariance (GRL)"),
+                ("dan", "DAN (MK-MMD)", "Multi-Kernel Maximum Mean Discrepancy"),
+                ("cdan", "CDAN", "Multilinear Conditioning Adversarial"),
+                ("shot", "SHOT", "Information Maximization + Diversity"),
+            ]
+            for sp in args.eval_splits:
+                st = master_summary["by_split"].get(sp, {})
+                if not st:
+                    continue
+                lp_auc = st.get("linear_probe_auc_mean", 0.0)
+                lp_ap = st.get("linear_probe_ap_mean", 0.0)
+                f.write(f"| **{sp.upper()}** | **Zero-Shot Linear Probe (Baseline)** | {lp_auc:.4f} | {lp_ap:.4f} | *baseline* | Source-only frozen readout |\n")
+                for key, label, strat in uda_meta:
+                    if f"{key}_auc_mean" in st:
+                        u_auc = st[f"{key}_auc_mean"]
+                        u_ap = st[f"{key}_ap_mean"]
+                        diff = u_auc - lp_auc
+                        diff_str = f"+{diff:.4f}" if diff >= 0 else f"{diff:.4f}"
+                        f.write(f"| **{sp.upper()}** | {label} | {u_auc:.4f} | {u_ap:.4f} | **{diff_str}** | {strat} |\n")
+
     # 8. Terminal Output
-    print("\n" + "=" * 75)
+    print("\n" + "=" * 80)
     print("MASTER BENCHMARK EVALUATION SUMMARY")
-    print("=" * 75)
+    print("=" * 80)
     for sp in args.eval_splits:
         st = master_summary["by_split"].get(sp, {})
         if st:
             print(f"[{sp.upper():5s}] ({st['count']} files) -> LP AUC: {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | LP AP: {st['linear_probe_ap_mean']:.4f} | CNR: {st['cnr_mean']:.2f} | Seg IoU: {st['segmentation_iou_mean']:.4f} | Sizing R²: {st['sizing_r2_mean']:.4f}")
-    print("-" * 75)
+    print("-" * 80)
     ov = master_summary["overall"]
     print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} ± {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")
+
+    # UDA Summary in Console
+    has_uda = any("coral_auc_mean" in master_summary["by_split"].get(sp, {}) for sp in args.eval_splits)
+    if has_uda:
+        print("\n" + "=" * 80)
+        print("UNSUPERVISED DOMAIN ADAPTATION (UDA) BENCHMARK SUMMARY")
+        print("=" * 80)
+        print(f"{'Split':<7} | {'Model / Method':<24} | {'AUC':<15} | {'AP':<8} | {'Δ vs LP AUC':<12}")
+        print("-" * 80)
+        uda_meta = [
+            ("coral", "CORAL"),
+            ("dann", "DANN"),
+            ("dan", "DAN (MK-MMD)"),
+            ("cdan", "CDAN"),
+            ("shot", "SHOT"),
+        ]
+        for sp in args.eval_splits:
+            st = master_summary["by_split"].get(sp, {})
+            if not st:
+                continue
+            lp_auc = st.get("linear_probe_auc_mean", 0.0)
+            lp_ap = st.get("linear_probe_ap_mean", 0.0)
+            print(f"{sp.upper():<7} | {'Linear Probe (Zero-Shot)':<24} | {lp_auc:<15.4f} | {lp_ap:<8.4f} | {'baseline':<12}")
+            for key, label in uda_meta:
+                if f"{key}_auc_mean" in st:
+                    u_auc = st[f"{key}_auc_mean"]
+                    u_std = st.get(f"{key}_auc_std", 0.0)
+                    u_ap = st[f"{key}_ap_mean"]
+                    diff = u_auc - lp_auc
+                    diff_str = f"+{diff:.4f}" if diff >= 0 else f"{diff:.4f}"
+                    auc_str = f"{u_auc:.4f} ± {u_std:.4f}"
+                    print(f"{sp.upper():<7} | {label:<24} | {auc_str:<15} | {u_ap:<8.4f} | {diff_str:<12}")
+            print("-" * 80)
+    else:
+        print("\n" + "!" * 80)
+        print("[NOTICE] No pre-trained UDA models were loaded for this evaluation.")
+        print("To evaluate UDA models (CORAL, DANN, DAN, CDAN, SHOT):")
+        print("  1. Run downstream training first:")
+        print(f"     python -m src.PECT_JEPA.cross_condition.downstream.train_downstream --checkpoint {ckpt_path} --data_dir {args.data_dir}")
+        print("  2. Re-run evaluate:")
+        print(f"     python -m src.PECT_JEPA.cross_condition.evaluate --checkpoint {ckpt_path} --data_dir {args.data_dir}")
+        print("!" * 80)
+
     for sp in args.eval_splits:
         n_flag = sum(1 for r in master_results if r["split"] == sp and r.get("regime_ood", 0) == 1)
         n_sp = sum(1 for r in master_results if r["split"] == sp)
         print(f"[REGIME] {sp.upper():5s}: {n_flag}/{n_sp} files flagged OOD-regime (E||z||^2 outside 2x train median {ref_energy:.1f})")
     print(f"\nAll results saved to: {out_dir}")
-    print("=" * 75 + "\n", flush=True)
+    print("=" * 80 + "\n", flush=True)
 
 
 if __name__ == "__main__":
