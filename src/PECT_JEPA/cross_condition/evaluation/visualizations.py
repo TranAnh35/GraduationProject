@@ -558,17 +558,28 @@ def plot_training_curves(
         axes[1].grid(True, alpha=0.3)
         axes[1].legend(loc="lower right", fontsize=8)
 
-    # Panel 3: Validation AUC & AP
+    # Panel 3: Validation AUC & AP (Dual Y-Axis for Unsupervised Mahalanobis Metrics)
     if "val_auc" in history and len(history["val_auc"]) > 0:
-        axes[2].plot(epochs, history["val_auc"], "b-^", label="Val AUC", markersize=3)
-        if "val_ap" in history and len(history["val_ap"]) > 0:
-            axes[2].plot(epochs, history["val_ap"], "c--", label="Val AP")
+        line_auc = axes[2].plot(epochs, history["val_auc"], "b-^", label="Val AUC", markersize=3)
         axes[2].set_title("Validation Anomaly Detection", fontsize=11, fontweight="bold")
         axes[2].set_xlabel("Epoch")
-        axes[2].set_ylabel("AUC / AP")
+        axes[2].set_ylabel("AUC-ROC", color="blue")
+        axes[2].tick_params(axis="y", labelcolor="blue")
         axes[2].set_ylim([0.4, 1.02])
         axes[2].grid(True, alpha=0.3)
-        axes[2].legend(loc="lower right", fontsize=8)
+
+        if "val_ap" in history and len(history["val_ap"]) > 0 and any(v > 0 for v in history["val_ap"]):
+            ax2_ap = axes[2].twinx()
+            line_ap = ax2_ap.plot(epochs, history["val_ap"], "c--s", label="Val AP", markersize=3)
+            ax2_ap.set_ylabel("Average Precision (AP)", color="teal")
+            ax2_ap.tick_params(axis="y", labelcolor="teal")
+            max_ap = float(max(history["val_ap"]))
+            ax2_ap.set_ylim([0.0, max(0.04, max_ap * 1.5)])
+            lines = line_auc + line_ap
+            labels = [l.get_label() for l in lines]
+            axes[2].legend(lines, labels, loc="lower right", fontsize=8)
+        else:
+            axes[2].legend(loc="lower right", fontsize=8)
     else:
         axes[2].text(0.5, 0.5, "No Validation Telemetry", ha="center", va="center", transform=axes[2].transAxes)
 

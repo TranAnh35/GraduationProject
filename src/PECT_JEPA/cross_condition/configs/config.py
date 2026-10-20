@@ -30,9 +30,10 @@ class CrossConditionConfig:
     temporal_samples: int = 128
     num_harmonics: int = 16
 
-    # Masking specification (9 core target probes, 16 outer context probes)
+    # Masking specification (concentric star topology)
     num_target_probes: int = 9
     num_context_probes: int = 16
+    num_target_rays: int = 3              # Number of contiguous rays masked (3 = 9 target / 16 context [36%]; 5 = 15 target / 10 context [60%])
     continuous_pos_embed: bool = False    # Option A: continuous 2D coordinate MLP pos_mlp(dr, dc) instead of discrete pos_embed table
     contiguous_masking: bool = False      # Contiguous non-enclosing wedge masking (avoids context inside target and vice versa)
     predictor_scattering_only: bool = False  # If True, predictor reads only z_s (blocks carrier z_c shortcut)
@@ -114,6 +115,7 @@ class CrossConditionConfig:
 
     # Loss weights
     pred_loss_type: str = "l1"  # Pure L1 loss preserving subtle flaw gradients
+    pred_magnitude_weight: float = 0.0    # Scale-invariant log-energy magnitude penalty |log(||pred||) - log(||tgt||)|
     scan_centered_vicreg: bool = True  # If True, centers representations per scan before computing VICReg (forces within-scan variance)
     var_weight: float = 0.5     # Gentle VICReg variance scale anchor (std >= 1.0, prevents 2D collapse)
     cov_weight: float = 0.0     # Covariance decorrelation penalty (0.0 allows natural 6D-12D rank)

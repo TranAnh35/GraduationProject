@@ -171,8 +171,10 @@ class CrossConditionJEPA(nn.Module):
         # Contiguous non-enclosing wedge mask bank (16 masks: 8 Family A outer half-plane wedges
         # with Center 0 in Context + 8 Family B apex-inclusive wedges with Center 0 in Target).
         # Registered with persistent=False so legacy checkpoints load with strict=True.
+        _rays = getattr(config, "num_target_rays", 3)
         tgt_bank_np, ctx_bank_np = get_contiguous_star_masks(
-            star_radii=tuple(getattr(config, "star_radii", (1, 3, 7)))
+            star_radii=tuple(getattr(config, "star_radii", (1, 3, 7))),
+            num_target_rays=_rays,
         )
         self.register_buffer("target_idx_bank", torch.from_numpy(tgt_bank_np).long(), persistent=False)
         self.register_buffer("context_idx_bank", torch.from_numpy(ctx_bank_np).long(), persistent=False)
@@ -335,7 +337,14 @@ class CrossConditionJEPA(nn.Module):
                 h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
                 h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
                 pred_shape = F.l1_loss(h_pred_norm, h_tgt_norm)
-                pred_loss = pred_cos + pred_shape
+                mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
+                if mag_weight > 0:
+                    pred_mag = torch.norm(H_pred_s, p=2, dim=-1)
+                    tgt_mag = torch.norm(H_tgt_s, p=2, dim=-1)
+                    mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
+                    pred_loss = pred_cos + pred_shape + mag_weight * mag_loss
+                else:
+                    pred_loss = pred_cos + pred_shape
             else:
                 cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
                 H_pred_b = self.predictor(
@@ -540,7 +549,14 @@ class CrossConditionJEPA(nn.Module):
                 pred_cos = 1.0 - F.cosine_similarity(H_pred_b, target_signal, dim=-1).mean()
                 h_pred_norm = F.normalize(H_pred_b, p=2.0, dim=-1)
                 h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
-                pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
+                mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
+                if mag_weight > 0:
+                    pred_mag = torch.norm(H_pred_b, p=2, dim=-1)
+                    tgt_mag = torch.norm(target_signal, p=2, dim=-1)
+                    mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
+                    pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm) + mag_weight * mag_loss
+                else:
+                    pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
             else:
                 cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
                 H_pred_b = self.predictor(

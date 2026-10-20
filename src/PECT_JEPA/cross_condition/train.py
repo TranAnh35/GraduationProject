@@ -94,6 +94,8 @@ def parse_args():
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument("--num_target_rays", type=int, default=3, choices=[3, 5], help="Number of contiguous rays masked (3=9 tgt/16 ctx [36%], 5=15 tgt/10 ctx [60%])")
+    parser.add_argument("--pred_magnitude_weight", type=float, default=0.0, help="Weight on scale-invariant relative log-energy magnitude loss")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
 
@@ -182,6 +184,8 @@ def main():
         zc_cond_weight=args.zc_cond_weight,
         offset_weight=args.offset_weight,
         pool_var_weight=args.pool_var_weight,
+        num_target_rays=args.num_target_rays,
+        pred_magnitude_weight=args.pred_magnitude_weight,
         scan_centered_vicreg=args.scan_centered_vicreg,
         var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,
