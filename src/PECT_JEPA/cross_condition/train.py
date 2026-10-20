@@ -96,6 +96,7 @@ def parse_args():
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--num_target_rays", type=int, default=3, choices=[3, 5], help="Number of contiguous rays masked (3=9 tgt/16 ctx [36%], 5=15 tgt/10 ctx [60%])")
     parser.add_argument("--pred_magnitude_weight", type=float, default=0.0, help="Weight on scale-invariant relative log-energy magnitude loss")
+    parser.add_argument("--self_focus_gamma", type=float, default=0.0, help="Exponent for self-supervised hard-sample focus weighting (0.0 = uniform)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
 
@@ -186,6 +187,7 @@ def main():
         pool_var_weight=args.pool_var_weight,
         num_target_rays=args.num_target_rays,
         pred_magnitude_weight=args.pred_magnitude_weight,
+        self_focus_gamma=args.self_focus_gamma,
         scan_centered_vicreg=args.scan_centered_vicreg,
         var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,

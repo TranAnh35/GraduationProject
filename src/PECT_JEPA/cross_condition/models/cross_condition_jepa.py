@@ -333,18 +333,38 @@ class CrossConditionJEPA(nn.Module):
                     ctx_coords=ctx_coords_a,
                 )
                 H_pred_s = H_pred_b[..., D_c:]
-                pred_cos = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1).mean()
-                h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
-                h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
-                pred_shape = F.l1_loss(h_pred_norm, h_tgt_norm)
-                mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
-                if mag_weight > 0:
-                    pred_mag = torch.norm(H_pred_s, p=2, dim=-1)
-                    tgt_mag = torch.norm(H_tgt_s, p=2, dim=-1)
-                    mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
-                    pred_loss = pred_cos + pred_shape + mag_weight * mag_loss
+                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
+                if focus_gamma > 0:
+                    cos_per_probe = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1)
+                    h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
+                    h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
+                    shape_per_probe = (h_pred_norm - h_tgt_norm).abs().mean(dim=-1)
+                    sample_loss = cos_per_probe.mean(dim=-1) + shape_per_probe.mean(dim=-1)
+                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
+                    if mag_weight > 0:
+                        pred_mag = torch.norm(H_pred_s, p=2, dim=-1)
+                        tgt_mag = torch.norm(H_tgt_s, p=2, dim=-1)
+                        mag_per_probe = (torch.log(pred_mag + 1e-4) - torch.log(tgt_mag + 1e-4)).abs().mean(dim=-1)
+                        sample_loss = sample_loss + mag_weight * mag_per_probe
+                    tgt_dev = torch.norm(H_tgt_s.detach(), p=2, dim=-1).mean(dim=-1)
+                    weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
+                    weights = weights / (weights.mean() + 1e-8)
+                    weights = torch.clamp(weights, min=0.2, max=5.0)
+                    weights = weights / (weights.mean() + 1e-8)
+                    pred_loss = (weights * sample_loss).mean()
                 else:
-                    pred_loss = pred_cos + pred_shape
+                    pred_cos = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1).mean()
+                    h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
+                    h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
+                    pred_shape = F.l1_loss(h_pred_norm, h_tgt_norm)
+                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
+                    if mag_weight > 0:
+                        pred_mag = torch.norm(H_pred_s, p=2, dim=-1)
+                        tgt_mag = torch.norm(H_tgt_s, p=2, dim=-1)
+                        mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
+                        pred_loss = pred_cos + pred_shape + mag_weight * mag_loss
+                    else:
+                        pred_loss = pred_cos + pred_shape
             else:
                 cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
                 H_pred_b = self.predictor(
@@ -546,17 +566,37 @@ class CrossConditionJEPA(nn.Module):
                     tgt_coords=tgt_coords_b if diff_attn else None,
                     ctx_coords=ctx_coords_a if diff_attn else None,
                 )
-                pred_cos = 1.0 - F.cosine_similarity(H_pred_b, target_signal, dim=-1).mean()
-                h_pred_norm = F.normalize(H_pred_b, p=2.0, dim=-1)
-                h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
-                mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
-                if mag_weight > 0:
-                    pred_mag = torch.norm(H_pred_b, p=2, dim=-1)
-                    tgt_mag = torch.norm(target_signal, p=2, dim=-1)
-                    mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
-                    pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm) + mag_weight * mag_loss
+                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
+                if focus_gamma > 0:
+                    cos_per_probe = 1.0 - F.cosine_similarity(H_pred_b, target_signal, dim=-1)
+                    h_pred_norm = F.normalize(H_pred_b, p=2.0, dim=-1)
+                    h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
+                    shape_per_probe = (h_pred_norm - h_tgt_norm).abs().mean(dim=-1)
+                    sample_loss = cos_per_probe.mean(dim=-1) + shape_per_probe.mean(dim=-1)
+                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
+                    if mag_weight > 0:
+                        pred_mag = torch.norm(H_pred_b, p=2, dim=-1)
+                        tgt_mag = torch.norm(target_signal, p=2, dim=-1)
+                        mag_per_probe = (torch.log(pred_mag + 1e-4) - torch.log(tgt_mag + 1e-4)).abs().mean(dim=-1)
+                        sample_loss = sample_loss + mag_weight * mag_per_probe
+                    tgt_dev = torch.norm(target_signal.detach(), p=2, dim=-1).mean(dim=-1)
+                    weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
+                    weights = weights / (weights.mean() + 1e-8)
+                    weights = torch.clamp(weights, min=0.2, max=5.0)
+                    weights = weights / (weights.mean() + 1e-8)
+                    pred_loss = (weights * sample_loss).mean()
                 else:
-                    pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
+                    pred_cos = 1.0 - F.cosine_similarity(H_pred_b, target_signal, dim=-1).mean()
+                    h_pred_norm = F.normalize(H_pred_b, p=2.0, dim=-1)
+                    h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
+                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
+                    if mag_weight > 0:
+                        pred_mag = torch.norm(H_pred_b, p=2, dim=-1)
+                        tgt_mag = torch.norm(target_signal, p=2, dim=-1)
+                        mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
+                        pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm) + mag_weight * mag_loss
+                    else:
+                        pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
             else:
                 cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
                 H_pred_b = self.predictor(
