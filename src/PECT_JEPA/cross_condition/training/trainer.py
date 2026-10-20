@@ -209,8 +209,9 @@ class CrossConditionTrainer:
             patch25 = padded[r_idx, c_idx]  # [N, 25, C]
             patch55 = patch25.reshape(num_patches, 5, 5, C)
             x = torch.from_numpy(patch55).to(self.device, non_blocking=True)
+            ref_patch_val = x[:1].expand(x.shape[0], -1, -1, -1) if x.shape[0] > 0 else x
             with torch.amp.autocast("cuda", enabled=self.config.mixed_precision and self.device.type == "cuda"):
-                out = self.model(x_a=x, x_b=x, ref_b=x[:1].expand(x.shape[0], -1, -1, -1) if x.shape[0] > 0 else x)
+                out = self.model(x_a=x, x_b=x, ref_b=ref_patch_val, ref_a=ref_patch_val)
                 pl = out.get("pred_loss", None)
                 losses.append(float(pl.item()) if pl is not None else 0.0)
         self.model.train(was_training)
@@ -388,6 +389,9 @@ class CrossConditionTrainer:
             x_a = batch["x_a"].to(self.device, non_blocking=True)
             x_b = batch["x_b"].to(self.device, non_blocking=True)
             ref_b = batch["ref_b"].to(self.device, non_blocking=True)
+            ref_a = batch.get("ref_a")
+            if ref_a is not None:
+                ref_a = ref_a.to(self.device, non_blocking=True)
             scan_id = batch.get("scan_id")
             if scan_id is not None:
                 scan_id = scan_id.to(self.device, non_blocking=True)
@@ -402,9 +406,16 @@ class CrossConditionTrainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=self.config.mixed_precision and self.device.type == "cuda"):
-                outputs = self.model(x_a, x_b, ref_b, scan_id=scan_id,
-                                     inv_scale=inv_scale, xcov_scale=xcov_scale,
-                                     inv_sound_mask=inv_sound_mask)
+                outputs = self.model(
+                    x_a,
+                    x_b,
+                    ref_b,
+                    ref_a=ref_a,
+                    scan_id=scan_id,
+                    inv_scale=inv_scale,
+                    xcov_scale=xcov_scale,
+                    inv_sound_mask=inv_sound_mask,
+                )
                 loss = outputs["total_loss"]
 
             self.scaler.scale(loss).backward()

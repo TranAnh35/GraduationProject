@@ -68,6 +68,15 @@ class PredictorBlock(nn.Module):
             # Zero-initialize the modulation projection so it starts as exact identity
             nn.init.zeros_(self.ada_mod[1].weight)
             nn.init.zeros_(self.ada_mod[1].bias)
+        elif self.modulation == "pure_film":
+            # Pure Multiplicative FiLM (no additive beta bias): only scales norm_self and norm_mlp
+            # by (1 + tanh(gamma)), completely eliminating additive shortcut collapse!
+            self.film_mod = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(embed_dim, 2 * embed_dim),
+            )
+            nn.init.zeros_(self.film_mod[1].weight)
+            nn.init.zeros_(self.film_mod[1].bias)
 
     def forward(
         self,
@@ -88,7 +97,30 @@ class PredictorBlock(nn.Module):
             gamma_c = torch.exp(self.gamma_cross_log).view(1, self.num_heads, 1, 1)
             attn_bias_cross = -gamma_c * dist_cross_sq.unsqueeze(1)
 
-        if self.modulation == "adaln" and condition_vec is not None:
+        if self.modulation == "pure_film" and condition_vec is not None:
+            # Multiplicative FiLM: zero additive shift (blocks identity/DC shortcut)
+            c = condition_vec.squeeze(1) if condition_vec.ndim == 3 else condition_vec
+            params = self.film_mod(c)  # [B, 2*D]
+            gamma_s, gamma_m = params.chunk(2, dim=-1)
+            gamma_s = gamma_s.unsqueeze(1)  # [B, 1, D]
+            gamma_m = gamma_m.unsqueeze(1)
+
+            # 1. Scaled Self-Attention
+            norm_q = self.norm_self(target_queries) * (1.0 + torch.tanh(gamma_s))
+            q = target_queries + self.self_attn(norm_q, attn_bias=attn_bias_self)
+
+            # 2. Cross-Attention to Context
+            q = q + self.cross_attn(
+                query=self.norm_cross_q(q),
+                key_value=self.norm_cross_kv(H_context),
+                attn_bias=attn_bias_cross,
+            )
+
+            # 3. Scaled MLP
+            norm_m = self.norm_mlp(q) * (1.0 + torch.tanh(gamma_m))
+            q = q + self.mlp(norm_m)
+            return q
+        elif self.modulation == "adaln" and condition_vec is not None:
             # condition_vec: [B, 1, D] -> [B, D]
             if condition_vec.ndim == 3:
                 c = condition_vec.squeeze(1)
@@ -223,7 +255,7 @@ class CrossConditionPredictor(nn.Module):
                 H_context_kv = torch.cat([H_context, c], dim=1)
             elif self.modulation == "additive":
                 queries = queries + condition_token
-            elif self.modulation == "adaln":
+            elif self.modulation in ("adaln", "pure_film"):
                 cond_for_block = condition_token
 
         q = queries

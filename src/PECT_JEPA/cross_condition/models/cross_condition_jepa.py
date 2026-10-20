@@ -118,6 +118,17 @@ class CrossConditionJEPA(nn.Module):
             nn.Linear(config.embed_dim, config.embed_dim),
         )
 
+        # 4b. Relative Domain Transfer Operator Projector T(c_A, c_B)
+        # Inactive unless relative_condition_operator is True so legacy checkpoints load with strict=True.
+        if getattr(config, "relative_condition_operator", False):
+            self.transfer_proj = nn.Sequential(
+                nn.Linear(config.embed_dim + 1, config.embed_dim),
+                nn.GELU(),
+                nn.Linear(config.embed_dim, config.embed_dim),
+            )
+        else:
+            self.transfer_proj = None
+
         # 5. Cross-Condition Predictor
         self.predictor = CrossConditionPredictor(config)
 
@@ -194,6 +205,7 @@ class CrossConditionJEPA(nn.Module):
         x_a: torch.Tensor,
         x_b: torch.Tensor,
         ref_b: torch.Tensor,
+        ref_a: Optional[torch.Tensor] = None,
         scan_id: Optional[torch.Tensor] = None,
         inv_scale: float = 1.0,
         xcov_scale: float = 1.0,
@@ -204,6 +216,7 @@ class CrossConditionJEPA(nn.Module):
         x_a:     [B, 5, 5, C] measurement patch from Condition A
         x_b:     [B, 5, 5, C] measurement patch from Condition B (same physical coordinate)
         ref_b:   [B, 5, 5, C] background sound-metal patch of Condition B
+        ref_a:   [B, 5, 5, C] background sound-metal patch of Condition A (optional for domain transfer)
         scan_id: [B] scan pair identifier for within-scan centered regularization
         inv_scale/xcov_scale: P0-1 curriculum multipliers in [0, 1] supplied by
             the trainer from the epoch schedule (default 1.0 = legacy path).
@@ -215,8 +228,24 @@ class CrossConditionJEPA(nn.Module):
         tokens_a, pos_a = self.tokenizer(x_a)  # [B, 25, D]
         tokens_b, pos_b = self.tokenizer(x_b)  # [B, 25, D]
 
-        # 2. Extract self-supervised condition token (disabled if use_condition_token is False)
+        # 2. Extract self-supervised condition token and domain transfer operator
         c_b = self.extract_condition_token(ref_b) if self.config.use_condition_token else None
+        cond_transfer = None
+        if self.config.use_condition_token and c_b is not None:
+            if (
+                getattr(self.config, "relative_condition_operator", False)
+                and ref_a is not None
+                and self.transfer_proj is not None
+            ):
+                c_a = self.extract_condition_token(ref_a)
+                norm_a = torch.norm(c_a, p=2, dim=-1, keepdim=True) + 1e-6
+                norm_b = torch.norm(c_b, p=2, dim=-1, keepdim=True) + 1e-6
+                delta_u = (c_b / norm_b) - (c_a / norm_a)  # [B, 1, D]
+                rho = torch.log(norm_b / norm_a)  # [B, 1, 1]
+                op_in = torch.cat([delta_u, rho], dim=-1)  # [B, 1, D + 1]
+                cond_transfer = self.transfer_proj(op_in)  # [B, 1, D]
+            else:
+                cond_transfer = c_b
 
         # 3. Partition tokens:
         # - If contiguous_masking=True: sample from 16 spatially contiguous, non-enclosing
@@ -291,9 +320,9 @@ class CrossConditionJEPA(nn.Module):
 
             if getattr(self.config, "grounded_condition_pred", False):
                 # Direction C: Grounded Condition Transfer Function Prediction
-                # Normalize c_b to unit sphere: extracts condition transfer orientation/angle
+                # Normalize condition token to unit sphere: extracts condition transfer orientation/angle
                 # without passing DC magnitude (blocks identity shortcut and instant collapse!)
-                cond_in = F.normalize(c_b, p=2.0, dim=-1) if c_b is not None else None
+                cond_in = F.normalize(cond_transfer, p=2.0, dim=-1) if cond_transfer is not None else None
                 H_pred_b = self.predictor(
                     H_ctx_for_pred,
                     tgt_pos_b,
@@ -308,10 +337,11 @@ class CrossConditionJEPA(nn.Module):
                 pred_shape = F.l1_loss(h_pred_norm, h_tgt_norm)
                 pred_loss = pred_cos + pred_shape
             else:
+                cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
                 H_pred_b = self.predictor(
                     H_ctx_for_pred,
                     tgt_pos_b,
-                    condition_token=None,
+                    condition_token=cond_in,
                     tgt_coords=tgt_coords_b,
                     ctx_coords=ctx_coords_a,
                 )
@@ -499,7 +529,7 @@ class CrossConditionJEPA(nn.Module):
             # Standard single-space prediction
             diff_attn = bool(getattr(self.config, "diffusion_attention", False))
             if getattr(self.config, "grounded_condition_pred", False):
-                cond_in = F.normalize(c_b, p=2.0, dim=-1) if c_b is not None else None
+                cond_in = F.normalize(cond_transfer, p=2.0, dim=-1) if cond_transfer is not None else None
                 H_pred_b = self.predictor(
                     H_ctx_a,
                     tgt_pos_b,
@@ -512,10 +542,11 @@ class CrossConditionJEPA(nn.Module):
                 h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
                 pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
             else:
+                cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
                 H_pred_b = self.predictor(
                     H_ctx_a,
                     tgt_pos_b,
-                    condition_token=c_b,
+                    condition_token=cond_in,
                     tgt_coords=tgt_coords_b if diff_attn else None,
                     ctx_coords=ctx_coords_a if diff_attn else None,
                 )

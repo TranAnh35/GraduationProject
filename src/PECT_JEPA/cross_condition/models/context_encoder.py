@@ -65,6 +65,8 @@ class TwoStreamContextEncoder(nn.Module):
             for _ in range(config.encoder_depth)
         ])
 
+        self.coupling_mode = getattr(config, "carrier_coupling_mode", "additive")
+
         self.norm_c = nn.LayerNorm(self.carrier_dim)
         self.norm_s = nn.LayerNorm(self.scattering_dim, bias=False)
 
@@ -83,8 +85,16 @@ class TwoStreamContextEncoder(nn.Module):
         ):
             h_c = c_blk(h_c, coords=coords)
             c_detached = h_c.detach()
-            c_mod = gate(c_detached) * proj(c_detached)
-            h_s = s_blk(h_s + c_mod, coords=coords)
+            if self.coupling_mode == "none":
+                h_s = s_blk(h_s, coords=coords)
+            elif self.coupling_mode == "multiplicative":
+                # Pure multiplicative modulation: scales scattering sensitivity without injecting DC carrier energy
+                c_mod = gate(c_detached) * torch.tanh(proj(c_detached))
+                h_s = s_blk(h_s * (1.0 + c_mod), coords=coords)
+            else:
+                # Additive carrier injection (legacy)
+                c_mod = gate(c_detached) * proj(c_detached)
+                h_s = s_blk(h_s + c_mod, coords=coords)
 
         out_c = self.norm_c(h_c)
         out_s = self.norm_s(h_s)

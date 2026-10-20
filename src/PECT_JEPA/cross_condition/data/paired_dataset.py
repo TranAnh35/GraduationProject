@@ -249,6 +249,7 @@ class PairedPECTDataset(Dataset):
         sample = {
             "x_a": torch.from_numpy(patch_a).float(),
             "x_b": torch.from_numpy(patch_b).float(),
+            "ref_a": torch.from_numpy(scan_a["ref_patch"]).float(),
             "ref_b": torch.from_numpy(scan_b["ref_patch"]).float(),
             "coord": torch.tensor([r, c], dtype=torch.long),
             "scan_id": torch.tensor(pair_idx, dtype=torch.long),

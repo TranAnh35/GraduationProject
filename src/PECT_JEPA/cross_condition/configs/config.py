@@ -46,9 +46,11 @@ class CrossConditionConfig:
     bi_directional_relative_energy: bool = False  # If True, appends both signed Delta E and absolute magnitude |Delta E| to time branch (eliminates Rivet_v2 half-space sign inversion in latent space)
     diffusion_attention: bool = False  # Direction A: Physically-grounded Green's diffusion distance-decay attention bias
     two_stream_backbone: bool = False  # Direction B: Asymmetric two-stream decoupled encoder backbone (carrier z_c vs scattering z_s)
+    carrier_coupling_mode: str = "additive"  # 'additive' (legacy), 'multiplicative' (pure scaling), 'none' (fully decoupled)
     grounded_condition_pred: bool = False  # Direction C: Condition transfer function grounding with scale-normalized directional target prediction
     use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
-    condition_modulation: str = "none"  # 'query_projection', 'cross_attention', 'adaln', 'additive', 'none'
+    relative_condition_operator: bool = False  # If True, condition token is domain transfer operator T(c_A, c_B) preventing shortcut DC leakage
+    condition_modulation: str = "none"  # 'query_projection', 'cross_attention', 'adaln', 'pure_film', 'additive', 'none'
     tokenizer_type: str = "dual_domain"  # 'dual_domain' (baseline EXP-44), 'energy_adaptive', 'patch_energy_adaptive', 'waveform_invariant'
     relative_target: bool = False  # If False, predicts full-field target H_tgt preserving natural target variance
 

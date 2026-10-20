@@ -46,7 +46,9 @@ def parse_args():
     parser.add_argument("--cov_weight", type=float, default=0.0, help="VICReg covariance penalty weight (0.0 to disable)")
     parser.add_argument("--relative_target", type=lambda v: v.lower() == "true", default=False, help="Predict relative flaw perturbation Delta H (default False: full target H_tgt)")
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_b in predictor")
-    parser.add_argument("--condition_modulation", type=str, default="query_projection", choices=["query_projection", "cross_attention", "adaln", "additive", "none"], help="Modulation type for condition token c_b")
+    parser.add_argument("--relative_condition_operator", type=lambda v: v.lower() == "true", default=False, help="Domain transfer operator T(c_A, c_B) preventing shortcut DC leakage")
+    parser.add_argument("--condition_modulation", type=str, default="query_projection", choices=["query_projection", "cross_attention", "adaln", "pure_film", "additive", "none"], help="Modulation type for condition token c_b")
+    parser.add_argument("--carrier_coupling_mode", type=str, default="additive", choices=["additive", "multiplicative", "none"], help="Carrier to scattering coupling mode in two-stream backbone")
     parser.add_argument("--tokenizer_type", type=str, default="dual_domain", choices=["energy_adaptive", "patch_energy_adaptive", "dual_domain", "waveform_invariant"], help="Tokenizer type ('waveform_invariant', 'dual_domain', 'energy_adaptive', 'patch_energy_adaptive')")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
     parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")
@@ -155,9 +157,11 @@ def main():
         bi_directional_relative_energy=args.bi_directional_relative_energy,
         diffusion_attention=args.diffusion_attention,
         two_stream_backbone=args.two_stream_backbone,
+        carrier_coupling_mode=args.carrier_coupling_mode,
         grounded_condition_pred=args.grounded_condition_pred,
         relative_target=args.relative_target,
         use_condition_token=args.use_condition_token,
+        relative_condition_operator=args.relative_condition_operator,
         condition_modulation=args.condition_modulation,
         tokenizer_type=args.tokenizer_type,
         latent_disentanglement=args.latent_disentanglement,
