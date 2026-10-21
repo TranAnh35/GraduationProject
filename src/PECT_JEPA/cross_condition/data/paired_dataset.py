@@ -60,6 +60,7 @@ class PairedPECTDataset(Dataset):
         transform_csv: str = "data/ground_truth/raw_tdms_rotate_crop.csv",
         seed: int = 42,
         include_sound_mask: bool = False,
+        dynamic_condition_token: bool = False,
     ):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
@@ -83,6 +84,7 @@ class PairedPECTDataset(Dataset):
         # once here (2 x 270x270, trivial RAM). Only consumed when the model
         # flag inv_oracle_mask is on; otherwise __getitem__ skips the lookup.
         self.include_sound_mask = bool(include_sound_mask)
+        self.dynamic_condition_token = bool(dynamic_condition_token)
         _gt_base = data_dir if data_dir is not None else "data"
         self.gt_by_specimen: Dict[str, np.ndarray] = {}
         if self.include_sound_mask:
@@ -246,11 +248,22 @@ class PairedPECTDataset(Dataset):
         patch_a = scan_a["padded"][sample_r, sample_c, :].reshape(self.grid_size, self.grid_size, -1)
         patch_b = scan_b["padded"][sample_r, sample_c, :].reshape(self.grid_size, self.grid_size, -1)
 
+        if self.dynamic_condition_token:
+            # Dynamically sample a 5x5 patch from the safe sound-metal margin [10:35, 10:35]
+            # Identical physical coordinates for both Condition A and Condition B:
+            ref_r = np.random.randint(10, 35) + self.pad
+            ref_c = np.random.randint(10, 35) + self.pad
+            ref_patch_a = scan_a["padded"][ref_r : ref_r + self.grid_size, ref_c : ref_c + self.grid_size, :]
+            ref_patch_b = scan_b["padded"][ref_r : ref_r + self.grid_size, ref_c : ref_c + self.grid_size, :]
+        else:
+            ref_patch_a = scan_a["ref_patch"]
+            ref_patch_b = scan_b["ref_patch"]
+
         sample = {
             "x_a": torch.from_numpy(patch_a).float(),
             "x_b": torch.from_numpy(patch_b).float(),
-            "ref_a": torch.from_numpy(scan_a["ref_patch"]).float(),
-            "ref_b": torch.from_numpy(scan_b["ref_patch"]).float(),
+            "ref_a": torch.from_numpy(ref_patch_a).float(),
+            "ref_b": torch.from_numpy(ref_patch_b).float(),
             "coord": torch.tensor([r, c], dtype=torch.long),
             "scan_id": torch.tensor(pair_idx, dtype=torch.long),
         }

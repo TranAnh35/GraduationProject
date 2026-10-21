@@ -333,8 +333,21 @@ class CrossConditionJEPA(nn.Module):
                     ctx_coords=ctx_coords_a,
                 )
                 H_pred_s = H_pred_b[..., D_c:]
+                pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
                 focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
-                if focus_gamma > 0:
+                if pred_loss_type == "raw_l1":
+                    # EXP-67: Unnormalized physical Raw L1 loss in feature space
+                    sample_loss = (H_pred_s - H_tgt_s).abs().mean(dim=(-2, -1))
+                    if focus_gamma > 0:
+                        tgt_dev = torch.norm(H_tgt_s.detach(), p=2, dim=-1).mean(dim=-1)
+                        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
+                        weights = weights / (weights.mean() + 1e-8)
+                        weights = torch.clamp(weights, min=0.2, max=5.0)
+                        weights = weights / (weights.mean() + 1e-8)
+                        pred_loss = (weights * sample_loss).mean()
+                    else:
+                        pred_loss = sample_loss.mean()
+                elif focus_gamma > 0:
                     cos_per_probe = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1)
                     h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
                     h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
@@ -376,7 +389,19 @@ class CrossConditionJEPA(nn.Module):
                 )
                 H_pred_s = H_pred_b[..., D_c:]
                 pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
-                if pred_loss_type == "smooth_l1":
+                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
+                if pred_loss_type == "raw_l1":
+                    sample_loss = (H_pred_s - H_tgt_s).abs().mean(dim=(-2, -1))
+                    if focus_gamma > 0:
+                        tgt_dev = torch.norm(H_tgt_s.detach(), p=2, dim=-1).mean(dim=-1)
+                        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
+                        weights = weights / (weights.mean() + 1e-8)
+                        weights = torch.clamp(weights, min=0.2, max=5.0)
+                        weights = weights / (weights.mean() + 1e-8)
+                        pred_loss = (weights * sample_loss).mean()
+                    else:
+                        pred_loss = sample_loss.mean()
+                elif pred_loss_type == "smooth_l1":
                     pred_loss = F.smooth_l1_loss(H_pred_s, H_tgt_s)
                 elif pred_loss_type == "cosine_normalized_l1":
                     pred_cos = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1).mean()
@@ -544,16 +569,33 @@ class CrossConditionJEPA(nn.Module):
             else:
                 offset_loss = torch.tensor(0.0, device=device)
 
-            total_loss = (
-                pred_loss
-                + carrier_loss
-                + vicreg_loss
-                + eff_inv * inv_loss
-                + eff_xcov * xcov_loss
-                + zc_cond_weight * zc_cond_loss
-                + offset_weight * offset_loss
-                + pool_var_weight * pool_var_loss
-            )
+            anti_hijack_ratio = getattr(self.config, "anti_hijack_ratio", 0.0)
+            if anti_hijack_ratio > 0 and pred_loss.detach() > 0:
+                aux_loss = (
+                    carrier_loss
+                    + vicreg_loss
+                    + eff_inv * inv_loss
+                    + eff_xcov * xcov_loss
+                    + zc_cond_weight * zc_cond_loss
+                    + offset_weight * offset_loss
+                    + pool_var_weight * pool_var_loss
+                )
+                max_aux = anti_hijack_ratio * pred_loss.detach()
+                if aux_loss > max_aux:
+                    aux_scale = max_aux / (aux_loss + 1e-8)
+                    aux_loss = aux_loss * aux_scale
+                total_loss = pred_loss + aux_loss
+            else:
+                total_loss = (
+                    pred_loss
+                    + carrier_loss
+                    + vicreg_loss
+                    + eff_inv * inv_loss
+                    + eff_xcov * xcov_loss
+                    + zc_cond_weight * zc_cond_loss
+                    + offset_weight * offset_loss
+                    + pool_var_weight * pool_var_loss
+                )
         else:
             # Standard single-space prediction
             diff_attn = bool(getattr(self.config, "diffusion_attention", False))
@@ -606,7 +648,21 @@ class CrossConditionJEPA(nn.Module):
                     tgt_coords=tgt_coords_b if diff_attn else None,
                     ctx_coords=ctx_coords_a if diff_attn else None,
                 )
-                pred_loss = F.l1_loss(H_pred_b, target_signal)
+                pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
+                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
+                if pred_loss_type == "raw_l1":
+                    sample_loss = (H_pred_b - target_signal).abs().mean(dim=(-2, -1))
+                    if focus_gamma > 0:
+                        tgt_dev = torch.norm(target_signal.detach(), p=2, dim=-1).mean(dim=-1)
+                        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
+                        weights = weights / (weights.mean() + 1e-8)
+                        weights = torch.clamp(weights, min=0.2, max=5.0)
+                        weights = weights / (weights.mean() + 1e-8)
+                        pred_loss = (weights * sample_loss).mean()
+                    else:
+                        pred_loss = sample_loss.mean()
+                else:
+                    pred_loss = F.l1_loss(H_pred_b, target_signal)
 
             flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
             if self.config.var_weight > 0 or self.config.cov_weight > 0:
