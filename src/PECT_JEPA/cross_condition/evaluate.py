@@ -386,6 +386,11 @@ def evaluate_canonical_domain_adaptation(
                         uda_metrics={"auc": m_auc, "ap": m_ap},
                     )
 
+                    # A file whose GT mask has a single class has no defined AUC; averaging a
+                    # placeholder 0.0 into auc_mean silently drags the shift summary down.
+                    if not has_both:
+                        print(f"    [skip] {m_name} {set_name} {fname}: GT mask has a single class")
+                        continue
                     shift_rows.append({
                         "shift": shift,
                         "domain_set": set_name,

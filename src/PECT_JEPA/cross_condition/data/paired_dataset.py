@@ -61,6 +61,7 @@ class PairedPECTDataset(Dataset):
         seed: int = 42,
         include_sound_mask: bool = False,
         dynamic_condition_token: bool = False,
+        ref_patch_mode: str = "legacy",
     ):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
@@ -85,6 +86,7 @@ class PairedPECTDataset(Dataset):
         # flag inv_oracle_mask is on; otherwise __getitem__ skips the lookup.
         self.include_sound_mask = bool(include_sound_mask)
         self.dynamic_condition_token = bool(dynamic_condition_token)
+        self.ref_patch_mode = str(ref_patch_mode)
         _gt_base = data_dir if data_dir is not None else "data"
         self.gt_by_specimen: Dict[str, np.ndarray] = {}
         if self.include_sound_mask:
@@ -125,7 +127,18 @@ class PairedPECTDataset(Dataset):
             )
             sY, sX, C = cscan.shape
             padded = np.pad(cscan, ((_pad, _pad), (_pad, _pad), (0, 0)), mode="edge")
-            ref_patch = cscan[10:15, 10:15, :].copy()
+            # Background "sound metal" reference patch consumed by the condition token.
+            # 'legacy': top-left 5x5, which sits inside the first defect site (15,15):
+            #   measured 96% GT defect pixels on Corrosion (audit_ref_patch.py).
+            # 'corner_median': pixel-wise median of the 4 corner patches -- 0% defect
+            #   pixels on all three specimens, >=8.5 px from the nearest defect, and
+            #   robust to the canonical rotation/flip of each file.
+            if ref_patch_mode == "corner_median":
+                _corners = (cscan[0:5, 0:5, :], cscan[0:5, -5:, :],
+                            cscan[-5:, 0:5, :], cscan[-5:, -5:, :])
+                ref_patch = np.median(np.stack(_corners, axis=0), axis=0).astype(cscan.dtype)
+            else:
+                ref_patch = cscan[10:15, 10:15, :].copy()
             return fpath, meta, {
                 "file_path": fpath,
                 "meta": meta,
@@ -249,7 +262,10 @@ class PairedPECTDataset(Dataset):
         patch_b = scan_b["padded"][sample_r, sample_c, :].reshape(self.grid_size, self.grid_size, -1)
 
         if self.dynamic_condition_token:
-            # Dynamically sample a 5x5 patch from the safe sound-metal margin [10:35, 10:35]
+            # Dynamically sample a 5x5 patch from the margin [10:35, 10:35].
+            # NOTE: for Corrosion the first defect site is (15,15) with a radius that
+            # reaches rows/cols 10..14, so this window is NOT defect-free either
+            # (audit_ref_patch.py). Prefer ref_patch_mode='corner_median' instead.
             # Identical physical coordinates for both Condition A and Condition B:
             ref_r = np.random.randint(10, 35) + self.pad
             ref_c = np.random.randint(10, 35) + self.pad

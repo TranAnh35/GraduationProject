@@ -22,6 +22,48 @@ from .target_encoder import TargetEncoder
 from .predictor import CrossConditionPredictor
 
 
+# EXP-68 spectral condition token: number of harmonic bins kept above DC.
+SPECTRAL_N_HARMONICS = 8
+
+
+def spectral_token_dim(config) -> int:
+    """Feature width of the Dodd-Deeds condition signature.
+
+    'cos_sin' (default): each harmonic contributes (cos theta_k, sin theta_k) so the
+    signature has no discontinuity at the +-pi branch cut, then a normalized energy
+    ratio per harmonic. 'raw': theta_k / pi in [-1, 1] as in the first exp68 draft.
+    """
+    enc = getattr(config, "spectral_phase_encoding", "cos_sin")
+    phase_dim = 2 * SPECTRAL_N_HARMONICS if enc == "cos_sin" else SPECTRAL_N_HARMONICS
+    return phase_dim + SPECTRAL_N_HARMONICS
+
+
+def normalized_probe_l1(pred: torch.Tensor, tgt: torch.Tensor, focus_gamma: float = 0.0) -> torch.Tensor:
+    """EXP-68 probe-wise normalized L1: z-score each probe over its feature dimension.
+
+    Invariant to any per-probe rescaling of the representation, so shrinking the latent
+    cannot reduce the loss (removes the death-spiral descent direction of raw L1), while
+    a position-blind / constant prediction is still heavily penalized.
+    """
+    pred_m = pred.mean(dim=-1, keepdim=True)
+    pred_s = pred.std(dim=-1, keepdim=True).clamp_min(1e-8)
+    h_pred_norm = (pred - pred_m) / pred_s
+
+    tgt_m = tgt.mean(dim=-1, keepdim=True)
+    tgt_s = tgt.std(dim=-1, keepdim=True).clamp_min(1e-8)
+    h_tgt_norm = (tgt - tgt_m) / tgt_s
+
+    sample_loss = (h_pred_norm - h_tgt_norm).abs().mean(dim=(-2, -1))
+    if focus_gamma > 0:
+        tgt_dev = torch.norm(tgt.detach(), p=2, dim=-1).mean(dim=-1)
+        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
+        weights = weights / (weights.mean() + 1e-8)
+        weights = torch.clamp(weights, min=0.2, max=5.0)
+        weights = weights / (weights.mean() + 1e-8)
+        return (weights * sample_loss).mean()
+    return sample_loss.mean()
+
+
 def center_by_group(z_f: torch.Tensor, group_id: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Center a 2D tensor z_f [N, D] (float32) per group_id [N] if provided,
@@ -133,7 +175,7 @@ class CrossConditionJEPA(nn.Module):
         # Inactive unless spectral_condition_token is True so legacy checkpoints load with strict=True.
         if getattr(config, "spectral_condition_token", False):
             self.spec_cond_proj = nn.Sequential(
-                nn.Linear(16, config.embed_dim),
+                nn.Linear(spectral_token_dim(config), config.embed_dim),
                 nn.GELU(),
                 nn.Linear(config.embed_dim, config.embed_dim),
             )
@@ -202,12 +244,15 @@ class CrossConditionJEPA(nn.Module):
 
     def extract_spectral_condition_token(self, ref_b: torch.Tensor) -> torch.Tensor:
         """
-        EXP-68: Extracts Dodd-Deeds 16D spectral signature condition token c_B from sound-metal patch ref_b.
+        EXP-68: Extracts the Dodd-Deeds spectral signature c_B from the sound-metal patch ref_b.
         Completely eliminates DC amplitude (0% DC leakage) and lift-off attenuation.
-        Components:
-          - 8 harmonic Fourier phases theta_k = arg(X_k) / pi in [-1, 1]
-          - 8 harmonic normalized spectral energy ratios E_k / sum(E) in [0, 1]
-        Projected into embed_dim via spec_cond_proj.
+        Components (per harmonic k = 1..8):
+          - w_k * cos theta_k, w_k * sin theta_k  with w_k = sqrt(E_k / sum E) and
+            theta_k = arg(X_k). The (cos, sin) pair has no discontinuity at the +-pi branch
+            cut, and the energy weight keeps harmonics that carry no energy from injecting
+            their (numerically arbitrary) phase into the token.
+          - normalized spectral energy ratio E_k / sum(E) in [0, 1]
+        'spectral_phase_encoding=raw' reproduces the original theta_k / pi encoding (ablation).
         Args:
             ref_b: [B, 5, 5, C] raw background sound-metal patch (C=128 temporal samples).
         Returns:
@@ -222,16 +267,26 @@ class CrossConditionJEPA(nn.Module):
         # RFFT: [B, C // 2 + 1] complex
         X = torch.fft.rfft(ref_ac, dim=-1)
         # Extract first 8 harmonics (k = 1..8, skip DC bin 0)
-        X_harm = X[:, 1:9]  # [B, 8]
-        phases = torch.angle(X_harm) / torch.pi  # [B, 8] in [-1, 1]
+        X_harm = X[:, 1:1 + SPECTRAL_N_HARMONICS]  # [B, 8]
         mags = torch.abs(X_harm)  # [B, 8]
         energies = mags ** 2
         energy_ratios = energies / (energies.sum(dim=-1, keepdim=True) + 1e-8)  # [B, 8]
-        spec_feat = torch.cat([phases, energy_ratios], dim=-1)  # [B, 16]
+        encoding = getattr(self.config, "spectral_phase_encoding", "cos_sin")
+        if encoding == "raw":
+            phase_feat = torch.angle(X_harm) / torch.pi  # [B, 8] in [-1, 1]
+        else:
+            theta = torch.angle(X_harm)  # [B, 8] in [-pi, pi]
+            weight = torch.sqrt(energy_ratios.clamp_min(0.0))  # [B, 8] in [0, 1]
+            # interleave (w*cos, w*sin) per harmonic -> continuous at the branch cut, and
+            # a bin with ~zero energy (arbitrary phase) contributes ~zero.
+            phase_feat = torch.stack([weight * torch.cos(theta),
+                                      weight * torch.sin(theta)], dim=-1).reshape(B, -1)
+        spec_feat = torch.cat([phase_feat, energy_ratios], dim=-1)  # [B, token_dim]
         if self.spec_cond_proj is not None:
             c_b = self.spec_cond_proj(spec_feat).unsqueeze(1)  # [B, 1, D]
         else:
-            rep = max(1, self.config.embed_dim // 16)
+            dim = spec_feat.shape[-1]
+            rep = max(1, self.config.embed_dim // dim)
             c_b = spec_feat.repeat(1, rep)[:, :self.config.embed_dim].unsqueeze(1)
         return c_b
 
@@ -351,7 +406,11 @@ class CrossConditionJEPA(nn.Module):
         if getattr(self.config, "unified_latent", False):
             # EXP-68: Single Unified 64D Representation (No Subspace Fragmentation)
             diff_attn = bool(getattr(self.config, "diffusion_attention", False))
-            cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
+            # L2-normalize the condition token: AdaLN applies norm*(1+gamma)+beta with
+            # UNBOUNDED gamma/beta, so an unnormalized token (spec_cond_proj has no norm)
+            # turns c_B into a per-scan bias bank that inflates as its weight grows --
+            # the "c_B learns extremely fast" symptom. Matches the grounded branch (:496).
+            cond_in = F.normalize(cond_transfer, p=2.0, dim=-1) if cond_transfer is not None else None
             H_pred_b = self.predictor(
                 H_ctx_a,
                 tgt_pos_b,
@@ -364,27 +423,8 @@ class CrossConditionJEPA(nn.Module):
             pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
             focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
             if pred_loss_type == "normalized_l1":
-                # EXP-68: Scale-invariant probe-wise normalized L1 loss
-                # Normalizes per probe along feature dimension: mean 0, std 1
-                # Eliminates any mathematical incentive for representation shrinking/collapse!
-                pred_m = H_pred_b.mean(dim=-1, keepdim=True)
-                pred_s = H_pred_b.std(dim=-1, keepdim=True).clamp_min(1e-8)
-                h_pred_norm = (H_pred_b - pred_m) / pred_s
-
-                tgt_m = target_signal.mean(dim=-1, keepdim=True)
-                tgt_s = target_signal.std(dim=-1, keepdim=True).clamp_min(1e-8)
-                h_tgt_norm = (target_signal - tgt_m) / tgt_s
-
-                sample_loss = (h_pred_norm - h_tgt_norm).abs().mean(dim=(-2, -1))
-                if focus_gamma > 0:
-                    tgt_dev = torch.norm(target_signal.detach(), p=2, dim=-1).mean(dim=-1)
-                    weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-                    weights = weights / (weights.mean() + 1e-8)
-                    weights = torch.clamp(weights, min=0.2, max=5.0)
-                    weights = weights / (weights.mean() + 1e-8)
-                    pred_loss = (weights * sample_loss).mean()
-                else:
-                    pred_loss = sample_loss.mean()
+                # EXP-68: scale-invariant probe-wise normalized L1 (no shrinkage incentive)
+                pred_loss = normalized_probe_l1(H_pred_b, target_signal, focus_gamma)
             elif pred_loss_type == "raw_l1":
                 sample_loss = (H_pred_b - target_signal).abs().mean(dim=(-2, -1))
                 if focus_gamma > 0:
@@ -553,6 +593,9 @@ class CrossConditionJEPA(nn.Module):
                     h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
                     h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
                     pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
+                elif pred_loss_type == "normalized_l1":
+                    # EXP-68a: same probe-wise normalized L1, applied to the scattering subspace
+                    pred_loss = normalized_probe_l1(H_pred_s, H_tgt_s, focus_gamma)
                 else:
                     pred_loss = F.l1_loss(H_pred_s, H_tgt_s)
 

@@ -101,7 +101,9 @@ def parse_args():
     parser.add_argument("--anti_hijack_ratio", type=float, default=0.0, help="Anti-hijack guard: caps auxiliary losses to (ratio * pred_loss)")
     parser.add_argument("--dynamic_condition_token", type=lambda v: v.lower() == "true", default=False, help="Dynamically sample sound-metal reference patch per scan (EXP-67a)")
     parser.add_argument("--unified_latent", type=lambda v: v.lower() == "true", default=False, help="EXP-68: Single unified 64D representation (eliminates two-stream / 2-subspace split)")
-    parser.add_argument("--spectral_condition_token", type=lambda v: v.lower() == "true", default=False, help="EXP-68: Dodd-Deeds 16D spectral signature condition token (Fourier phase + energy ratio)")
+    parser.add_argument("--spectral_condition_token", type=lambda v: v.lower() == "true", default=False, help="EXP-68: Dodd-Deeds spectral signature condition token (Fourier phase + energy ratio)")
+    parser.add_argument("--spectral_phase_encoding", type=str, default="cos_sin", choices=["cos_sin", "raw"], help="EXP-68: 'cos_sin' (continuous at the +-pi branch cut) or 'raw' (theta/pi)")
+    parser.add_argument("--ref_patch_mode", type=str, default="legacy", choices=["legacy", "corner_median"], help="Background patch for the condition token: 'legacy' = [10:15,10:15] (96%% defect on Corrosion), 'corner_median' = median of 4 defect-free corners")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
 
@@ -198,6 +200,8 @@ def main():
         dynamic_condition_token=args.dynamic_condition_token,
         unified_latent=args.unified_latent,
         spectral_condition_token=args.spectral_condition_token,
+        spectral_phase_encoding=args.spectral_phase_encoding,
+        ref_patch_mode=args.ref_patch_mode,
         scan_centered_vicreg=args.scan_centered_vicreg,
         var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,
@@ -271,6 +275,7 @@ def main():
         transform_csv=config.transform_csv,
         include_sound_mask=args.inv_oracle_mask,
         dynamic_condition_token=getattr(config, "dynamic_condition_token", False),
+        ref_patch_mode=getattr(config, "ref_patch_mode", "legacy"),
     )
 
     # Initialize Trainer with logger and validation reference scans

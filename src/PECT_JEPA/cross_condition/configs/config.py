@@ -50,7 +50,9 @@ class CrossConditionConfig:
     carrier_coupling_mode: str = "additive"  # 'additive' (legacy), 'multiplicative' (pure scaling), 'none' (fully decoupled)
     grounded_condition_pred: bool = False  # Direction C: Condition transfer function grounding with scale-normalized directional target prediction
     unified_latent: bool = False  # EXP-68: Single unified 64D representation (eliminates two-stream / 2-subspace split)
-    spectral_condition_token: bool = False  # EXP-68: Dodd-Deeds 16D spectral signature (Fourier phase + normalized energy, 0% DC)
+    spectral_condition_token: bool = False  # EXP-68: Dodd-Deeds spectral signature (Fourier phase + normalized energy, 0% DC)
+    spectral_phase_encoding: str = "cos_sin"  # EXP-68: 'cos_sin' (continuous at the +-pi branch cut) or 'raw' (theta/pi, exp68 draft)
+    ref_patch_mode: str = "legacy"  # 'legacy' = cscan[10:15,10:15] (96% defect pixels on Corrosion), 'corner_median' = pixel-wise median of the 4 defect-free corners
     use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
     dynamic_condition_token: bool = False  # If True, dynamically samples sound-metal reference patch per scan (EXP-67a)
     relative_condition_operator: bool = False  # If True, condition token is domain transfer operator T(c_A, c_B) preventing shortcut DC leakage
