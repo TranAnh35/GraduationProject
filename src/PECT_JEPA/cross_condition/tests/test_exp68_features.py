@@ -6,6 +6,12 @@ Comprehensive Unit Test Suite for EXP-68 Unified OPF-JEPA Features:
 4. Single Unified Latent Representation (Full 64D forward, 3-loss formulation, feature extraction [B, 128])
 5. Scheduled Invariance (L_inv ramp-up behavior)
 6. Backward Compatibility (strict state_dict loading for legacy checkpoints)
+
+SCOPE: every test here builds `CrossConditionConfig(...)` directly, i.e. it covers the
+config-object / model / loss layer only. The CLI surface (train.py argparse ->
+CrossConditionConfig -> dataset) is covered by `tests/test_train_cli_contract.py`; a flag
+that exists in the config but was never registered in train.py passes all 14 tests below and
+still crashes Colab, which is exactly what happened to EXP-68B.
 """
 
 import os
