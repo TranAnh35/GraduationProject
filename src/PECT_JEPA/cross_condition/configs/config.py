@@ -49,6 +49,8 @@ class CrossConditionConfig:
     two_stream_backbone: bool = False  # Direction B: Asymmetric two-stream decoupled encoder backbone (carrier z_c vs scattering z_s)
     carrier_coupling_mode: str = "additive"  # 'additive' (legacy), 'multiplicative' (pure scaling), 'none' (fully decoupled)
     grounded_condition_pred: bool = False  # Direction C: Condition transfer function grounding with scale-normalized directional target prediction
+    unified_latent: bool = False  # EXP-68: Single unified 64D representation (eliminates two-stream / 2-subspace split)
+    spectral_condition_token: bool = False  # EXP-68: Dodd-Deeds 16D spectral signature (Fourier phase + normalized energy, 0% DC)
     use_condition_token: bool = False  # If False, disables c_b condition routing (pure JEPA)
     dynamic_condition_token: bool = False  # If True, dynamically samples sound-metal reference patch per scan (EXP-67a)
     relative_condition_operator: bool = False  # If True, condition token is domain transfer operator T(c_A, c_B) preventing shortcut DC leakage
@@ -115,7 +117,7 @@ class CrossConditionConfig:
     downstream_latent_type: str = "scattering"  # 'scattering' (z_s only, drift-free), 'full' ([z_c, z_s]), 'carrier' (z_c)
 
     # Loss weights
-    pred_loss_type: str = "l1"  # Pure L1 loss preserving subtle flaw gradients
+    pred_loss_type: str = "l1"  # 'l1', 'raw_l1', 'normalized_l1' (EXP-68: scale-invariant probe-wise normalized L1)
     pred_magnitude_weight: float = 0.0    # Scale-invariant log-energy magnitude penalty |log(||pred||) - log(||tgt||)|
     self_focus_gamma: float = 0.0         # Exponent for self-supervised hard-sample focus weighting (0.0 = uniform)
     anti_hijack_ratio: float = 0.0        # If > 0, caps auxiliary losses to (anti_hijack_ratio * pred_loss) to guarantee JEPA prediction dominance >= 80% (EXP-67)

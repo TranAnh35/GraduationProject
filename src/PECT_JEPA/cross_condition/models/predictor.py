@@ -65,8 +65,9 @@ class PredictorBlock(nn.Module):
                 nn.SiLU(),
                 nn.Linear(embed_dim, 4 * embed_dim),
             )
-            # Zero-initialize the modulation projection so it starts as exact identity
-            nn.init.zeros_(self.ada_mod[1].weight)
+            # Near-zero initialize the modulation projection (std=1e-3) so it acts as near-exact identity
+            # while allowing non-zero initial gradient flow back into condition token representations.
+            nn.init.normal_(self.ada_mod[1].weight, std=1e-3)
             nn.init.zeros_(self.ada_mod[1].bias)
         elif self.modulation == "pure_film":
             # Pure Multiplicative FiLM (no additive beta bias): only scales norm_self and norm_mlp

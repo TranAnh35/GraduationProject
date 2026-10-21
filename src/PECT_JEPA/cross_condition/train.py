@@ -94,12 +94,14 @@ def parse_args():
     parser.add_argument("--var_gamma", type=float, default=1.0, help="Target standard deviation threshold for VICReg variance hinge")
     parser.add_argument("--downstream_latent_type", type=str, default="scattering", choices=["scattering", "carrier", "full"], help="Subspace to extract for downstream tasks")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume training from")
-    parser.add_argument("--num_target_rays", type=int, default=3, choices=[3, 5], help="Number of contiguous rays masked (3=9 tgt/16 ctx [36%], 5=15 tgt/10 ctx [60%])")
+    parser.add_argument("--num_target_rays", type=int, default=3, choices=[3, 5], help="Number of contiguous rays masked (3=9 tgt/16 ctx [36%%], 5=15 tgt/10 ctx [60%%])")
     parser.add_argument("--pred_magnitude_weight", type=float, default=0.0, help="Weight on scale-invariant relative log-energy magnitude loss")
     parser.add_argument("--self_focus_gamma", type=float, default=0.0, help="Exponent for self-supervised hard-sample focus weighting (0.0 = uniform)")
-    parser.add_argument("--pred_loss_type", type=str, default="l1", choices=["l1", "raw_l1", "smooth_l1", "cosine_normalized_l1"], help="Prediction loss type ('raw_l1' for unnormalized physical L1)")
+    parser.add_argument("--pred_loss_type", type=str, default="l1", choices=["l1", "raw_l1", "normalized_l1", "smooth_l1", "cosine_normalized_l1"], help="Prediction loss type ('raw_l1' for unnormalized physical L1, 'normalized_l1' for probe-wise normalized L1)")
     parser.add_argument("--anti_hijack_ratio", type=float, default=0.0, help="Anti-hijack guard: caps auxiliary losses to (ratio * pred_loss)")
     parser.add_argument("--dynamic_condition_token", type=lambda v: v.lower() == "true", default=False, help="Dynamically sample sound-metal reference patch per scan (EXP-67a)")
+    parser.add_argument("--unified_latent", type=lambda v: v.lower() == "true", default=False, help="EXP-68: Single unified 64D representation (eliminates two-stream / 2-subspace split)")
+    parser.add_argument("--spectral_condition_token", type=lambda v: v.lower() == "true", default=False, help="EXP-68: Dodd-Deeds 16D spectral signature condition token (Fourier phase + energy ratio)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
 
@@ -194,6 +196,8 @@ def main():
         pred_loss_type=args.pred_loss_type,
         anti_hijack_ratio=args.anti_hijack_ratio,
         dynamic_condition_token=args.dynamic_condition_token,
+        unified_latent=args.unified_latent,
+        spectral_condition_token=args.spectral_condition_token,
         scan_centered_vicreg=args.scan_centered_vicreg,
         var_gamma=args.var_gamma,
         downstream_latent_type=args.downstream_latent_type,
