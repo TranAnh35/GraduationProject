@@ -144,6 +144,8 @@ def parse_args():
     parser.add_argument("--prefetch", type=lambda v: v.lower() == "true", default=True, help="Overlap next-file TDMS load with current-file GPU/CPU processing")
     parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True, help="Enable unsupervised spatial self-calibration (zero-centering C-scan against sound-metal background median)")
     parser.add_argument("--downstream_dir", type=str, default=None, help="Directory containing pre-trained downstream models (standard_probes.joblib, coral_model.pt, dann_model.pt)")
+    parser.add_argument("--skip_domain_adaptation", "--skip_uda", dest="skip_domain_adaptation", nargs="?", const=True, type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=False, help="Skip canonical domain adaptation evaluation task (UDA models)")
+    parser.add_argument("--eval_domain_adaptation", "--run_uda", dest="eval_domain_adaptation", type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=True, help="Whether to evaluate canonical domain adaptation (UDA models). Set to False to skip.")
     return parser.parse_args()
 
 
@@ -868,20 +870,26 @@ def main():
     # 7. STEP 4: Canonical Domain Adaptation Benchmark (Single-Variable Controlled Shifts)
     in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
     canonical_uda_results = None
-    if downstream_dir is not None and os.path.isdir(downstream_dir):
-        canonical_uda_results = evaluate_canonical_domain_adaptation(
-            downstream_dir=downstream_dir,
-            out_dir=out_dir,
-            all_files=all_files,
-            gt_masks=gt_masks,
-            cached_latents=cached_all_latents,
-            extractor=extractor,
-            self_calibration=args.self_calibration,
-            lr_probe=global_readouts.get("lr_probe") if global_readouts else None,
-            scaler_det=global_readouts.get("scaler_det") if global_readouts else None,
-            device=device,
-            in_dim=in_dim,
-        )
+    run_uda = bool(args.eval_domain_adaptation) and not bool(args.skip_domain_adaptation)
+    if run_uda:
+        if downstream_dir is not None and os.path.isdir(downstream_dir):
+            canonical_uda_results = evaluate_canonical_domain_adaptation(
+                downstream_dir=downstream_dir,
+                out_dir=out_dir,
+                all_files=all_files,
+                gt_masks=gt_masks,
+                cached_latents=cached_all_latents,
+                extractor=extractor,
+                self_calibration=args.self_calibration,
+                lr_probe=global_readouts.get("lr_probe") if global_readouts else None,
+                scaler_det=global_readouts.get("scaler_det") if global_readouts else None,
+                device=device,
+                in_dim=in_dim,
+            )
+    else:
+        print("\n" + "=" * 75)
+        print("STEP 4: Canonical Domain Adaptation Benchmark [SKIPPED by user configuration]")
+        print("=" * 75, flush=True)
 
     # 8. STEP 5: Save Master Reports
     master_csv = os.path.join(out_dir, "master_benchmark_metrics.csv")
@@ -1053,6 +1061,10 @@ def main():
                 auc_str = f"{t_auc:.4f} ± {t_std:.4f}"
                 print(f"{m_name:<24} | {s_auc:<12.4f} | {auc_str:<16} | {t_ap:<10.4f} | {sign}{delta:<12.4f}")
         print("=" * 80)
+    elif not run_uda:
+        print("\n" + "-" * 80)
+        print("[INFO] Canonical Domain Adaptation benchmark was SKIPPED by option (--skip_domain_adaptation / --eval_domain_adaptation=False).")
+        print("-" * 80)
     else:
         print("\n" + "!" * 80)
         print("[NOTICE] No pre-trained UDA models were evaluated.")
