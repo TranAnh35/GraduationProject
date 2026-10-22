@@ -73,6 +73,9 @@ def parse_args():
     parser.add_argument("--tta_trim_ratio", type=float, default=0.75, help="Trim ratio for robust background estimation (default 0.75)")
     parser.add_argument("--tta_shrinkage", type=float, default=1e-2, help="Diagonal loading shrinkage eps for whitening matrix (default 1e-2)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    # Backward compatibility / deprecated no-op flags
+    parser.add_argument("--skip_uda", "--skip_domain_adaptation", dest="skip_uda", nargs="?", const=True, type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=False)
+    parser.add_argument("--adapt_mode", type=str, default="all")
     return parser.parse_args()
 
 

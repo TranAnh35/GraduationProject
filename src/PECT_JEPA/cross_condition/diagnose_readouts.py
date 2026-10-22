@@ -90,6 +90,10 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8192)
     parser.add_argument("--prefetch", type=lambda v: v.lower() == "true", default=True)
     parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True)
+    # Backward compatibility / no-op flags
+    parser.add_argument("--skip_domain_adaptation", "--skip_uda", dest="skip_domain_adaptation", nargs="?", const=True, type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=False)
+    parser.add_argument("--eval_domain_adaptation", "--run_uda", dest="eval_domain_adaptation", type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=True)
+    parser.add_argument("--eval_tta", type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=True)
     return parser.parse_args()
 
 
