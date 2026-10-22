@@ -152,50 +152,165 @@ def plot_detection_summary_map(
     ground_truth_mask: np.ndarray,
     file_title: str,
     save_path: str,
+    raw_heatmap: Optional[np.ndarray] = None,
     metrics: Optional[Dict[str, Any]] = None,
     dpi: int = 150,
 ) -> None:
     """
-    Side-by-side 3-panel figure showing:
-    - Panel 1: Trained Linear Probe Probability Map (cmap='jet')
-    - Panel 2: Unsupervised Mahalanobis Anomaly Distance Map (cmap='jet')
-    - Panel 3: CAD Ground Truth Mask
+    Side-by-side 4-panel figure for Anomaly Detection:
+    - Panel 1: 1) CAD Ground Truth Mask (cmap='Blues')
+    - Panel 2: 2) Raw Heatmap (Peak-to-Peak V_pp) (cmap='viridis')
+    - Panel 3: 3) Unsupervised Mahalanobis Anomaly Distance Map (cmap='jet')
+    - Panel 4: 4) Trained Linear Probe Probability Map (cmap='jet')
     """
     save_path = to_safe_path(save_path)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5), dpi=dpi)
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5), dpi=dpi)
 
-    # 1. Trained Linear Probe Probability
-    p_disp = np.clip(prob_map, 0.0, 1.0)
-    im0 = axes[0].imshow(p_disp, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
-    t0 = "Trained Linear Probe P(Defect | z)"
-    if metrics:
-        lp_auc = metrics.get("linear_probe_auc", 0.0)
-        lp_ap = metrics.get("linear_probe_ap", 0.0)
-        t0 += f"\nAUC: {lp_auc:.4f} | AP: {lp_ap:.4f}"
-    axes[0].set_title(t0, fontsize=10, fontweight="bold")
-    axes[0].set_xlabel("X (pixels)")
-    axes[0].set_ylabel("Y (pixels)")
+    # 1. Ground Truth CAD Mask
+    im0 = axes[0].imshow(ground_truth_mask, cmap="Blues", origin="lower", vmin=0, vmax=1)
+    axes[0].set_title(f"1) Ground Truth CAD Mask\n{file_title}", fontsize=10, fontweight="bold")
+    axes[0].set_xlabel("X (pixels)", fontsize=9)
+    axes[0].set_ylabel("Y (pixels)", fontsize=9)
     plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
-    # 2. Unsupervised Mahalanobis Distance Map
-    im1 = axes[1].imshow(anomaly_map, cmap="jet", origin="lower")
-    t1 = "Unsupervised Mahalanobis Distance"
+    # 2. Raw Heatmap (Peak-to-Peak V_pp)
+    if raw_heatmap is not None:
+        im1 = axes[1].imshow(raw_heatmap, cmap="viridis", origin="lower")
+        t1 = f"2) Raw PECT Signal (Peak-to-Peak)\nV_pp range: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
+    else:
+        im1 = axes[1].imshow(np.zeros_like(ground_truth_mask), cmap="viridis", origin="lower")
+        t1 = "2) Raw PECT Signal (Not Provided)"
+    axes[1].set_title(t1, fontsize=10, fontweight="bold")
+    axes[1].set_xlabel("X (pixels)", fontsize=9)
+    axes[1].set_ylabel("Y (pixels)", fontsize=9)
+    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+    # 3. Unsupervised Mahalanobis Distance Map
+    im2 = axes[2].imshow(anomaly_map, cmap="jet", origin="lower")
+    t2 = "3) Unsupervised Mahalanobis Distance"
     if metrics:
         m_auc = metrics.get("mahalanobis_auc", 0.0)
         cnr = metrics.get("cnr", 0.0)
-        t1 += f"\nAUC: {m_auc:.4f} | CNR: {cnr:.2f}"
-    axes[1].set_title(t1, fontsize=10, fontweight="bold")
-    axes[1].set_xlabel("X (pixels)")
-    axes[1].set_ylabel("Y (pixels)")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-
-    # 3. Ground Truth CAD Mask
-    im2 = axes[2].imshow(ground_truth_mask, cmap="Blues", origin="lower", vmin=0, vmax=1)
-    axes[2].set_title(f"CAD Ground Truth Mask\n{file_title}", fontsize=10, fontweight="bold")
-    axes[2].set_xlabel("X (pixels)")
-    axes[2].set_ylabel("Y (pixels)")
+        t2 += f"\nAUC: {m_auc:.4f} | CNR: {cnr:.2f}"
+    axes[2].set_title(t2, fontsize=10, fontweight="bold")
+    axes[2].set_xlabel("X (pixels)", fontsize=9)
+    axes[2].set_ylabel("Y (pixels)", fontsize=9)
     plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+    # 4. Trained Linear Probe Probability
+    p_disp = np.clip(prob_map, 0.0, 1.0)
+    im3 = axes[3].imshow(p_disp, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    t3 = "4) Trained Linear Probe P(Defect | z)"
+    if metrics:
+        lp_auc = metrics.get("linear_probe_auc", 0.0)
+        lp_ap = metrics.get("linear_probe_ap", 0.0)
+        t3 += f"\nAUC: {lp_auc:.4f} | AP: {lp_ap:.4f}"
+    axes[3].set_title(t3, fontsize=10, fontweight="bold")
+    axes[3].set_xlabel("X (pixels)", fontsize=9)
+    axes[3].set_ylabel("Y (pixels)", fontsize=9)
+    plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    _safe_savefig(fig, save_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_tta_summary_map(
+    ground_truth_mask: np.ndarray,
+    lp_raw_prob_map: np.ndarray,
+    lp_tta_prob_map: np.ndarray,
+    file_title: str,
+    save_path: str,
+    raw_heatmap: Optional[np.ndarray] = None,
+    maha_map: Optional[np.ndarray] = None,
+    lp_raw_metrics: Optional[Dict[str, float]] = None,
+    lp_tta_metrics: Optional[Dict[str, float]] = None,
+    maha_metrics: Optional[Dict[str, float]] = None,
+    dpi: int = 150,
+) -> None:
+    """
+    Comprehensive figure presenting Test-Time Adaptation (TTA) results:
+    - Panel 1: Ground Truth CAD Mask (CAD reference)
+    - Panel 2: Raw PECT Signal (Peak-to-Peak V_pp) [if provided]
+    - Panel 3: Zero-Shot Linear Probe (Before TTA - Domain Shift Failure)
+    - Panel 4: TTA Calibrated Linear Probe (After TTA - Restored Contrast & Delta AUC)
+    - Panel 5: TTA Mahalanobis Energy Map (Unsupervised Threshold-Free Contrast)
+    """
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    has_raw = raw_heatmap is not None
+    has_maha = maha_map is not None
+
+    num_panels = 3 + (1 if has_raw else 0) + (1 if has_maha else 0)
+    fig_w = 5.5 * num_panels
+    fig, axes = plt.subplots(1, num_panels, figsize=(fig_w, 5), dpi=dpi)
+
+    ax_idx = 0
+
+    # 1. CAD Ground Truth Mask
+    im_gt = axes[ax_idx].imshow(ground_truth_mask, cmap="Blues", origin="lower", vmin=0, vmax=1)
+    axes[ax_idx].set_title(f"1) Ground Truth CAD Mask\n{file_title}", fontsize=10, fontweight="bold")
+    axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
+    axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
+    plt.colorbar(im_gt, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+    ax_idx += 1
+
+    # 2. Raw PECT Peak-to-Peak (if present)
+    if has_raw:
+        im_raw = axes[ax_idx].imshow(raw_heatmap, cmap="viridis", origin="lower")
+        t_raw = f"2) Raw PECT Signal (Peak-to-Peak)\nV_pp range: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
+        axes[ax_idx].set_title(t_raw, fontsize=10, fontweight="bold")
+        axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
+        axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
+        plt.colorbar(im_raw, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+        ax_idx += 1
+
+    # 3. Baseline Zero-Shot Linear Probe (Before TTA)
+    p0 = np.clip(lp_raw_prob_map, 0.0, 1.0)
+    im0 = axes[ax_idx].imshow(p0, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    t0 = "3) Zero-Shot Linear Probe (Before TTA)"
+    raw_auc = 0.0
+    if lp_raw_metrics:
+        raw_auc = lp_raw_metrics.get("auc", 0.0)
+        raw_ap = lp_raw_metrics.get("ap", 0.0)
+        t0 += f"\nAUC: {raw_auc:.4f} | AP: {raw_ap:.4f}"
+    axes[ax_idx].set_title(t0, fontsize=10, fontweight="bold")
+    axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
+    axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
+    plt.colorbar(im0, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+    ax_idx += 1
+
+    # 4. TTA Calibrated Linear Probe (After TTA)
+    p1 = np.clip(lp_tta_prob_map, 0.0, 1.0)
+    im1 = axes[ax_idx].imshow(p1, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    t1 = "4) TTA Calibrated Linear Probe (After TTA)"
+    if lp_tta_metrics:
+        tta_auc = lp_tta_metrics.get("auc", 0.0)
+        tta_ap = lp_tta_metrics.get("ap", 0.0)
+        diff = tta_auc - raw_auc
+        diff_str = f"+{diff:.4f}" if diff >= 0 else f"{diff:.4f}"
+        t1 += f"\nAUC: {tta_auc:.4f} (Δ {diff_str}) | AP: {tta_ap:.4f}"
+    axes[ax_idx].set_title(t1, fontsize=10, fontweight="bold")
+    axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
+    axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
+    plt.colorbar(im1, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+    ax_idx += 1
+
+    # 5. TTA Mahalanobis Energy Map (Unsupervised) [if present]
+    if has_maha:
+        im_m = axes[ax_idx].imshow(maha_map, cmap="jet", origin="lower")
+        t_m = "5) TTA Mahalanobis (Unsupervised Energy)"
+        if maha_metrics:
+            m_auc = maha_metrics.get("auc", 0.0)
+            m_ap = maha_metrics.get("ap", 0.0)
+            cnr = maha_metrics.get("cnr", 0.0)
+            t_m += f"\nAUC: {m_auc:.4f} | AP: {m_ap:.4f} | CNR: {cnr:.2f}"
+        axes[ax_idx].set_title(t_m, fontsize=10, fontweight="bold")
+        axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
+        axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
+        plt.colorbar(im_m, ax=axes[ax_idx], fraction=0.046, pad=0.04)
 
     plt.tight_layout()
     _safe_savefig(fig, save_path, bbox_inches="tight")
@@ -211,54 +326,25 @@ def plot_uda_summary_map(
     save_path: str,
     lp_metrics: Optional[Dict[str, float]] = None,
     uda_metrics: Optional[Dict[str, float]] = None,
+    raw_heatmap: Optional[np.ndarray] = None,
+    maha_map: Optional[np.ndarray] = None,
+    maha_metrics: Optional[Dict[str, float]] = None,
     dpi: int = 150,
 ) -> None:
-    """
-    Side-by-side 3-panel figure showing:
-    - Panel 1: Baseline Zero-Shot Linear Probe Probability (cmap='jet')
-    - Panel 2: UDA Adapted Probability (cmap='jet')
-    - Panel 3: CAD Ground Truth Mask
-    """
-    save_path = to_safe_path(save_path)
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5), dpi=dpi)
-
-    # 1. Baseline Linear Probe
-    p0 = np.clip(lp_prob_map, 0.0, 1.0)
-    im0 = axes[0].imshow(p0, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
-    t0 = "Baseline Zero-Shot Linear Probe"
-    if lp_metrics:
-        t0 += f"\nAUC: {lp_metrics.get('auc', 0.0):.4f} | AP: {lp_metrics.get('ap', 0.0):.4f}"
-    axes[0].set_title(t0, fontsize=10, fontweight="bold")
-    axes[0].set_xlabel("X (pixels)")
-    axes[0].set_ylabel("Y (pixels)")
-    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-
-    # 2. UDA Adapted Model
-    p1 = np.clip(uda_prob_map, 0.0, 1.0)
-    im1 = axes[1].imshow(p1, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
-    t1 = f"Adapted Model: {model_name}"
-    if uda_metrics:
-        u_auc = uda_metrics.get("auc", 0.0)
-        u_ap = uda_metrics.get("ap", 0.0)
-        diff = u_auc - (lp_metrics.get("auc", 0.0) if lp_metrics else 0.0)
-        diff_str = f"+{diff:.4f}" if diff >= 0 else f"{diff:.4f}"
-        t1 += f"\nAUC: {u_auc:.4f} (Δ {diff_str}) | AP: {u_ap:.4f}"
-    axes[1].set_title(t1, fontsize=10, fontweight="bold")
-    axes[1].set_xlabel("X (pixels)")
-    axes[1].set_ylabel("Y (pixels)")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-
-    # 3. CAD Ground Truth Mask
-    im2 = axes[2].imshow(ground_truth_mask, cmap="Blues", origin="lower", vmin=0, vmax=1)
-    axes[2].set_title(f"CAD Ground Truth Mask\n{file_title}", fontsize=10, fontweight="bold")
-    axes[2].set_xlabel("X (pixels)")
-    axes[2].set_ylabel("Y (pixels)")
-    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
-
-    plt.tight_layout()
-    _safe_savefig(fig, save_path, bbox_inches="tight")
-    plt.close(fig)
+    """Backward-compatible wrapper routing to plot_tta_summary_map."""
+    plot_tta_summary_map(
+        ground_truth_mask=ground_truth_mask,
+        lp_raw_prob_map=lp_prob_map,
+        lp_tta_prob_map=uda_prob_map,
+        file_title=file_title,
+        save_path=save_path,
+        raw_heatmap=raw_heatmap,
+        maha_map=maha_map,
+        lp_raw_metrics=lp_metrics,
+        lp_tta_metrics=uda_metrics,
+        maha_metrics=maha_metrics,
+        dpi=dpi,
+    )
 
 
 def plot_cscan_anomaly_map(

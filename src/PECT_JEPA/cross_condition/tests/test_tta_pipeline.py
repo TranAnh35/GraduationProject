@@ -18,6 +18,7 @@ Comprehensive Unit & Integration Test Suite for Test-Time Adaptation (TTA) Pipel
 import os
 import sys
 import unittest
+import tempfile
 import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
@@ -35,6 +36,10 @@ from src.PECT_JEPA.cross_condition.downstream.test_time_adaptation import (
 )
 from src.PECT_JEPA.cross_condition.downstream.detection.models import DetectionProbeBundle
 from src.PECT_JEPA.cross_condition.evaluate import parse_args
+from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
+    plot_detection_summary_map,
+    plot_tta_summary_map,
+)
 
 
 class TestWhiteningMatrix(unittest.TestCase):
@@ -173,6 +178,54 @@ class TestEvaluateCLIContract(unittest.TestCase):
             self.assertTrue(args.skip_domain_adaptation)
         finally:
             sys.argv = sys_argv_backup
+
+
+class TestVisualizationsContract(unittest.TestCase):
+    """Tests for 4-panel anomaly detection and 5-panel TTA comparison plots."""
+
+    def setUp(self):
+        self.H, self.W = 30, 30
+        self.gt_mask = np.zeros((self.H, self.W), dtype=np.int64)
+        self.gt_mask[10:15, 10:15] = 1
+        self.raw_ptp = np.random.rand(self.H, self.W).astype(np.float32)
+        self.maha_scores = np.random.rand(self.H, self.W).astype(np.float32)
+        self.prob_map_raw = np.random.rand(self.H, self.W).astype(np.float32)
+        self.prob_map_tta = np.random.rand(self.H, self.W).astype(np.float32)
+
+    def test_plot_detection_summary_map_4panels(self):
+        """Anomaly detection plot must save valid 4-panel layout with Label, Raw, Maha, and Linear."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_file = os.path.join(tmp_dir, "test_anom_4p.png")
+            plot_detection_summary_map(
+                prob_map=self.prob_map_raw,
+                anomaly_map=self.maha_scores,
+                ground_truth_mask=self.gt_mask,
+                file_title="Test File Summary",
+                save_path=out_file,
+                raw_heatmap=self.raw_ptp,
+                metrics={"linear_probe_auc": 0.85, "linear_probe_ap": 0.45, "mahalanobis_auc": 0.88, "cnr": 2.5},
+            )
+            self.assertTrue(os.path.exists(out_file), "4-panel anomaly plot must be created")
+            self.assertGreater(os.path.getsize(out_file), 1000, "Image file must have non-trivial size")
+
+    def test_plot_tta_summary_map_comprehensive(self):
+        """TTA plot must save valid 5-panel comparison layout."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_file = os.path.join(tmp_dir, "test_tta_5p.png")
+            plot_tta_summary_map(
+                ground_truth_mask=self.gt_mask,
+                lp_raw_prob_map=self.prob_map_raw,
+                lp_tta_prob_map=self.prob_map_tta,
+                file_title="Test Shift TTA",
+                save_path=out_file,
+                raw_heatmap=self.raw_ptp,
+                maha_map=self.maha_scores,
+                lp_raw_metrics={"auc": 0.52, "ap": 0.04},
+                lp_tta_metrics={"auc": 0.64, "ap": 0.06},
+                maha_metrics={"auc": 0.73, "ap": 0.08, "cnr": 1.5},
+            )
+            self.assertTrue(os.path.exists(out_file), "5-panel TTA plot must be created")
+            self.assertGreater(os.path.getsize(out_file), 1000, "Image file must have non-trivial size")
 
 
 if __name__ == "__main__":

@@ -74,6 +74,7 @@ from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
     plot_sizing_calibration,
     plot_defect_contours_and_iou,
     plot_uda_summary_map,
+    plot_tta_summary_map,
 )
 
 
@@ -262,6 +263,7 @@ def evaluate_canonical_test_time_adaptation(
     device: torch.device,
     tta_trim_ratio: float = 0.75,
     tta_shrinkage: float = 1e-2,
+    cached_raw_heatmaps: Optional[Dict[str, np.ndarray]] = None,
 ) -> Dict[str, Any]:
     """
     Evaluates Test-Time Adaptation (TTA) Suite across the 4 canonical single-variable domain shifts:
@@ -317,13 +319,15 @@ def evaluate_canonical_test_time_adaptation(
                 valid = np.where(gt_mask.reshape(-1) >= 0)[0]
                 has_both = len(np.unique(gt_mask.reshape(-1)[valid])) > 1
 
-                # Retrieve or extract latents
+                # Retrieve or extract latents and raw peak-to-peak heatmap
                 if fp in cached_latents:
                     latents = cached_latents[fp]
                 else:
                     cscan = load_canonical_cscan_from_tdms(fp)
                     latents = extractor.extract_full_cscan(cscan, self_calibrate=self_calibration)
                     cached_latents[fp] = latents
+                    if cached_raw_heatmaps is not None and fp not in cached_raw_heatmaps:
+                        cached_raw_heatmaps[fp] = np.ptp(cscan, axis=-1).astype(np.float32)
 
                 H, W = latents.shape[0], latents.shape[1]
                 flat_feats = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
@@ -377,18 +381,34 @@ def evaluate_canonical_test_time_adaptation(
                     auc_maha = float(roc_auc_score(gt_mask.reshape(-1)[valid], flat_maha[valid]))
                     ap_maha = float(average_precision_score(gt_mask.reshape(-1)[valid], flat_maha[valid]))
 
-                # Save Visualizations for target files
+                # Save Visualizations for target files (Comprehensive TTA Display)
                 if set_name == "target":
                     comp_path = os.path.join(vis_dir, f"{bname}_tta_comparison.png")
-                    plot_uda_summary_map(
-                        lp_prob_map=lp_raw_map,
-                        uda_prob_map=lp_tta_map,
+                    raw_ptp = cached_raw_heatmaps.get(fp) if cached_raw_heatmaps is not None else None
+                    if raw_ptp is None:
+                        cscan_tmp = load_canonical_cscan_from_tdms(fp)
+                        raw_ptp = np.ptp(cscan_tmp, axis=-1).astype(np.float32)
+                        if cached_raw_heatmaps is not None:
+                            cached_raw_heatmaps[fp] = raw_ptp
+
+                    target_cnr = 0.0
+                    if has_both:
+                        s_idx = np.where(gt_mask.reshape(-1) == 0)[0]
+                        d_idx = np.where(gt_mask.reshape(-1) == 1)[0]
+                        if len(s_idx) > 0 and len(d_idx) > 0:
+                            target_cnr = float((np.mean(flat_maha[d_idx]) - np.mean(flat_maha[s_idx])) / (np.std(flat_maha[s_idx]) + 1e-6))
+
+                    plot_tta_summary_map(
                         ground_truth_mask=gt_mask,
-                        model_name="TTA_Calibrated_LP",
+                        lp_raw_prob_map=lp_raw_map,
+                        lp_tta_prob_map=lp_tta_map,
                         file_title=f"[{shift.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
                         save_path=comp_path,
-                        lp_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
-                        uda_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
+                        raw_heatmap=raw_ptp,
+                        maha_map=maha_scores,
+                        lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
+                        lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
+                        maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
                     )
 
                 if not has_both:
@@ -567,6 +587,7 @@ def main():
 
     global_readouts = None
     cached_all_latents: Dict[str, np.ndarray] = {}
+    cached_raw_heatmaps: Dict[str, np.ndarray] = {}
     train_energies: List[float] = []
 
     if downstream_dir is not None and os.path.exists(os.path.join(downstream_dir, "standard_probes.joblib")):
@@ -629,6 +650,7 @@ def main():
             gt_mask = gt_masks[sp]["mask"]
             latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
             cached_all_latents[fp] = latents
+            cached_raw_heatmaps[fp] = np.ptp(cscan, axis=-1).astype(np.float32)
             train_energies.append(scan_feature_energy(latents))
 
             flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
@@ -746,7 +768,9 @@ def main():
             else:
                 assert next_loaded is not None and next_loaded[0] == fp, \
                     "Prefetch stream out of order"
-                latents = extractor.extract_full_cscan(next_loaded[1], self_calibrate=args.self_calibration)
+                cscan_cur = next_loaded[1]
+                latents = extractor.extract_full_cscan(cscan_cur, self_calibrate=args.self_calibration)
+                cached_raw_heatmaps[fp] = np.ptp(cscan_cur, axis=-1).astype(np.float32)
                 next_loaded = next(load_stream, None)
                 cached_all_latents[fp] = latents
 
@@ -834,14 +858,21 @@ def main():
                 metrics=anom_res,
             )
 
-            # 3-Panel Detection Summary (Trained Linear Probe vs Mahalanobis vs CAD GT)
+            # 4-Panel Detection Summary (1. CAD GT, 2. Raw Peak-to-Peak, 3. Mahalanobis, 4. Linear Probe)
             summary_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_detection_summary.png")
+            raw_ptp = cached_raw_heatmaps.get(fp)
+            if raw_ptp is None:
+                cscan_temp = load_canonical_cscan_from_tdms(fp)
+                raw_ptp = np.ptp(cscan_temp, axis=-1).astype(np.float32)
+                cached_raw_heatmaps[fp] = raw_ptp
+
             plot_detection_summary_map(
                 prob_map=prob_map,
                 anomaly_map=anom_res["anomaly_scores"],
                 ground_truth_mask=gt_mask,
                 file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform} | {liftoff}",
                 save_path=summary_plot_path,
+                raw_heatmap=raw_ptp,
                 metrics={"linear_probe_auc": det_res["auc_roc"], "linear_probe_ap": det_res["average_precision"], "mahalanobis_auc": anom_res["auc_roc"], "cnr": anom_res["cnr"]},
             )
 
@@ -943,6 +974,7 @@ def main():
             device=device,
             tta_trim_ratio=args.tta_trim_ratio,
             tta_shrinkage=args.tta_shrinkage,
+            cached_raw_heatmaps=cached_raw_heatmaps,
         )
     else:
         print("\n" + "=" * 75)
