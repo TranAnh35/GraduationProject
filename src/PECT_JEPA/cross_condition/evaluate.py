@@ -60,13 +60,11 @@ from src.PECT_JEPA.cross_condition.data.split import (
     get_canonical_shift_files,
     is_base_domain_file,
 )
-from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.coral import CORALAdapter
-from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dann import DANNModel
-from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.dan_mmd import DANModel
-from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.cdan import CDANModel
-from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.shot import SHOTModel
-from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.otda import OTDAModel
-from src.PECT_JEPA.cross_condition.downstream.domain_adaptation.cbst import CBSTModel
+from src.PECT_JEPA.cross_condition.downstream.test_time_adaptation import (
+    whiten_matrix,
+    unsup_trimmed_bg_stats,
+    TestTimeSelfCalibrator,
+)
 from src.PECT_JEPA.cross_condition.evaluation.cscan_extractor import CScanFeatureExtractor
 from src.PECT_JEPA.cross_condition.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
 from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
@@ -143,9 +141,14 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8192, help="Batch size for feature extraction")
     parser.add_argument("--prefetch", type=lambda v: v.lower() == "true", default=True, help="Overlap next-file TDMS load with current-file GPU/CPU processing")
     parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True, help="Enable unsupervised spatial self-calibration (zero-centering C-scan against sound-metal background median)")
-    parser.add_argument("--downstream_dir", type=str, default=None, help="Directory containing pre-trained downstream models (standard_probes.joblib, coral_model.pt, dann_model.pt)")
-    parser.add_argument("--skip_domain_adaptation", "--skip_uda", dest="skip_domain_adaptation", nargs="?", const=True, type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=False, help="Skip canonical domain adaptation evaluation task (UDA models)")
-    parser.add_argument("--eval_domain_adaptation", "--run_uda", dest="eval_domain_adaptation", type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=True, help="Whether to evaluate canonical domain adaptation (UDA models). Set to False to skip.")
+    parser.add_argument("--downstream_dir", type=str, default=None, help="Directory containing pre-trained downstream models (standard_probes.joblib)")
+    parser.add_argument("--eval_tta", "--run_tta", dest="eval_tta", type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=True, help="Whether to evaluate canonical Test-Time Adaptation (TTA). Default True.")
+    parser.add_argument("--skip_tta", dest="skip_tta", nargs="?", const=True, type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=False, help="Skip canonical Test-Time Adaptation (TTA)")
+    parser.add_argument("--tta_trim_ratio", type=float, default=0.75, help="Trim ratio for background statistics in TTA (default 0.75)")
+    parser.add_argument("--tta_shrinkage", type=float, default=1e-2, help="Diagonal loading shrinkage eps for TTA whitening matrix (default 1e-2)")
+    # Backward compatibility flags (aliased to TTA control)
+    parser.add_argument("--skip_domain_adaptation", "--skip_uda", dest="skip_domain_adaptation", nargs="?", const=True, type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=False, help="[Deprecated alias for --skip_tta]")
+    parser.add_argument("--eval_domain_adaptation", "--run_uda", dest="eval_domain_adaptation", type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v), default=True, help="[Deprecated alias for --eval_tta]")
     return parser.parse_args()
 
 
@@ -247,77 +250,56 @@ def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int =
             yield fp, cscan
 
 
-def evaluate_canonical_domain_adaptation(
-    downstream_dir: str,
+def evaluate_canonical_test_time_adaptation(
+    downstream_dir: Optional[str],
     out_dir: str,
     all_files: List[str],
     gt_masks: Dict[str, Any],
     cached_latents: Dict[str, np.ndarray],
     extractor: CScanFeatureExtractor,
     self_calibration: bool,
-    lr_probe: Any,
-    scaler_det: Any,
+    global_readouts: Dict[str, Any],
     device: torch.device,
-    in_dim: int,
+    tta_trim_ratio: float = 0.75,
+    tta_shrinkage: float = 1e-2,
 ) -> Dict[str, Any]:
     """
-    Evaluates UDA Suite across the 4 canonical single-variable domain shifts:
+    Evaluates Test-Time Adaptation (TTA) Suite across the 4 canonical single-variable domain shifts:
     - cross_sensor:   Source (16 Base files) -> Target (8 TMR-only files)
     - cross_waveform: Source (16 Base files) -> Target (8 Chirp-only files)
     - cross_specimen: Source (16 Base files) -> Target (8 Rivet_v2-only files)
     - cross_liftoff:  Source (16 Base files) -> Target (8 z2-only files)
     
     Structure:
-      4. Domain Adaptation/<shift>/<MODEL_NAME>/source/
-      4. Domain Adaptation/<shift>/<MODEL_NAME>/target/
-      4. Domain Adaptation/<shift>/uda_summary.csv
-      4. Domain Adaptation/<shift>/uda_summary.json
+      4. Test Time Adaptation/<shift>/visualizations/
+      4. Test Time Adaptation/<shift>/tta_summary.csv
+      4. Test Time Adaptation/<shift>/tta_summary.json
     """
     canonical_shifts = ["cross_sensor", "cross_waveform", "cross_specimen", "cross_liftoff"]
     shift_results: Dict[str, Any] = {}
 
-    uda_constructors = {
-        "CORAL": (CORALAdapter, "coral_model.pt"),
-        "DANN": (DANNModel, "dann_model.pt"),
-        "DAN": (DANModel, "dan_model.pt"),
-        "CDAN": (CDANModel, "cdan_model.pt"),
-        "SHOT": (SHOTModel, "shot_model.pt"),
-        "OTDA": (OTDAModel, "otda_model.pt"),
-        "CBST": (CBSTModel, "cbst_model.pt"),
-    }
-
     print("\n" + "=" * 75)
-    print("STEP 4: Canonical Domain Adaptation Benchmark (Single-Variable Controlled Shifts)")
+    print("STEP 4: Canonical Test-Time Adaptation (TTA) Benchmark (Single-Variable Controlled Shifts)")
     print("=" * 75, flush=True)
 
+    raw_scaler = global_readouts.get("raw_scaler_det", global_readouts.get("scaler_det"))
+    raw_lr = global_readouts.get("raw_lr_probe", global_readouts.get("lr_probe"))
+    raw_mlp = global_readouts.get("raw_mlp_probe", global_readouts.get("mlp_probe"))
+
+    tta_scaler = global_readouts.get("tta_scaler_det", raw_scaler)
+    tta_lr = global_readouts.get("tta_lr_probe", raw_lr)
+    tta_mlp = global_readouts.get("tta_mlp_probe", raw_mlp)
+
+    calibrator = TestTimeSelfCalibrator(keep_q=tta_trim_ratio, eps=tta_shrinkage)
+
     for shift in canonical_shifts:
-        shift_dir = os.path.join(downstream_dir, shift)
-        if not os.path.isdir(shift_dir):
-            shift_dir = downstream_dir
-
-        loaded_models: Dict[str, Any] = {}
-        for m_name, (cls, weight_file) in uda_constructors.items():
-            w_path = os.path.join(shift_dir, weight_file)
-            if os.path.exists(w_path):
-                try:
-                    m = cls(in_dim=in_dim, hidden_dim=64).to(device)
-                    m.load_state_dict(torch.load(w_path, map_location=device, weights_only=True))
-                    m.eval()
-                    loaded_models[m_name] = m
-                except Exception as e:
-                    print(f"    [WARN] Failed to load {m_name} from {w_path}: {e}")
-
-        if not loaded_models:
-            continue
-
         src_files, tgt_files = get_canonical_shift_files(all_files, shift)
-        shift_out_dir = os.path.join(out_dir, "4. Domain Adaptation", shift)
-        for m_name in loaded_models:
-            os.makedirs(os.path.join(shift_out_dir, m_name, "source"), exist_ok=True)
-            os.makedirs(os.path.join(shift_out_dir, m_name, "target"), exist_ok=True)
+        shift_out_dir = os.path.join(out_dir, "4. Test Time Adaptation", shift)
+        vis_dir = os.path.join(shift_out_dir, "visualizations")
+        os.makedirs(vis_dir, exist_ok=True)
 
         print("\n" + "-" * 75)
-        print(f"Evaluating Canonical Shift [{shift.upper()}]: {len(loaded_models)} Models Loaded")
+        print(f"Evaluating Canonical Shift [{shift.upper()}]: Test-Time Adaptation (TTA)")
         print(f"  Source Domain: {len(src_files)} Base files | Target Domain: {len(tgt_files)} Single-Shift files")
         print("-" * 75, flush=True)
 
@@ -346,123 +328,150 @@ def evaluate_canonical_domain_adaptation(
                 H, W = latents.shape[0], latents.shape[1]
                 flat_feats = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
 
-                # Linear Probe baseline prediction
-                lp_prob = None
-                lp_auc, lp_ap = 0.0, 0.0
-                if lr_probe is not None and scaler_det is not None:
-                    flat_scaled = scaler_det.transform(flat_feats)
-                    lp_prob = lr_probe.predict_proba(flat_scaled)[:, 1]
+                # 1. Zero-Shot Raw Probes Baseline
+                lp_raw_prob = None
+                auc_raw_lp, ap_raw_lp = 0.0, 0.0
+                if raw_lr is not None and raw_scaler is not None:
+                    flat_raw_scaled = raw_scaler.transform(flat_feats)
+                    lp_raw_prob = raw_lr.predict_proba(flat_raw_scaled)[:, 1]
                     if has_both:
-                        lp_auc = float(roc_auc_score(gt_mask.reshape(-1)[valid], lp_prob[valid]))
-                        lp_ap = float(average_precision_score(gt_mask.reshape(-1)[valid], lp_prob[valid]))
-                lp_prob_map = lp_prob.reshape(H, W) if lp_prob is not None else np.zeros((H, W), dtype=np.float32)
+                        auc_raw_lp = float(roc_auc_score(gt_mask.reshape(-1)[valid], lp_raw_prob[valid]))
+                        ap_raw_lp = float(average_precision_score(gt_mask.reshape(-1)[valid], lp_raw_prob[valid]))
+                lp_raw_map = lp_raw_prob.reshape(H, W) if lp_raw_prob is not None else np.zeros((H, W), dtype=np.float32)
 
-                # Evaluate each UDA model
-                for m_name, m_net in loaded_models.items():
-                    prob = m_net.predict_proba(flat_feats, device=str(device))
-                    prob_map = prob.reshape(H, W)
-                    m_auc, m_ap = 0.0, 0.0
+                auc_raw_mlp, ap_raw_mlp = 0.0, 0.0
+                if raw_mlp is not None and raw_scaler is not None:
+                    mlp_raw_prob = raw_mlp.predict_proba(flat_raw_scaled)[:, 1]
                     if has_both:
-                        m_auc = float(roc_auc_score(gt_mask.reshape(-1)[valid], prob[valid]))
-                        m_ap = float(average_precision_score(gt_mask.reshape(-1)[valid], prob[valid]))
+                        auc_raw_mlp = float(roc_auc_score(gt_mask.reshape(-1)[valid], mlp_raw_prob[valid]))
+                        ap_raw_mlp = float(average_precision_score(gt_mask.reshape(-1)[valid], mlp_raw_prob[valid]))
 
-                    # Save visualizations
-                    save_dir = os.path.join(shift_out_dir, m_name, set_name)
-                    prob_path = os.path.join(save_dir, f"{bname}_{m_name.lower()}_prob.png")
-                    plot_probability_heatmap(
-                        prob_map=prob_map,
-                        save_path=prob_path,
-                        title=f"{m_name} [{shift.upper()} | {set_name.upper()}]\n{sp} - {meta['sensor']} - {meta['waveform']} | AUC: {m_auc:.4f} | AP: {m_ap:.4f}",
-                        cmap="jet",
-                    )
+                # 2. TTA Self-Calibration Whitening
+                mu_bg, W_bg = unsup_trimmed_bg_stats(flat_feats, keep_q=tta_trim_ratio, eps=tta_shrinkage)
+                flat_feats_tta = (flat_feats - mu_bg).dot(W_bg).astype(np.float32)
 
-                    comp_path = os.path.join(save_dir, f"{bname}_{m_name.lower()}_comparison.png")
+                # 3. TTA Calibrated Linear Probe
+                lp_tta_prob = None
+                auc_tta_lp, ap_tta_lp = 0.0, 0.0
+                if tta_lr is not None and tta_scaler is not None:
+                    flat_tta_scaled = tta_scaler.transform(flat_feats_tta)
+                    lp_tta_prob = tta_lr.predict_proba(flat_tta_scaled)[:, 1]
+                    if has_both:
+                        auc_tta_lp = float(roc_auc_score(gt_mask.reshape(-1)[valid], lp_tta_prob[valid]))
+                        ap_tta_lp = float(average_precision_score(gt_mask.reshape(-1)[valid], lp_tta_prob[valid]))
+                lp_tta_map = lp_tta_prob.reshape(H, W) if lp_tta_prob is not None else np.zeros((H, W), dtype=np.float32)
+
+                # 4. TTA Calibrated MLP
+                auc_tta_mlp, ap_tta_mlp = 0.0, 0.0
+                if tta_mlp is not None and tta_scaler is not None:
+                    mlp_tta_prob = tta_mlp.predict_proba(flat_tta_scaled)[:, 1]
+                    if has_both:
+                        auc_tta_mlp = float(roc_auc_score(gt_mask.reshape(-1)[valid], mlp_tta_prob[valid]))
+                        ap_tta_mlp = float(average_precision_score(gt_mask.reshape(-1)[valid], mlp_tta_prob[valid]))
+
+                # 5. TTA Mahalanobis Distance (Unsupervised)
+                maha_scores = calibrator.compute_anomaly_scores(latents)
+                flat_maha = maha_scores.reshape(-1)
+                auc_maha, ap_maha = 0.0, 0.0
+                if has_both:
+                    auc_maha = float(roc_auc_score(gt_mask.reshape(-1)[valid], flat_maha[valid]))
+                    ap_maha = float(average_precision_score(gt_mask.reshape(-1)[valid], flat_maha[valid]))
+
+                # Save Visualizations for target files
+                if set_name == "target":
+                    comp_path = os.path.join(vis_dir, f"{bname}_tta_comparison.png")
                     plot_uda_summary_map(
-                        lp_prob_map=lp_prob_map,
-                        uda_prob_map=prob_map,
+                        lp_prob_map=lp_raw_map,
+                        uda_prob_map=lp_tta_map,
                         ground_truth_mask=gt_mask,
-                        model_name=m_name,
-                        file_title=f"[{shift.upper()} | {set_name.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
+                        model_name="TTA_Calibrated_LP",
+                        file_title=f"[{shift.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
                         save_path=comp_path,
-                        lp_metrics={"auc": lp_auc, "ap": lp_ap},
-                        uda_metrics={"auc": m_auc, "ap": m_ap},
+                        lp_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
+                        uda_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
                     )
 
-                    # A file whose GT mask has a single class has no defined AUC; averaging a
-                    # placeholder 0.0 into auc_mean silently drags the shift summary down.
-                    if not has_both:
-                        print(f"    [skip] {m_name} {set_name} {fname}: GT mask has a single class")
-                        continue
-                    shift_rows.append({
-                        "shift": shift,
-                        "domain_set": set_name,
-                        "model": m_name,
-                        "file": fname,
-                        "specimen": sp,
-                        "sensor": meta["sensor"],
-                        "waveform": meta["waveform"],
-                        "liftoff": meta["liftoff"],
-                        "auc": round(m_auc, 4),
-                        "ap": round(m_ap, 4),
-                        "lp_auc": round(lp_auc, 4),
-                        "lp_ap": round(lp_ap, 4),
-                        "delta_auc": round(m_auc - lp_auc, 4),
-                    })
+                if not has_both:
+                    print(f"    [skip] {set_name} {fname}: GT mask has a single class")
+                    continue
+
+                shift_rows.append({
+                    "shift": shift,
+                    "domain_set": set_name,
+                    "file": fname,
+                    "specimen": sp,
+                    "sensor": meta["sensor"],
+                    "waveform": meta["waveform"],
+                    "liftoff": meta["liftoff"],
+                    "auc_raw_lp": round(auc_raw_lp, 4),
+                    "ap_raw_lp": round(ap_raw_lp, 4),
+                    "auc_raw_mlp": round(auc_raw_mlp, 4),
+                    "ap_raw_mlp": round(ap_raw_mlp, 4),
+                    "auc_tta_lp": round(auc_tta_lp, 4),
+                    "ap_tta_lp": round(ap_tta_lp, 4),
+                    "delta_tta_lp": round(auc_tta_lp - auc_raw_lp, 4),
+                    "auc_tta_mlp": round(auc_tta_mlp, 4),
+                    "ap_tta_mlp": round(ap_tta_mlp, 4),
+                    "delta_tta_mlp": round(auc_tta_mlp - auc_raw_lp, 4),
+                    "auc_maha": round(auc_maha, 4),
+                    "ap_maha": round(ap_maha, 4),
+                    "delta_maha": round(auc_maha - auc_raw_lp, 4),
+                })
 
         # Save Shift CSV & Summary
         if shift_rows:
-            csv_path = os.path.join(shift_out_dir, "uda_summary.csv")
+            csv_path = os.path.join(shift_out_dir, "tta_summary.csv")
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=list(shift_rows[0].keys()))
                 writer.writeheader()
                 writer.writerows(shift_rows)
 
-            shift_summary: Dict[str, Any] = {"shift": shift, "models": {}}
-            for m_name in loaded_models:
-                shift_summary["models"][m_name] = {}
+            shift_summary: Dict[str, Any] = {"shift": shift, "methods": {}}
+            method_keys = [
+                ("Zero-Shot LP (Raw)", "auc_raw_lp", "ap_raw_lp", None),
+                ("Zero-Shot MLP (Raw)", "auc_raw_mlp", "ap_raw_mlp", None),
+                ("TTA Calibrated LP", "auc_tta_lp", "ap_tta_lp", "delta_tta_lp"),
+                ("TTA Calibrated MLP", "auc_tta_mlp", "ap_tta_mlp", "delta_tta_mlp"),
+                ("TTA Mahalanobis (Unsupervised)", "auc_maha", "ap_maha", "delta_maha"),
+            ]
+
+            for m_label, auc_k, ap_k, delta_k in method_keys:
+                shift_summary["methods"][m_label] = {}
                 for s_name in ["source", "target"]:
-                    rows = [r for r in shift_rows if r["model"] == m_name and r["domain_set"] == s_name]
-                    aucs = [r["auc"] for r in rows]
-                    aps = [r["ap"] for r in rows]
-                    lp_aucs = [r["lp_auc"] for r in rows]
-                    deltas = [r["delta_auc"] for r in rows]
-                    shift_summary["models"][m_name][s_name] = {
+                    rows = [r for r in shift_rows if r["domain_set"] == s_name]
+                    aucs = [r[auc_k] for r in rows]
+                    aps = [r[ap_k] for r in rows]
+                    deltas = [r[delta_k] for r in rows] if delta_k is not None else [0.0] * len(rows)
+                    shift_summary["methods"][m_label][s_name] = {
                         "count": len(rows),
                         "auc_mean": float(np.mean(aucs)) if aucs else 0.0,
                         "auc_std": float(np.std(aucs)) if aucs else 0.0,
                         "ap_mean": float(np.mean(aps)) if aps else 0.0,
-                        "lp_auc_mean": float(np.mean(lp_aucs)) if lp_aucs else 0.0,
                         "delta_auc_mean": float(np.mean(deltas)) if deltas else 0.0,
                     }
 
-            json_path = os.path.join(shift_out_dir, "uda_summary.json")
+            json_path = os.path.join(shift_out_dir, "tta_summary.json")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(shift_summary, f, indent=2)
 
             # Print Console Summary Table
-            tgt_rows = [r for r in shift_rows if r["domain_set"] == "target"]
-            lp_tgt_mean = np.mean([r["lp_auc"] for r in tgt_rows if r["model"] == list(loaded_models.keys())[0]]) if tgt_rows else 0.0
-            lp_tgt_ap = np.mean([r["lp_ap"] for r in tgt_rows if r["model"] == list(loaded_models.keys())[0]]) if tgt_rows else 0.0
-
-            src_rows = [r for r in shift_rows if r["domain_set"] == "source"]
-            lp_src_mean = np.mean([r["lp_auc"] for r in src_rows if r["model"] == list(loaded_models.keys())[0]]) if src_rows else 0.0
-
-            print("\n" + "=" * 90)
-            print(f"CANONICAL UDA BENCHMARK SUMMARY: [{shift.upper()}]")
-            print(f"  Source Domain: {len(src_files)} files (Train/Val Pool) | Target Domain: {len(tgt_files)} files (1-Variable Shift)")
-            print("=" * 90)
-            print(f"{'Model / Method':<24} | {'Source AUC (Retention)':<22} | {'Target AUC (Adaptation)':<23} | {'Target AP':<9} | {'Δ AUC vs LP':<12}")
-            print("-" * 90)
-            print(f"{'Linear Probe (Zero-Shot)':<24} | {lp_src_mean:<22.4f} | {lp_tgt_mean:<23.4f} | {lp_tgt_ap:<9.4f} | {'baseline':<12}")
-            for m_name in loaded_models:
-                m_src = shift_summary["models"][m_name]["source"]["auc_mean"]
-                m_tgt = shift_summary["models"][m_name]["target"]["auc_mean"]
-                m_tgt_std = shift_summary["models"][m_name]["target"]["auc_std"]
-                m_ap = shift_summary["models"][m_name]["target"]["ap_mean"]
-                delta = shift_summary["models"][m_name]["target"]["delta_auc_mean"]
-                sign = "+" if delta >= 0 else ""
-                print(f"{m_name:<24} | {m_src:<22.4f} | {m_tgt:.4f} ± {m_tgt_std:<15.4f} | {m_ap:<9.4f} | {sign}{delta:<11.4f}")
-            print("=" * 90 + "\n", flush=True)
+            print("\n" + "=" * 92)
+            print(f"CANONICAL TEST-TIME ADAPTATION (TTA) SUMMARY: [{shift.upper()}]")
+            print(f"  Source Domain: {len(src_files)} files (Train/Val Pool) | Target Domain: {len(tgt_files)} files (Single Shift)")
+            print("=" * 92)
+            print(f"{'Method / Mechanism':<30} | {'Source AUC (Retain)':<20} | {'Target AUC (Adapt)':<21} | {'Target AP':<9} | {'Δ vs Zero-Shot':<12}")
+            print("-" * 92)
+            for m_label, auc_k, ap_k, delta_k in method_keys:
+                s_stat = shift_summary["methods"][m_label]["source"]
+                t_stat = shift_summary["methods"][m_label]["target"]
+                s_auc = s_stat["auc_mean"]
+                t_auc = t_stat["auc_mean"]
+                t_std = t_stat["auc_std"]
+                t_ap = t_stat["ap_mean"]
+                delta = t_stat["delta_auc_mean"]
+                delta_str = f"{'+' if delta >= 0 else ''}{delta:.4f}" if delta_k is not None else "baseline"
+                print(f"{m_label:<30} | {s_auc:<20.4f} | {t_auc:.4f} ± {t_std:<13.4f} | {t_ap:<9.4f} | {delta_str:<12}")
+            print("=" * 92 + "\n", flush=True)
 
             shift_results[shift] = shift_summary
 
@@ -537,7 +546,7 @@ def main():
 
     # 4. STEP 1: Load Pre-trained Downstream Models or Fit on Train Pool
     print("=" * 75)
-    print("STEP 1: Downstream Probes & UDA Models Setup")
+    print("STEP 1: Downstream Probes & TTA Models Setup")
     print("=" * 75, flush=True)
 
     downstream_dir = args.downstream_dir
@@ -563,17 +572,33 @@ def main():
     if downstream_dir is not None and os.path.exists(os.path.join(downstream_dir, "standard_probes.joblib")):
         print(f"  [INFO] Loading pre-trained downstream models from: {downstream_dir}")
         bundle = joblib.load(os.path.join(downstream_dir, "standard_probes.joblib"))
-        det_bundle = bundle["detection"]
-        size_bundle = bundle.get("sizing")
+        raw_det = bundle.get("raw_detection", bundle.get("detection"))
+        raw_size = bundle.get("raw_sizing", bundle.get("sizing"))
+        tta_det = bundle.get("tta_detection", None)
+        tta_size = bundle.get("tta_sizing", None)
+
         global_readouts = {
-            "scaler_det": det_bundle.scaler,
-            "lr_probe": det_bundle.linear_probe,
-            "mlp_probe": det_bundle.mlp_probe,
+            "scaler_det": raw_det.scaler if raw_det else None,
+            "lr_probe": raw_det.linear_probe if raw_det else None,
+            "mlp_probe": raw_det.mlp_probe if raw_det else None,
+            "raw_scaler_det": raw_det.scaler if raw_det else None,
+            "raw_lr_probe": raw_det.linear_probe if raw_det else None,
+            "raw_mlp_probe": raw_det.mlp_probe if raw_det else None,
+            "tta_scaler_det": tta_det.scaler if tta_det else (raw_det.scaler if raw_det else None),
+            "tta_lr_probe": tta_det.linear_probe if tta_det else (raw_det.linear_probe if raw_det else None),
+            "tta_mlp_probe": tta_det.mlp_probe if tta_det else (raw_det.mlp_probe if raw_det else None),
         }
-        if size_bundle is not None:
-            global_readouts["scaler_size"] = size_bundle.scaler
-            global_readouts["ridge_size"] = size_bundle.ridge_regressor
-            global_readouts["mlp_size"] = size_bundle.mlp_regressor
+        if raw_size is not None:
+            global_readouts["scaler_size"] = raw_size.scaler
+            global_readouts["ridge_size"] = raw_size.ridge_regressor
+            global_readouts["mlp_size"] = raw_size.mlp_regressor
+            global_readouts["raw_scaler_size"] = raw_size.scaler
+            global_readouts["raw_ridge_size"] = raw_size.ridge_regressor
+            global_readouts["raw_mlp_size"] = raw_size.mlp_regressor
+        if tta_size is not None:
+            global_readouts["tta_scaler_size"] = tta_size.scaler
+            global_readouts["tta_ridge_size"] = tta_size.ridge_regressor
+            global_readouts["tta_mlp_size"] = tta_size.mlp_regressor
 
         ref_energy = 0.0
         print("  Pre-trained standard downstream models loaded successfully!\n", flush=True)
@@ -583,12 +608,12 @@ def main():
         print("  Checked candidate paths:")
         for cand in candidates:
             print(f"    - {cand} (exists: {os.path.exists(cand)})")
-        print("  Fitting readouts on train pool as fallback (UDA models will NOT be evaluated).")
-        print("  To train and evaluate UDA models, run train_downstream.py first:")
+        print("  Fitting readouts on train pool as fallback (Dual Raw + TTA Calibrated Probes).")
+        print("  To pre-train dedicated probes, run train_downstream.py first:")
         print(f"    python -m src.PECT_JEPA.cross_condition.downstream.train_downstream --checkpoint {ckpt_path} --data_dir {args.data_dir}")
         print("!" * 75 + "\n", flush=True)
-        train_det_x, train_det_y = [], []
-        train_size_x, train_size_y = [], []
+        train_det_x_raw, train_det_x_tta, train_det_y = [], [], []
+        train_size_x_raw, train_size_x_tta, train_size_y = [], [], []
 
         train_eval_files = [fp for fp in splits["train"]
                             if extract_file_metadata(fp)["specimen"] in gt_masks]
@@ -609,25 +634,33 @@ def main():
             flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
             flat_y = gt_mask.reshape(-1).astype(np.int64)
 
+            # TTA Whitened Features
+            mu_bg, W_bg = unsup_trimmed_bg_stats(flat_z, keep_q=args.tta_trim_ratio, eps=args.tta_shrinkage)
+            flat_z_tta = (flat_z - mu_bg).dot(W_bg).astype(np.float32)
+
             pos_idx = np.where(flat_y == 1)[0]
             neg_idx = np.where(flat_y == 0)[0]
             if len(pos_idx) > 0 and len(neg_idx) > 0:
                 sub_neg_count = min(len(neg_idx), max(len(pos_idx) * 4, 2500))
                 sub_neg = rng.choice(neg_idx, size=sub_neg_count, replace=False)
                 sel = np.concatenate([pos_idx, sub_neg])
-                train_det_x.append(flat_z[sel])
+                train_det_x_raw.append(flat_z[sel])
+                train_det_x_tta.append(flat_z_tta[sel])
                 train_det_y.append(flat_y[sel])
 
             if sp == "Corrosion" and corr_d_map is not None:
                 flat_d = corr_d_map.reshape(-1).astype(np.float32)
                 def_idx = np.where(flat_d > 0.0)[0]
                 if len(def_idx) > 0:
-                    train_size_x.append(flat_z[def_idx])
+                    train_size_x_raw.append(flat_z[def_idx])
+                    train_size_x_tta.append(flat_z_tta[def_idx])
                     train_size_y.append(flat_d[def_idx])
 
-        X_train_det = np.concatenate(train_det_x, axis=0)
+        X_train_det_raw = np.concatenate(train_det_x_raw, axis=0)
+        X_train_det_tta = np.concatenate(train_det_x_tta, axis=0)
         y_train_det = np.concatenate(train_det_y, axis=0)
-        X_train_size = np.concatenate(train_size_x, axis=0) if train_size_x else None
+        X_train_size_raw = np.concatenate(train_size_x_raw, axis=0) if train_size_x_raw else None
+        X_train_size_tta = np.concatenate(train_size_x_tta, axis=0) if train_size_x_tta else None
         y_train_size = np.concatenate(train_size_y, axis=0) if train_size_y else None
 
         print(f"\n  [Train Pool Aggregation]")
@@ -637,13 +670,40 @@ def main():
         ref_energy = float(np.median(train_energies)) if train_energies else 0.0
         print(f"  - Latent regime reference (median scan E||z||^2): {ref_energy:.1f}", flush=True)
 
-        print(f"  Fitting global Logistic Regression & Ridge Regressors...", flush=True)
-        global_readouts = suite.fit_global_readouts(
-            X_det=X_train_det,
+        print(f"  Fitting Dual Readouts (Raw & TTA Calibrated)...", flush=True)
+        raw_readouts = suite.fit_global_readouts(
+            X_det=X_train_det_raw,
             y_det=y_train_det,
-            X_size=X_train_size,
+            X_size=X_train_size_raw,
             y_size=y_train_size,
         )
+        tta_readouts = suite.fit_global_readouts(
+            X_det=X_train_det_tta,
+            y_det=y_train_det,
+            X_size=X_train_size_tta,
+            y_size=y_train_size,
+        )
+        global_readouts = {
+            "scaler_det": raw_readouts["scaler_det"],
+            "lr_probe": raw_readouts["lr_probe"],
+            "mlp_probe": raw_readouts.get("mlp_probe"),
+            "raw_scaler_det": raw_readouts["scaler_det"],
+            "raw_lr_probe": raw_readouts["lr_probe"],
+            "raw_mlp_probe": raw_readouts.get("mlp_probe"),
+            "scaler_size": raw_readouts.get("scaler_size"),
+            "ridge_size": raw_readouts.get("ridge_size"),
+            "mlp_size": raw_readouts.get("mlp_size"),
+            "raw_scaler_size": raw_readouts.get("scaler_size"),
+            "raw_ridge_size": raw_readouts.get("ridge_size"),
+            "raw_mlp_size": raw_readouts.get("mlp_size"),
+            "tta_scaler_det": tta_readouts["scaler_det"],
+            "tta_lr_probe": tta_readouts["lr_probe"],
+            "tta_mlp_probe": tta_readouts.get("mlp_probe"),
+            "tta_scaler_size": tta_readouts.get("scaler_size"),
+            "tta_ridge_size": tta_readouts.get("ridge_size"),
+            "tta_mlp_size": tta_readouts.get("mlp_size"),
+        }
+        print("  Dual readouts successfully fitted and frozen!\n", flush=True)
         print("  Global readouts successfully fitted and frozen!\n", flush=True)
 
     # 5. STEP 2: Multi-Task Evaluation across all splits
@@ -867,28 +927,26 @@ def main():
                 with open(t_json, "w", encoding="utf-8") as f:
                     json.dump({"split": sp, "task": tname, "count": len(trows), "metrics": num_summary}, f, indent=2)
 
-    # 7. STEP 4: Canonical Domain Adaptation Benchmark (Single-Variable Controlled Shifts)
-    in_dim = config.carrier_dim + config.scattering_dim if config.latent_disentanglement else config.embed_dim
-    canonical_uda_results = None
-    run_uda = bool(args.eval_domain_adaptation) and not bool(args.skip_domain_adaptation)
-    if run_uda:
-        if downstream_dir is not None and os.path.isdir(downstream_dir):
-            canonical_uda_results = evaluate_canonical_domain_adaptation(
-                downstream_dir=downstream_dir,
-                out_dir=out_dir,
-                all_files=all_files,
-                gt_masks=gt_masks,
-                cached_latents=cached_all_latents,
-                extractor=extractor,
-                self_calibration=args.self_calibration,
-                lr_probe=global_readouts.get("lr_probe") if global_readouts else None,
-                scaler_det=global_readouts.get("scaler_det") if global_readouts else None,
-                device=device,
-                in_dim=in_dim,
-            )
+    # 7. STEP 4: Canonical Test-Time Adaptation (TTA) Benchmark (Single-Variable Controlled Shifts)
+    canonical_tta_results = None
+    run_tta = bool(args.eval_tta) and not bool(args.skip_tta) and not bool(args.skip_domain_adaptation)
+    if run_tta:
+        canonical_tta_results = evaluate_canonical_test_time_adaptation(
+            downstream_dir=downstream_dir,
+            out_dir=out_dir,
+            all_files=all_files,
+            gt_masks=gt_masks,
+            cached_latents=cached_all_latents,
+            extractor=extractor,
+            self_calibration=args.self_calibration,
+            global_readouts=global_readouts,
+            device=device,
+            tta_trim_ratio=args.tta_trim_ratio,
+            tta_shrinkage=args.tta_shrinkage,
+        )
     else:
         print("\n" + "=" * 75)
-        print("STEP 4: Canonical Domain Adaptation Benchmark [SKIPPED by user configuration]")
+        print("STEP 4: Canonical Test-Time Adaptation (TTA) Benchmark [SKIPPED by user configuration]")
         print("=" * 75, flush=True)
 
     # 8. STEP 5: Save Master Reports
@@ -949,7 +1007,8 @@ def main():
             sp: compute_stats([r for r in master_results if r["specimen"] == sp])
             for sp in ["Corrosion", "Rivet_v1", "Rivet_v2"]
         },
-        "canonical_domain_adaptation": canonical_uda_results,
+        "canonical_test_time_adaptation": canonical_tta_results,
+        "canonical_domain_adaptation": canonical_tta_results,
     }
 
     master_json = os.path.join(out_dir, "master_benchmark_summary.json")
@@ -991,37 +1050,29 @@ def main():
             if st.get("count", 0) > 0:
                 f.write(f"| {lo} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
-        # Section 3: Canonical UDA Benchmark
-        if canonical_uda_results:
-            f.write("\n## 3. Canonical Domain Adaptation (UDA) Benchmark (Controlled Single-Variable Shifts)\n\n")
-            f.write("| Shift | Model | Source AUC (Retention) | Target AUC (Adaptation) | Target AP | Δ AUC vs Zero-Shot LP | Adaptation Strategy |\n")
+        # Section 3: Canonical TTA Benchmark
+        if canonical_tta_results:
+            f.write("\n## 3. Canonical Test-Time Adaptation (TTA) Benchmark (Controlled Single-Variable Shifts)\n\n")
+            f.write("| Shift | Method / Mechanism | Source AUC (Retention) | Target AUC (Adaptation) | Target AP | Δ AUC vs Zero-Shot LP | Strategy |\n")
             f.write("| :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n")
-            uda_meta = {
-                "CORAL": "Feature Covariance Alignment",
-                "DANN": "Adversarial Domain Invariance (GRL)",
-                "DAN": "Multi-Kernel Maximum Mean Discrepancy",
-                "CDAN": "Multilinear Conditioning Adversarial",
-                "SHOT": "Information Maximization (Source-Free)",
-                "OTDA": "Wasserstein Sinkhorn Optimal Transport",
-                "CBST": "Class-Balanced Self-Training",
+            tta_strat_desc = {
+                "Zero-Shot LP (Raw)": "Source-only frozen linear readout",
+                "Zero-Shot MLP (Raw)": "Source-only non-linear MLP readout",
+                "TTA Calibrated LP": "Unsupervised background whitening + Linear Probe",
+                "TTA Calibrated MLP": "Unsupervised background whitening + MLP Probe",
+                "TTA Mahalanobis (Unsupervised)": "Threshold-free energy ranking on whitened background",
             }
-            for s_name, s_data in canonical_uda_results.items():
-                m_dict = s_data.get("models", {})
-                if not m_dict:
-                    continue
-                first_m = list(m_dict.keys())[0]
-                lp_src = m_dict[first_m]["source"]["lp_auc_mean"]
-                lp_tgt = m_dict[first_m]["target"]["lp_auc_mean"]
-                f.write(f"| **{s_name.upper()}** | **Zero-Shot Linear Probe (Baseline)** | {lp_src:.4f} | {lp_tgt:.4f} | - | *baseline* | Source-only frozen readout |\n")
+            for s_name, s_data in canonical_tta_results.items():
+                m_dict = s_data.get("methods", {})
                 for m_name, m_res in m_dict.items():
                     s_auc = m_res["source"]["auc_mean"]
                     t_auc = m_res["target"]["auc_mean"]
                     t_std = m_res["target"]["auc_std"]
                     t_ap = m_res["target"]["ap_mean"]
                     delta = m_res["target"]["delta_auc_mean"]
-                    sign = "+" if delta >= 0 else ""
-                    strat = uda_meta.get(m_name, "Domain Adaptation")
-                    f.write(f"| **{s_name.upper()}** | {m_name} | {s_auc:.4f} | {t_auc:.4f} ± {t_std:.4f} | {t_ap:.4f} | **{sign}{delta:.4f}** | {strat} |\n")
+                    delta_str = f"**{'+' if delta >= 0 else ''}{delta:.4f}**" if "Zero-Shot" not in m_name else "*baseline*"
+                    strat = tta_strat_desc.get(m_name, "Test-Time Self-Calibration")
+                    f.write(f"| **{s_name.upper()}** | **{m_name}** | {s_auc:.4f} | {t_auc:.4f} ± {t_std:.4f} | {t_ap:.4f} | {delta_str} | {strat} |\n")
 
     # 9. Terminal Output
     print("\n" + "=" * 80)
@@ -1035,45 +1086,30 @@ def main():
     ov = master_summary["overall"]
     print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} ± {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")
 
-    # Canonical UDA Summary in Console
-    if canonical_uda_results:
+    # Canonical TTA Summary in Console
+    if canonical_tta_results:
         print("\n" + "=" * 80)
-        print("CANONICAL DOMAIN ADAPTATION (UDA) BENCHMARK SUMMARY")
+        print("CANONICAL TEST-TIME ADAPTATION (TTA) BENCHMARK SUMMARY")
         print("=" * 80)
-        for s_name, s_data in canonical_uda_results.items():
-            m_dict = s_data.get("models", {})
-            if not m_dict:
-                continue
-            first_m = list(m_dict.keys())[0]
-            lp_src = m_dict[first_m]["source"]["lp_auc_mean"]
-            lp_tgt = m_dict[first_m]["target"]["lp_auc_mean"]
+        for s_name, s_data in canonical_tta_results.items():
+            m_dict = s_data.get("methods", {})
             print(f"\n--- Shift: [{s_name.upper()}] ---")
-            print(f"{'Model / Method':<24} | {'Source AUC':<12} | {'Target AUC':<16} | {'Target AP':<10} | {'Δ vs LP AUC':<12}")
+            print(f"{'Method / Mechanism':<32} | {'Source AUC':<12} | {'Target AUC':<16} | {'Target AP':<10} | {'Δ vs LP AUC':<12}")
             print("-" * 80)
-            print(f"{'Linear Probe (Zero-Shot)':<24} | {lp_src:<12.4f} | {lp_tgt:<16.4f} | {'-':<10} | {'baseline':<12}")
             for m_name, m_res in m_dict.items():
                 s_auc = m_res["source"]["auc_mean"]
                 t_auc = m_res["target"]["auc_mean"]
                 t_std = m_res["target"]["auc_std"]
                 t_ap = m_res["target"]["ap_mean"]
                 delta = m_res["target"]["delta_auc_mean"]
-                sign = "+" if delta >= 0 else ""
+                delta_str = f"{'+' if delta >= 0 else ''}{delta:.4f}" if "Zero-Shot" not in m_name else "baseline"
                 auc_str = f"{t_auc:.4f} ± {t_std:.4f}"
-                print(f"{m_name:<24} | {s_auc:<12.4f} | {auc_str:<16} | {t_ap:<10.4f} | {sign}{delta:<12.4f}")
+                print(f"{m_name:<32} | {s_auc:<12.4f} | {auc_str:<16} | {t_ap:<10.4f} | {delta_str:<12}")
         print("=" * 80)
-    elif not run_uda:
+    elif not run_tta:
         print("\n" + "-" * 80)
-        print("[INFO] Canonical Domain Adaptation benchmark was SKIPPED by option (--skip_domain_adaptation / --eval_domain_adaptation=False).")
+        print("[INFO] Canonical Test-Time Adaptation (TTA) benchmark was SKIPPED by option (--skip_tta / --eval_tta=False).")
         print("-" * 80)
-    else:
-        print("\n" + "!" * 80)
-        print("[NOTICE] No pre-trained UDA models were evaluated.")
-        print("To train and evaluate UDA models (CORAL, DANN, DAN, CDAN, SHOT, OTDA, CBST):")
-        print("  1. Run downstream training first:")
-        print(f"     python -m src.PECT_JEPA.cross_condition.downstream.train_downstream --checkpoint {ckpt_path} --data_dir {args.data_dir}")
-        print("  2. Re-run evaluate:")
-        print(f"     python -m src.PECT_JEPA.cross_condition.evaluate --checkpoint {ckpt_path} --data_dir {args.data_dir}")
-        print("!" * 80)
 
     for sp in args.eval_splits:
         n_flag = sum(1 for r in master_results if r["split"] == sp and r.get("regime_ood", 0) == 1)
