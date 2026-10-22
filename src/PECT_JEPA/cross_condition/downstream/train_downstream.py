@@ -93,8 +93,26 @@ def parse_args():
         dest="adaptation_mode",
         type=str,
         default="all",
-        choices=["all", "cross_sensor", "cross_waveform", "cross_specimen", "cross_liftoff", "all_test"],
-        help="Target domain selection: 'all' (all 4 canonical single-shifts), 'cross_sensor' (TMR), 'cross_waveform' (Chirp), 'cross_specimen' (Rivet_v2), 'cross_liftoff' (z2)",
+        choices=["all", "cross_sensor", "cross_waveform", "cross_specimen", "cross_liftoff", "all_test", "none"],
+        help="Target domain selection: 'all' (all 4 canonical single-shifts), 'cross_sensor' (TMR), 'cross_waveform' (Chirp), 'cross_specimen' (Rivet_v2), 'cross_liftoff' (z2), 'all_test', 'none' (skip UDA training)",
+    )
+    parser.add_argument(
+        "--skip_uda",
+        "--skip_domain_adaptation",
+        dest="skip_uda",
+        nargs="?",
+        const=True,
+        type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v),
+        default=False,
+        help="Skip UDA model training entirely (only fit standard linear/MLP detection and sizing probes)",
+    )
+    parser.add_argument(
+        "--train_uda",
+        "--train_domain_adaptation",
+        dest="train_uda",
+        type=lambda v: v.lower() == "true" if isinstance(v, str) else bool(v),
+        default=True,
+        help="Whether to train UDA models (CORAL, DANN, etc.). Set to False to skip.",
     )
     
     # UDA Training Hyperparameters
@@ -578,7 +596,10 @@ def main():
     os.makedirs(downstream_dir, exist_ok=True)
 
     canonical_shifts = ["cross_sensor", "cross_waveform", "cross_specimen", "cross_liftoff"]
-    if args.adaptation_mode in ["all", "all_test"]:
+    run_uda = bool(args.train_uda) and not bool(args.skip_uda) and args.adaptation_mode != "none"
+    if not run_uda:
+        active_shifts = []
+    elif args.adaptation_mode in ["all", "all_test"]:
         active_shifts = canonical_shifts
     else:
         active_shifts = [args.adaptation_mode]
@@ -587,7 +608,8 @@ def main():
     print(f"CANONICAL DOWNSTREAM & UDA TRAINING PIPELINE")
     print(f"  Checkpoint:       {ckpt_path}")
     print(f"  Output Dir:       {downstream_dir}")
-    print(f"  Adaptation Mode:  {args.adaptation_mode} -> {active_shifts}")
+    print(f"  Adaptation Mode:  {args.adaptation_mode} -> {active_shifts if run_uda else '[SKIPPED]'}")
+    print(f"  Train UDA:        {run_uda}")
     print(f"  Device:           {args.device}")
     print("=" * 80, flush=True)
 
@@ -684,114 +706,123 @@ def main():
     print(f"  Saved standard_probes.joblib to {downstream_dir}")
 
     # 4. Train 7 UDA Models for Each Canonical Shift
-    print(f"\n[STEP 3/3] Training 7 UDA Models across {len(active_shifts)} Canonical Shifts...")
+    if run_uda and len(active_shifts) > 0:
+        print(f"\n[STEP 3/3] Training 7 UDA Models across {len(active_shifts)} Canonical Shifts...")
 
-    for shift in active_shifts:
-        src_files, tgt_files = get_canonical_shift_files(all_files, shift)
-        shift_dir = os.path.join(downstream_dir, shift)
-        os.makedirs(shift_dir, exist_ok=True)
+        for shift in active_shifts:
+            src_files, tgt_files = get_canonical_shift_files(all_files, shift)
+            shift_dir = os.path.join(downstream_dir, shift)
+            os.makedirs(shift_dir, exist_ok=True)
 
-        print("\n" + "=" * 75)
-        print(f"  >>> TRAINING UDA FOR CANONICAL SHIFT: [{shift.upper()}] <<<")
-        print(f"  Source: {len(src_files)} Base files | Target: {len(tgt_files)} Single-Shift files")
-        print(f"  Target Destination: {shift_dir}")
-        print("=" * 75, flush=True)
+            print("\n" + "=" * 75)
+            print(f"  >>> TRAINING UDA FOR CANONICAL SHIFT: [{shift.upper()}] <<<")
+            print(f"  Source: {len(src_files)} Base files | Target: {len(tgt_files)} Single-Shift files")
+            print(f"  Target Destination: {shift_dir}")
+            print("=" * 75, flush=True)
 
-        # Extract target features for this specific shift
-        target_z_list = []
-        pbar_target = tqdm(_iter_with_prefetch(tgt_files, args.prefetch), total=len(tgt_files),
-                           desc=f"Extracting Target [{shift}]", file=sys.stdout, dynamic_ncols=True)
-        for fp, cscan in pbar_target:
-            latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
-            flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
-            sample_n = min(len(flat_z), max(2000, args.target_sample_size // len(tgt_files)))
-            idx = rng.choice(len(flat_z), size=sample_n, replace=False)
-            target_z_list.append(flat_z[idx])
+            # Extract target features for this specific shift
+            target_z_list = []
+            pbar_target = tqdm(_iter_with_prefetch(tgt_files, args.prefetch), total=len(tgt_files),
+                               desc=f"Extracting Target [{shift}]", file=sys.stdout, dynamic_ncols=True)
+            for fp, cscan in pbar_target:
+                latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
+                flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
+                sample_n = min(len(flat_z), max(2000, args.target_sample_size // len(tgt_files)))
+                idx = rng.choice(len(flat_z), size=sample_n, replace=False)
+                target_z_list.append(flat_z[idx])
 
-        X_target = np.concatenate(target_z_list, axis=0)
-        if len(X_target) > args.target_sample_size:
-            X_target = X_target[rng.choice(len(X_target), size=args.target_sample_size, replace=False)]
-        print(f"  Target Samples for [{shift}]: {len(X_target)} pixels")
+            X_target = np.concatenate(target_z_list, axis=0)
+            if len(X_target) > args.target_sample_size:
+                X_target = X_target[rng.choice(len(X_target), size=args.target_sample_size, replace=False)]
+            print(f"  Target Samples for [{shift}]: {len(X_target)} pixels")
 
-        # Train Model 1: CORAL
-        coral_model = train_coral(
-            X_s=X_train_det, y_s=y_train_det, X_t=X_target,
-            epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
-            coral_weight=args.coral_weight, device=args.device,
-        )
+            # Train Model 1: CORAL
+            coral_model = train_coral(
+                X_s=X_train_det, y_s=y_train_det, X_t=X_target,
+                epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
+                coral_weight=args.coral_weight, device=args.device,
+            )
 
-        # Train Model 2: DANN
-        dann_model = train_dann(
-            X_s=X_train_det, y_s=y_train_det, X_t=X_target,
-            epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
-            dann_weight=args.dann_weight, device=args.device,
-        )
+            # Train Model 2: DANN
+            dann_model = train_dann(
+                X_s=X_train_det, y_s=y_train_det, X_t=X_target,
+                epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
+                dann_weight=args.dann_weight, device=args.device,
+            )
 
-        # Train Model 3: DAN (MK-MMD)
-        dan_model = train_dan(
-            X_s=X_train_det, y_s=y_train_det, X_t=X_target,
-            epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
-            dan_weight=args.dan_weight, device=args.device,
-        )
+            # Train Model 3: DAN (MK-MMD)
+            dan_model = train_dan(
+                X_s=X_train_det, y_s=y_train_det, X_t=X_target,
+                epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
+                dan_weight=args.dan_weight, device=args.device,
+            )
 
-        # Train Model 4: CDAN
-        cdan_model = train_cdan(
-            X_s=X_train_det, y_s=y_train_det, X_t=X_target,
-            epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
-            cdan_weight=args.cdan_weight, device=args.device,
-        )
+            # Train Model 4: CDAN
+            cdan_model = train_cdan(
+                X_s=X_train_det, y_s=y_train_det, X_t=X_target,
+                epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
+                cdan_weight=args.cdan_weight, device=args.device,
+            )
 
-        # Train Model 5: SHOT
-        shot_model = train_shot(
-            X_s=X_train_det, y_s=y_train_det, X_t=X_target,
-            epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
-            div_weight=args.shot_div_weight, device=args.device,
-        )
+            # Train Model 5: SHOT
+            shot_model = train_shot(
+                X_s=X_train_det, y_s=y_train_det, X_t=X_target,
+                epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
+                div_weight=args.shot_div_weight, device=args.device,
+            )
 
-        # Train Model 6: OTDA (Wasserstein Sinkhorn)
-        otda_model = train_otda(
-            X_s=X_train_det, y_s=y_train_det, X_t=X_target,
-            epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
-            ot_weight=args.ot_weight, device=args.device,
-        )
+            # Train Model 6: OTDA (Wasserstein Sinkhorn)
+            otda_model = train_otda(
+                X_s=X_train_det, y_s=y_train_det, X_t=X_target,
+                epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
+                ot_weight=args.ot_weight, device=args.device,
+            )
 
-        # Train Model 7: CBST (Class-Balanced Self-Training)
-        cbst_model = train_cbst(
-            X_s=X_train_det, y_s=y_train_det, X_t=X_target,
-            epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
-            st_weight=args.cbst_weight, device=args.device,
-        )
+            # Train Model 7: CBST (Class-Balanced Self-Training)
+            cbst_model = train_cbst(
+                X_s=X_train_det, y_s=y_train_det, X_t=X_target,
+                epochs=args.epochs, batch_size=args.uda_batch_size, lr=args.learning_rate,
+                st_weight=args.cbst_weight, device=args.device,
+            )
 
-        # Save all 7 models into shift directory
-        torch.save(coral_model.state_dict(), os.path.join(shift_dir, "coral_model.pt"))
-        torch.save(dann_model.state_dict(), os.path.join(shift_dir, "dann_model.pt"))
-        torch.save(dan_model.state_dict(), os.path.join(shift_dir, "dan_model.pt"))
-        torch.save(cdan_model.state_dict(), os.path.join(shift_dir, "cdan_model.pt"))
-        torch.save(shot_model.state_dict(), os.path.join(shift_dir, "shot_model.pt"))
-        torch.save(otda_model.state_dict(), os.path.join(shift_dir, "otda_model.pt"))
-        torch.save(cbst_model.state_dict(), os.path.join(shift_dir, "cbst_model.pt"))
+            # Save all 7 models into shift directory
+            torch.save(coral_model.state_dict(), os.path.join(shift_dir, "coral_model.pt"))
+            torch.save(dann_model.state_dict(), os.path.join(shift_dir, "dann_model.pt"))
+            torch.save(dan_model.state_dict(), os.path.join(shift_dir, "dan_model.pt"))
+            torch.save(cdan_model.state_dict(), os.path.join(shift_dir, "cdan_model.pt"))
+            torch.save(shot_model.state_dict(), os.path.join(shift_dir, "shot_model.pt"))
+            torch.save(otda_model.state_dict(), os.path.join(shift_dir, "otda_model.pt"))
+            torch.save(cbst_model.state_dict(), os.path.join(shift_dir, "cbst_model.pt"))
 
-        summary = {
-            "checkpoint": ckpt_path,
-            "shift": shift,
-            "source_files": len(src_files),
-            "target_files": len(tgt_files),
-            "source_samples": int(len(y_train_det)),
-            "target_samples": int(len(X_target)),
-            "epochs": args.epochs,
-            "models": ["CORAL", "DANN", "DAN", "CDAN", "SHOT", "OTDA", "CBST"],
-            "device": args.device,
-        }
-        with open(os.path.join(shift_dir, "downstream_train_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+            summary = {
+                "checkpoint": ckpt_path,
+                "shift": shift,
+                "source_files": len(src_files),
+                "target_files": len(tgt_files),
+                "source_samples": int(len(y_train_det)),
+                "target_samples": int(len(X_target)),
+                "epochs": args.epochs,
+                "models": ["CORAL", "DANN", "DAN", "CDAN", "SHOT", "OTDA", "CBST"],
+                "device": args.device,
+            }
+            with open(os.path.join(shift_dir, "downstream_train_summary.json"), "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
 
-        print(f"  [OK] Saved all 7 UDA models for [{shift}] to: {shift_dir}")
+            print(f"  [OK] Saved all 7 UDA models for [{shift}] to: {shift_dir}")
+    else:
+        print("\n" + "=" * 80)
+        print("[STEP 3/3] Training UDA Models [SKIPPED by user configuration]")
+        print("  Only standard downstream probes (Linear/MLP Detection & Sizing) were trained and saved.")
+        print("=" * 80, flush=True)
 
     print("\n" + "=" * 80)
-    print(f"SUCCESS: All Downstream Models Trained:")
+    print("SUCCESS: Downstream Training Complete:")
     print(f"  - Probes: {os.path.join(downstream_dir, 'standard_probes.joblib')}")
-    for shift in active_shifts:
-        print(f"  - UDA Suite ({shift}): {os.path.join(downstream_dir, shift)} (7 models: CORAL, DANN, DAN, CDAN, SHOT, OTDA, CBST)")
+    if run_uda and len(active_shifts) > 0:
+        for shift in active_shifts:
+            print(f"  - UDA Suite ({shift}): {os.path.join(downstream_dir, shift)} (7 models: CORAL, DANN, DAN, CDAN, SHOT, OTDA, CBST)")
+    else:
+        print("  - UDA Suite: [SKIPPED by user configuration]")
     print("=" * 80, flush=True)
 
 
