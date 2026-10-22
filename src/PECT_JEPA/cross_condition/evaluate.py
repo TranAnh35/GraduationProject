@@ -603,7 +603,7 @@ def main():
 
             gt_mask = gt_masks[sp]["mask"]
             latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
-            cached_train_latents[fp] = latents
+            cached_all_latents[fp] = latents
             train_energies.append(scan_feature_energy(latents))
 
             flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
