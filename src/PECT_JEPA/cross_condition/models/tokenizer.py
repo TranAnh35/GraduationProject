@@ -46,6 +46,21 @@ class DualDomainTokenizer(nn.Module):
         self.relative_energy_anchor = bool(getattr(config, "relative_energy_anchor", False))
         self.patch_polarity_align = bool(getattr(config, "patch_polarity_align", False))
         self.bi_directional_relative_energy = bool(getattr(config, "bi_directional_relative_energy", False))
+        # EXP-69: dedicated window-anchor branch. Rationale measured on 81 scans: the per-probe
+        # v_pp map alone lifts a linear readout 0.6424 -> 0.7366 (+0.094, Chirp +0.209), but in
+        # the legacy path v_pp/energy_t are 2 of ~133 inputs to a single linear layer whose other
+        # inputs are unit-variance shapes, so the anchor block enters at ~1/60 of the shape scale
+        # and the encoder never represents it.
+        self.anchor_stats_branch = bool(getattr(config, "anchor_stats_branch", False))
+        self.anchor_stats_norm = bool(getattr(config, "anchor_stats_norm", True))
+        if self.anchor_stats_branch and self.tokenizer_type not in ("energy_adaptive", "patch_energy_adaptive"):
+            raise ValueError("anchor_stats_branch requires tokenizer_type='energy_adaptive' "
+                             f"(got '{self.tokenizer_type}')")
+        if self.anchor_stats_branch:
+            self.anchor_bn = nn.BatchNorm1d(6) if self.anchor_stats_norm else None
+            self.anchor_proj = nn.Linear(6, config.embed_dim)
+            nn.init.trunc_normal_(self.anchor_proj.weight, std=0.02)
+            nn.init.zeros_(self.anchor_proj.bias)
 
         self.time_dim = config.embed_dim // 2
         self.freq_dim = config.embed_dim - self.time_dim
@@ -142,6 +157,7 @@ class DualDomainTokenizer(nn.Module):
         assert C == self.temporal_samples, f"Expected {self.temporal_samples} channels, got {C}"
 
         x_flat = x.reshape(B, self.num_tokens, C)
+        anchor_stats = None
 
         if self.clean_phasor_token:
             # --- 1. Polarity-Aligned Time Domain + Diffusion Energy Quantiles ---
@@ -259,6 +275,17 @@ class DualDomainTokenizer(nn.Module):
                 energy_t = torch.log1p(torch.mean(x_flat_aligned ** 2, dim=-1, keepdim=True))
                 x_fp32 = x_flat_aligned.float()
 
+                if self.anchor_stats_branch:
+                    # The exact 6 per-probe window statistics whose linear readout was measured
+                    # on 81 scans (vpp/mean/std/rms/peak/zcr), kept in native units; BatchNorm
+                    # restores their dynamic range before a dedicated projection.
+                    _vpp = (v_max - v_min)
+                    _rms = torch.sqrt(torch.mean(x_flat_aligned ** 2, dim=-1, keepdim=True) + 1e-12)
+                    _peak = torch.amax(torch.abs(x_flat_aligned), dim=-1, keepdim=True)
+                    _sg = torch.sign(x_flat_aligned)
+                    _zcr = 0.5 * torch.mean(torch.abs(_sg[..., 1:] - _sg[..., :-1]), dim=-1, keepdim=True)
+                    anchor_stats = torch.cat([_vpp, mean_t, std_t, _rms, _peak, _zcr], dim=-1)
+
                 if self.bi_directional_relative_energy:
                     # Bi-directional spatial energy contrast (fixes Rivet_v2 half-space sign inversion in latent space):
                     # Relative probe energy compared to surrounding context probes (probes 1..24)
@@ -339,6 +366,15 @@ class DualDomainTokenizer(nn.Module):
         # 3. Dual-domain fusion
         z_fused = torch.cat([z_time, z_freq], dim=-1)  # [B, 25, D]
         tokens = self.drop(self.norm(z_fused))
+        if self.anchor_stats_branch:
+            if anchor_stats is None:
+                raise RuntimeError("anchor_stats_branch=True but no anchor statistics were produced; "
+                                   "it is only supported for the plain energy_adaptive branch "
+                                   "(patch_energy_norm/median_patch_energy/clean_phasor_token must be False)")
+            a = anchor_stats
+            if self.anchor_bn is not None:
+                a = self.anchor_bn(a.reshape(-1, 6)).reshape(B, self.num_tokens, 6)
+            tokens = tokens + self.anchor_proj(a.to(tokens.dtype))
         if self.continuous_pos_embed:
             coords = self.norm_coords.to(dtype=tokens.dtype, device=tokens.device)
             pos = self.pos_mlp(coords).expand(B, -1, -1)

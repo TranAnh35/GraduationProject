@@ -45,6 +45,8 @@ class CrossConditionConfig:
     relative_energy_anchor: bool = False  # If True, appends spatial energy ratio log(1 + E_i) - log(1 + E_context) to time branch without outer-ring boundary coupling (fixes FM11 on Rivet_v2 & Sizing without FM13/FM14)
     patch_polarity_align: bool = False    # If True, aligns patch polarity using center probe 0 dominant peak without checkerboard flips or root-saliency spectral starvation (resolves TMR polarity while preserving broadband Dodd-Deeds phase)
     bi_directional_relative_energy: bool = False  # If True, appends both signed Delta E and absolute magnitude |Delta E| to time branch (eliminates Rivet_v2 half-space sign inversion in latent space)
+    anchor_stats_branch: bool = False  # EXP-69: adds a dedicated 6-statistic window-anchor branch (vpp/mean/std/rms/peak/zcr per probe). Rationale: the per-probe vpp map alone is worth +0.094 test LP when read linearly (0.6424->0.7366) but enters the legacy time_proj at ~1/60 of the shape-channel scale, so the encoder discards it.
+    anchor_stats_norm: bool = True  # EXP-69: BatchNorm1d over the 6 anchor statistics (per-channel standardization) before the anchor projection. True = scale-restored (mechanism test); False = raw units (scale-starvation ablation).
     diffusion_attention: bool = False  # Direction A: Physically-grounded Green's diffusion distance-decay attention bias
     two_stream_backbone: bool = False  # Direction B: Asymmetric two-stream decoupled encoder backbone (carrier z_c vs scattering z_s)
     carrier_coupling_mode: str = "additive"  # 'additive' (legacy), 'multiplicative' (pure scaling), 'none' (fully decoupled)

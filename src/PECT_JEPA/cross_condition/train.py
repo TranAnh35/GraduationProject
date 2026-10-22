@@ -88,6 +88,8 @@ def parse_args():
     parser.add_argument("--relative_energy_anchor", type=lambda v: v.lower() == "true", default=False, help="Append spatial energy ratio log(1 + E_i) - log(1 + E_context) to time branch (fixes FM11 on Rivet_v2 without FM13/FM14)")
     parser.add_argument("--patch_polarity_align", type=lambda v: v.lower() == "true", default=False, help="Align patch polarity using center probe 0 dominant peak (fixes TMR polarity without FM18 spectral starvation)")
     parser.add_argument("--bi_directional_relative_energy", type=lambda v: v.lower() == "true", default=False, help="Append both signed Delta E and absolute magnitude |Delta E| to time branch (eliminates Rivet_v2 sign inversion)")
+    parser.add_argument("--anchor_stats_branch", type=lambda v: v.lower() == "true", default=False, help="EXP-69: dedicated 6-statistic (vpp/mean/std/rms/peak/zcr) window-anchor branch with its own projection (restores the amplitude-contrast subspace the encoder currently discards)")
+    parser.add_argument("--anchor_stats_norm", type=lambda v: v.lower() == "true", default=True, help="EXP-69: BatchNorm1d per-channel standardization of the 6 anchor statistics before projection (False = raw units ablation)")
     parser.add_argument("--diffusion_attention", type=lambda v: v.lower() == "true", default=False, help="Physically-grounded Green's diffusion distance-decay attention bias (Direction A)")
     parser.add_argument("--two_stream_backbone", type=lambda v: v.lower() == "true", default=False, help="Asymmetric two-stream decoupled encoder backbone (carrier z_c vs scattering z_s) (Direction B)")
     parser.add_argument("--grounded_condition_pred", type=lambda v: v.lower() == "true", default=False, help="Condition transfer function grounding with scale-normalized directional target prediction (Direction C)")
@@ -165,6 +167,8 @@ def main():
         relative_energy_anchor=args.relative_energy_anchor,
         patch_polarity_align=args.patch_polarity_align,
         bi_directional_relative_energy=args.bi_directional_relative_energy,
+        anchor_stats_branch=args.anchor_stats_branch,
+        anchor_stats_norm=args.anchor_stats_norm,
         diffusion_attention=args.diffusion_attention,
         two_stream_backbone=args.two_stream_backbone,
         carrier_coupling_mode=args.carrier_coupling_mode,
