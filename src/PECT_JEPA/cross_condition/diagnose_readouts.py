@@ -240,7 +240,7 @@ def main():
 
     extractor = CScanFeatureExtractor(model=model, device=device, batch_size=args.batch_size)
     suite = DownstreamBenchmarkSuite(n_splits=5, random_state=42, device=device)
-    gt_masks = load_ground_truth_masks()
+    gt_masks = load_ground_truth_masks(args.data_dir)
 
     all_files = sorted(glob.glob(os.path.join(args.data_dir, "**", "*.tdms"), recursive=True))
     all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]

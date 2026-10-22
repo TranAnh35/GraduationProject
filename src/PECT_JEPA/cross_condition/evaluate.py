@@ -78,13 +78,32 @@ from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
 )
 
 
-def load_ground_truth_masks() -> Dict[str, Any]:
+def load_ground_truth_masks(data_dir: Optional[str] = None) -> Dict[str, Any]:
     """Loads CAD ground truth masks and sizing targets for all specimens."""
     masks = {}
+    candidates = []
+    if data_dir is not None:
+        candidates.append(os.path.join(data_dir, "ground_truth"))
+        candidates.append(data_dir)
+    candidates.extend([
+        os.path.join(ROOT_DIR, "data", "ground_truth"),
+        os.path.join(ROOT_DIR, "ground_truth"),
+        "data/ground_truth",
+        "ground_truth",
+        "/content/drive/MyDrive/PECT_Dataset/ground_truth",
+    ])
+    gt_root = None
+    for c in candidates:
+        if os.path.exists(os.path.join(c, "corrosion", "corrosion_gt_mask.npy")):
+            gt_root = c
+            break
+
+    if gt_root is None:
+        return masks
 
     # 1. Corrosion
-    corr_gt_path = "data/ground_truth/corrosion/corrosion_gt_mask.npy"
-    corr_cfg_path = "data/ground_truth/corrosion/corrosion_flaws_config.json"
+    corr_gt_path = os.path.join(gt_root, "corrosion", "corrosion_gt_mask.npy")
+    corr_cfg_path = os.path.join(gt_root, "corrosion", "corrosion_flaws_config.json")
     if os.path.exists(corr_gt_path):
         masks["Corrosion"] = {
             "mask": np.load(corr_gt_path),
@@ -92,7 +111,7 @@ def load_ground_truth_masks() -> Dict[str, Any]:
         }
 
     # 2. Rivet_v1
-    r1_gt_path = "data/ground_truth/rivet_v1/rivet_v1_gt_mask.npy"
+    r1_gt_path = os.path.join(gt_root, "rivet_v1", "rivet_v1_gt_mask.npy")
     if os.path.exists(r1_gt_path):
         masks["Rivet_v1"] = {
             "mask": np.load(r1_gt_path),
@@ -100,7 +119,7 @@ def load_ground_truth_masks() -> Dict[str, Any]:
         }
 
     # 3. Rivet_v2
-    r2_gt_path = "data/ground_truth/rivet_v2/rivet_v2_gt_mask.npy"
+    r2_gt_path = os.path.join(gt_root, "rivet_v2", "rivet_v2_gt_mask.npy")
     if os.path.exists(r2_gt_path):
         masks["Rivet_v2"] = {
             "mask": np.load(r2_gt_path),
@@ -479,7 +498,7 @@ def evaluate_canonical_test_time_adaptation(
             print(f"CANONICAL TEST-TIME ADAPTATION (TTA) SUMMARY: [{shift.upper()}]")
             print(f"  Source Domain: {len(src_files)} files (Train/Val Pool) | Target Domain: {len(tgt_files)} files (Single Shift)")
             print("=" * 92)
-            print(f"{'Method / Mechanism':<30} | {'Source AUC (Retain)':<20} | {'Target AUC (Adapt)':<21} | {'Target AP':<9} | {'Δ vs Zero-Shot':<12}")
+            print(f"{'Method / Mechanism':<30} | {'Source AUC (Retain)':<20} | {'Target AUC (Adapt)':<21} | {'Target AP':<9} | {'Delta vs Base':<13}")
             print("-" * 92)
             for m_label, auc_k, ap_k, delta_k in method_keys:
                 s_stat = shift_summary["methods"][m_label]["source"]
@@ -490,7 +509,7 @@ def evaluate_canonical_test_time_adaptation(
                 t_ap = t_stat["ap_mean"]
                 delta = t_stat["delta_auc_mean"]
                 delta_str = f"{'+' if delta >= 0 else ''}{delta:.4f}" if delta_k is not None else "baseline"
-                print(f"{m_label:<30} | {s_auc:<20.4f} | {t_auc:.4f} ± {t_std:<13.4f} | {t_ap:<9.4f} | {delta_str:<12}")
+                print(f"{m_label:<30} | {s_auc:<20.4f} | {t_auc:.4f} +/- {t_std:<10.4f} | {t_ap:<9.4f} | {delta_str:<13}")
             print("=" * 92 + "\n", flush=True)
 
             shift_results[shift] = shift_summary
@@ -499,6 +518,11 @@ def evaluate_canonical_test_time_adaptation(
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     args = parse_args()
     device = torch.device(args.device)
     try:
@@ -546,7 +570,7 @@ def main():
     # 2. Ground Truth Masks & Feature Extractor
     extractor = CScanFeatureExtractor(model=model, device=device, batch_size=args.batch_size)
     suite = DownstreamBenchmarkSuite(n_splits=5, random_state=42, device=device)
-    gt_masks = load_ground_truth_masks()
+    gt_masks = load_ground_truth_masks(args.data_dir)
     corr_d_map = None
     if "Corrosion" in gt_masks and gt_masks["Corrosion"]["config"] is not None:
         corr_d_map = build_corrosion_diameter_map(gt_masks["Corrosion"]["config"])
@@ -1113,10 +1137,10 @@ def main():
     for sp in args.eval_splits:
         st = master_summary["by_split"].get(sp, {})
         if st:
-            print(f"[{sp.upper():5s}] ({st['count']} files) -> LP AUC: {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | LP AP: {st['linear_probe_ap_mean']:.4f} | CNR: {st['cnr_mean']:.2f} | Seg IoU: {st['segmentation_iou_mean']:.4f} | Sizing R²: {st['sizing_r2_mean']:.4f}")
+            print(f"[{sp.upper():5s}] ({st['count']} files) -> LP AUC: {st['linear_probe_auc_mean']:.4f} +/- {st['linear_probe_auc_std']:.4f} | LP AP: {st['linear_probe_ap_mean']:.4f} | CNR: {st['cnr_mean']:.2f} | Seg IoU: {st['segmentation_iou_mean']:.4f} | Sizing R2: {st['sizing_r2_mean']:.4f}")
     print("-" * 80)
     ov = master_summary["overall"]
-    print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} ± {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")
+    print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} +/- {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")
 
     # Canonical TTA Summary in Console
     if canonical_tta_results:
@@ -1126,7 +1150,7 @@ def main():
         for s_name, s_data in canonical_tta_results.items():
             m_dict = s_data.get("methods", {})
             print(f"\n--- Shift: [{s_name.upper()}] ---")
-            print(f"{'Method / Mechanism':<32} | {'Source AUC':<12} | {'Target AUC':<16} | {'Target AP':<10} | {'Δ vs LP AUC':<12}")
+            print(f"{'Method / Mechanism':<32} | {'Source AUC':<12} | {'Target AUC':<16} | {'Target AP':<10} | {'Delta vs LP':<12}")
             print("-" * 80)
             for m_name, m_res in m_dict.items():
                 s_auc = m_res["source"]["auc_mean"]
@@ -1135,7 +1159,7 @@ def main():
                 t_ap = m_res["target"]["ap_mean"]
                 delta = m_res["target"]["delta_auc_mean"]
                 delta_str = f"{'+' if delta >= 0 else ''}{delta:.4f}" if "Zero-Shot" not in m_name else "baseline"
-                auc_str = f"{t_auc:.4f} ± {t_std:.4f}"
+                auc_str = f"{t_auc:.4f} +/- {t_std:.4f}"
                 print(f"{m_name:<32} | {s_auc:<12.4f} | {auc_str:<16} | {t_ap:<10.4f} | {delta_str:<12}")
         print("=" * 80)
     elif not run_tta:

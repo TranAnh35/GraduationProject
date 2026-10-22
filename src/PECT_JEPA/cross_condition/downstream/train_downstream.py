@@ -119,7 +119,7 @@ def main():
     # 2. File discovery
     all_files = sorted(glob.glob(os.path.join(args.data_dir, "**", "*.tdms"), recursive=True))
     all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
-    gt_masks = load_ground_truth_masks()
+    gt_masks = load_ground_truth_masks(args.data_dir)
     corr_d_map = None
     if "Corrosion" in gt_masks and gt_masks["Corrosion"]["config"] is not None:
         corr_d_map = build_corrosion_diameter_map(gt_masks["Corrosion"]["config"])
