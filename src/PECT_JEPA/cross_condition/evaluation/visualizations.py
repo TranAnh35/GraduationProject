@@ -176,10 +176,10 @@ def plot_detection_summary_map(
 
     # 2. Raw Heatmap (Peak-to-Peak V_pp)
     if raw_heatmap is not None:
-        im1 = axes[1].imshow(raw_heatmap, cmap="viridis", origin="lower")
+        im1 = axes[1].imshow(raw_heatmap, cmap="jet", origin="lower")
         t1 = f"2) Raw PECT Signal (Peak-to-Peak)\nV_pp range: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
     else:
-        im1 = axes[1].imshow(np.zeros_like(ground_truth_mask), cmap="viridis", origin="lower")
+        im1 = axes[1].imshow(np.zeros_like(ground_truth_mask), cmap="jet", origin="lower")
         t1 = "2) Raw PECT Signal (Not Provided)"
     axes[1].set_title(t1, fontsize=10, fontweight="bold")
     axes[1].set_xlabel("X (pixels)", fontsize=9)
@@ -259,7 +259,7 @@ def plot_tta_summary_map(
 
     # 2. Raw PECT Peak-to-Peak (if present)
     if has_raw:
-        im_raw = axes[ax_idx].imshow(raw_heatmap, cmap="viridis", origin="lower")
+        im_raw = axes[ax_idx].imshow(raw_heatmap, cmap="jet", origin="lower")
         t_raw = f"2) Raw PECT Signal (Peak-to-Peak)\nV_pp range: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
         axes[ax_idx].set_title(t_raw, fontsize=10, fontweight="bold")
         axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)

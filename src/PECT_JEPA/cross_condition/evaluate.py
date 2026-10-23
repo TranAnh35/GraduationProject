@@ -540,9 +540,8 @@ def main():
         "sizing": os.path.join(out_dir, "2_Defect_Sizing"),
         "segmentation": os.path.join(out_dir, "3_Segmentation_IoU"),
     }
-    for tname, tdir in task_dirs.items():
-        for sp in ["train", "val", "test"]:
-            os.makedirs(os.path.join(tdir, sp), exist_ok=True)
+    for tdir in task_dirs.values():
+        os.makedirs(tdir, exist_ok=True)
 
     print("\n" + "=" * 75)
     print("PECT-JEPA Unified Downstream Benchmark Evaluation")
@@ -822,7 +821,7 @@ def main():
                 )
 
             # TASK 3: Segmentation IoU & Bounding Box Overlap Map (spatiotemporal_5x5 standard)
-            seg_plot_path = os.path.join(task_dirs["segmentation"], split_name, f"{bname}_segmentation_iou.png")
+            seg_plot_path = os.path.join(task_dirs["segmentation"], f"{bname}_segmentation_iou.png")
             iou_res = plot_defect_contours_and_iou(
                 prob_map=prob_map,
                 gt_mask=gt_mask,
@@ -863,27 +862,8 @@ def main():
             master_results.append(row)
 
             # Save task-specific visualizations
-            # 1. Anomaly Detection: Trained Linear Probe Probability Heatmap (cmap='jet')
-            lp_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_linear_probe_prob.png")
-            plot_probability_heatmap(
-                prob_map=prob_map,
-                save_path=lp_plot_path,
-                title=f"Trained Linear Probe P(Defect | z) [{split_name.upper()}]\n{specimen} - {sensor} - {waveform} | AUC: {det_res['auc_roc']:.4f} | AP: {det_res['average_precision']:.4f}",
-                cmap="jet",
-            )
-
-            # Unsupervised Mahalanobis Anomaly Map (cmap='jet')
-            maha_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_mahalanobis.png")
-            plot_cscan_anomaly_map(
-                anomaly_map=anom_res["anomaly_scores"],
-                ground_truth_mask=gt_mask,
-                file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform} | {liftoff}",
-                save_path=maha_plot_path,
-                metrics=anom_res,
-            )
-
-            # 4-Panel Detection Summary (1. CAD GT, 2. Raw Peak-to-Peak, 3. Mahalanobis, 4. Linear Probe)
-            summary_plot_path = os.path.join(task_dirs["anomaly"], split_name, f"{bname}_detection_summary.png")
+            # 1. Anomaly Detection: 4-Panel Summary Map (1. CAD GT, 2. Raw Peak-to-Peak, 3. Mahalanobis, 4. Linear Probe)
+            summary_plot_path = os.path.join(task_dirs["anomaly"], f"{bname}_detection_summary.png")
             raw_ptp = cached_raw_heatmaps.get(fp)
             if raw_ptp is None:
                 cscan_temp = load_canonical_cscan_from_tdms(fp)
@@ -916,7 +896,7 @@ def main():
 
             # 2. Sizing Scatter Plot (if applicable)
             if specimen == "Corrosion" and len(sizing_res["y_true"]) > 0:
-                sizing_plot_path = os.path.join(task_dirs["sizing"], split_name, f"{bname}_sizing.png")
+                sizing_plot_path = os.path.join(task_dirs["sizing"], f"{bname}_sizing.png")
                 plot_sizing_calibration(
                     true_size=sizing_res["y_true"],
                     pred_size=sizing_res["y_pred"],
@@ -962,25 +942,26 @@ def main():
     print("STEP 3: Saving Structured Output Hierarchy and Aggregated Reports")
     print("=" * 75, flush=True)
 
-    for sp in args.eval_splits:
-        for tname in ["anomaly", "sizing", "segmentation"]:
-            trows = split_task_results[sp][tname]
-            if trows:
-                t_csv = os.path.join(task_dirs[tname], sp, "split_metrics.csv")
-                with open(t_csv, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=list(trows[0].keys()))
-                    writer.writeheader()
-                    writer.writerows(trows)
+    for tname in ["anomaly", "sizing", "segmentation"]:
+        all_task_rows = []
+        for sp in args.eval_splits:
+            all_task_rows.extend(split_task_results[sp][tname])
+        if all_task_rows:
+            t_csv = os.path.join(task_dirs[tname], "metrics.csv")
+            with open(t_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(all_task_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(all_task_rows)
 
-                t_json = os.path.join(task_dirs[tname], sp, "split_summary.json")
-                num_summary = {}
-                for k in trows[0].keys():
-                    vals = [r[k] for r in trows if isinstance(r[k], (int, float))]
-                    if vals:
-                        num_summary[f"mean_{k}"] = float(np.mean(vals))
-                        num_summary[f"std_{k}"] = float(np.std(vals))
-                with open(t_json, "w", encoding="utf-8") as f:
-                    json.dump({"split": sp, "task": tname, "count": len(trows), "metrics": num_summary}, f, indent=2)
+            t_json = os.path.join(task_dirs[tname], "summary.json")
+            num_summary = {}
+            for k in all_task_rows[0].keys():
+                vals = [r[k] for r in all_task_rows if isinstance(r[k], (int, float))]
+                if vals:
+                    num_summary[f"mean_{k}"] = float(np.mean(vals))
+                    num_summary[f"std_{k}"] = float(np.std(vals))
+            with open(t_json, "w", encoding="utf-8") as f:
+                json.dump({"task": tname, "count": len(all_task_rows), "metrics": num_summary}, f, indent=2)
 
     # 7. STEP 4: Canonical Test-Time Adaptation (TTA) Benchmark (Single-Variable Controlled Shifts)
     canonical_tta_results = None
