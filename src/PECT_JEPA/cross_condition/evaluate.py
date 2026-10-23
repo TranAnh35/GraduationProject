@@ -1037,6 +1037,30 @@ def main():
             "sizing_mae_mean": float(np.mean(sz_mae)) if sz_mae else 0.0,
         }
 
+    def _effective_latent_dim(cfg) -> int:
+        if getattr(cfg, "unified_latent", False) or not getattr(cfg, "latent_disentanglement", False):
+            return int(cfg.embed_dim * 2)
+        lt = getattr(cfg, "downstream_latent_type", "scattering")
+        if lt == "scattering":
+            return int(getattr(cfg, "scattering_dim", cfg.embed_dim // 2) * 2)
+        if lt == "carrier":
+            return int(getattr(cfg, "carrier_dim", cfg.embed_dim // 2) * 2)
+        return int(cfg.embed_dim * 2)
+
+    _test_rows = [r for r in master_results if r["split"] == "test"]
+    by_axis_test = {}
+    if _test_rows:
+        by_axis_test = {
+            "by_waveform_test": {wf: compute_stats([r for r in _test_rows if r["waveform"] == wf])
+                                 for wf in ["Square", "Gaussian", "Chirp"]},
+            "by_sensor_test": {sn: compute_stats([r for r in _test_rows if r["sensor"] == sn])
+                               for sn in ["Hall_Air_Core", "Hall_Pot_Core", "TMR"]},
+            "by_liftoff_test": {lo: compute_stats([r for r in _test_rows if r["liftoff"] == lo])
+                                for lo in ["z1", "z2", "z3"]},
+            "by_specimen_test": {sp: compute_stats([r for r in _test_rows if r["specimen"] == sp])
+                                 for sp in ["Corrosion", "Rivet_v1", "Rivet_v2"]},
+        }
+
     master_summary = {
         "evaluation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "checkpoint": ckpt_path,
@@ -1063,6 +1087,21 @@ def main():
             sp: compute_stats([r for r in master_results if r["specimen"] == sp])
             for sp in ["Corrosion", "Rivet_v1", "Rivet_v2"]
         },
+        # AUDIT-2026-10-23: the by_* tables above span EVERY evaluated file, so a
+        # train/val file leaks into a per-axis number. Any per-axis claim must use
+        # the *_test variants below (test-only rows).
+        "scope_note": ("by_* tables span all evaluated splits; use by_*_test for "
+                       "per-axis claims. latent_config records the effective "
+                       "representation and calibration flags."),
+        "latent_config": {
+            "downstream_latent_type": getattr(config, "downstream_latent_type", None),
+            "latent_disentanglement": bool(getattr(config, "latent_disentanglement", False)),
+            "unified_latent": bool(getattr(config, "unified_latent", False)),
+            "self_calibration": bool(getattr(args, "self_calibration", False)),
+            "eval_tta": bool(getattr(args, "eval_tta", False)),
+            "latent_dim": _effective_latent_dim(config),
+        },
+        **by_axis_test,
         "canonical_test_time_adaptation": canonical_tta_results,
         "canonical_domain_adaptation": canonical_tta_results,
     }
@@ -1088,21 +1127,24 @@ def main():
                 f.write(f"| **{sp.upper()}** | {st['count']} | {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['mahalanobis_auc_mean']:.4f} | {st['segmentation_iou_mean']:.4f} | {st['sizing_r2_mean']:.4f} |\n")
 
         f.write("\n## 2. Generalization Disaggregation\n\n")
+        f.write("> AUDIT-2026-10-23: these tables are **test-only** (`by_*_test`). The "
+                "`by_*` fields in the JSON still span every evaluated split and must not "
+                "be quoted as generalization.\n\n")
         f.write("### By Waveform\n")
         f.write("| Waveform | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
-        for wf, st in master_summary["by_waveform"].items():
+        for wf, st in master_summary.get("by_waveform_test", master_summary["by_waveform"]).items():
             if st.get("count", 0) > 0:
                 f.write(f"| {wf} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
         f.write("\n### By Sensor\n")
         f.write("| Sensor | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
-        for sn, st in master_summary["by_sensor"].items():
+        for sn, st in master_summary.get("by_sensor_test", master_summary["by_sensor"]).items():
             if st.get("count", 0) > 0:
                 f.write(f"| {sn} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 
         f.write("\n### By Lift-off\n")
         f.write("| Lift-off | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
-        for lo, st in master_summary["by_liftoff"].items():
+        for lo, st in master_summary.get("by_liftoff_test", master_summary["by_liftoff"]).items():
             if st.get("count", 0) > 0:
                 f.write(f"| {lo} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
 

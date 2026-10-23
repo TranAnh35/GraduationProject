@@ -50,7 +50,8 @@ class PairedPECTDataset(Dataset):
         self,
         file_paths: Optional[List[str]] = None,
         data_dir: Optional[str] = None,
-        grid_stride: int = 1,
+        use_full_dataset: bool = False,
+        grid_stride: int = 4,
         samples_per_epoch: Optional[int] = None,
         num_partitions: int = 10,
         topology: str = "concentric_star",
@@ -66,15 +67,24 @@ class PairedPECTDataset(Dataset):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
         self.seed = seed
+        self.use_full_dataset = bool(use_full_dataset)
         import glob
         from .split import filter_base_domain_files
 
         if file_paths is None:
+            if data_dir is None or not os.path.isdir(data_dir):
+                for cand in [data_dir, "data", os.path.join("..", "..", "..", "data"), os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")]:
+                    if cand and os.path.isdir(cand):
+                        data_dir = cand
+                        break
             if data_dir is None:
                 data_dir = "data"
-            all_files = glob.glob(os.path.join(data_dir, "**", "*.tdms"), recursive=True)
-            all_files = [f for f in all_files if not f.endswith("_index.tdms")]
-            file_paths = filter_base_domain_files(all_files)
+            all_files = sorted(glob.glob(os.path.join(data_dir, "**", "*.tdms"), recursive=True))
+            all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
+            if self.use_full_dataset:
+                file_paths = all_files
+            else:
+                file_paths = filter_base_domain_files(all_files)
 
         self.grid_size = grid_size
         self.temporal_samples = temporal_samples
@@ -110,7 +120,8 @@ class PairedPECTDataset(Dataset):
         # independent; order is preserved by mapping back onto file_paths, so
         # the resulting dataset is bit-identical to sequential loading)
         self.scans_by_specimen: Dict[str, List[Dict]] = {}
-        print(f"\n[Loading & Standardizing {len(file_paths)} Training C-scans into RAM...]")
+        ds_mode = "Full Cross-Condition Dataset (all 81 scans)" if self.use_full_dataset else "Base Domain"
+        print(f"\n[Loading & Standardizing {len(file_paths)} {ds_mode} C-scans into RAM...]")
 
         # Pre-build the canonical transformer in the main thread (lazy global)
         get_canonical_transformer()

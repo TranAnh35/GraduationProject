@@ -34,7 +34,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size per training step")
     parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions K per macro-cycle (K sub-epochs = 100%% full universe pass)")
-    parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100%% all 72,900 pixels per scan)")
+    parser.add_argument("--use_full_dataset", type=lambda v: v.lower() == "true", default=False, help="Use full 81 TDMS dataset across all conditions for pretraining (default: False)")
+    parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100%% all 72,900 pixels per scan, 4 = stride 4 subsampling)")
     parser.add_argument("--star_radii", type=int, nargs=3, default=[1, 3, 7], help="Concentric star ring radii in px (default 1 3 7; e.g. 2 4 7 for harder masking)")
     parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (default None: 100%% exhaustive dataset traversal)")
     parser.add_argument("--lr", type=float, default=4e-4, help="Peak learning rate for Cosine schedule")
@@ -145,6 +146,7 @@ def main():
         early_stopping_min_delta=args.early_stopping_min_delta,
         best_reff_floor_ratio=args.best_reff_floor_ratio,
         eval_val_every=args.eval_val_every,
+        use_full_dataset=args.use_full_dataset,
         batch_size=args.batch_size,
         grid_stride=args.grid_stride,
         star_radii=tuple(args.star_radii),
@@ -269,9 +271,11 @@ def main():
     logger.info(f"Loaded {len(val_scans)} Validation Reference Scans for Real-time Downstream Telemetry.")
 
     # Build Paired Dataset across all directed pairs
-    logger.info(f"Loading Base Domain Dataset (Exhaustive grid stride: {config.grid_stride}, K={config.num_partitions} partitions)...")
+    dataset_type_str = "Full 81-File Cross-Condition Dataset" if getattr(config, "use_full_dataset", False) else "Base Domain Dataset"
+    logger.info(f"Loading {dataset_type_str} (Grid stride: {config.grid_stride}, K={config.num_partitions} partitions)...")
     dataset = PairedPECTDataset(
         data_dir=config.data_dir,
+        use_full_dataset=getattr(config, "use_full_dataset", False),
         grid_stride=config.grid_stride,
         samples_per_epoch=config.samples_per_epoch,
         num_partitions=config.num_partitions,

@@ -131,11 +131,12 @@ class CrossConditionConfig:
     var_gamma: float = 1.0
 
     # Training parameters
+    use_full_dataset: bool = False  # If True, pretrains on all 81 files across all conditions; if False, base domain (16 files)
     batch_size: int = 256
     num_partitions: int = 10    # K partitions per macro-cycle (K sub-epochs = 100% full universe pass)
     # samples_per_epoch: if None, computed automatically from total_exhaustive_samples // num_partitions
     samples_per_epoch: Optional[int] = None
-    grid_stride: int = 1        # 1 = all 72,900 pixels per C-scan; 2 = stride 2 subsample (18,225 px)
+    grid_stride: int = 1        # 1 = all 72,900 pixels per C-scan; 4 = subsampled 4,624 px (half of r3)
     epochs: int = 100
     warmup_epochs: int = 10     # Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)
     early_stopping_patience: int = 15  # Early stopping patience in epochs post-warmup (0 to disable)
