@@ -26,7 +26,8 @@ from src.PECT_JEPA.cross_condition.evaluation.raw_signal_features import (
 )
 from src.PECT_JEPA.cross_condition.evaluation.cscan_extractor import CScanFeatureExtractor
 from src.PECT_JEPA.cross_condition.evaluation.visualizations import AsyncPlotSaver, Figure
-from unittest.mock import MagicMock
+from src.PECT_JEPA.cross_condition.evaluate import _iter_with_prefetch
+from unittest.mock import MagicMock, patch
 
 
 class TestNewEvaluationMetrics(unittest.TestCase):
@@ -177,6 +178,25 @@ class TestNewEvaluationMetrics(unittest.TestCase):
 
         self.assertEqual(n1, 270 * 270)
         self.assertIs(b1, b2)  # Identical cached object reference
+
+    def test_iter_with_prefetch_contract(self):
+        """Verify _iter_with_prefetch yields exactly (file_path, cscan) 2-tuple."""
+        mock_cscan = np.zeros((10, 10, 128), dtype=np.float32)
+        with patch("src.PECT_JEPA.cross_condition.evaluate.load_canonical_cscan_from_tdms", return_value=mock_cscan):
+            test_files = ["scan_a.tdms", "scan_b.tdms", "scan_c.tdms"]
+            # 1. Prefetch enabled
+            unpacked_prefetch = []
+            for fp, cscan in _iter_with_prefetch(test_files, use_prefetch=True, max_workers=2, lookahead=2):
+                unpacked_prefetch.append((fp, cscan.shape))
+            self.assertEqual(len(unpacked_prefetch), 3)
+            self.assertEqual(unpacked_prefetch[0], ("scan_a.tdms", (10, 10, 128)))
+
+            # 2. Sequential fallback (use_prefetch=False)
+            unpacked_seq = []
+            for fp, cscan in _iter_with_prefetch(test_files, use_prefetch=False):
+                unpacked_seq.append((fp, cscan.shape))
+            self.assertEqual(len(unpacked_seq), 3)
+            self.assertEqual(unpacked_seq[0], ("scan_a.tdms", (10, 10, 128)))
 
 
 if __name__ == "__main__":

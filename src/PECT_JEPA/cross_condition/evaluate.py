@@ -246,22 +246,15 @@ def regime_flag(energy: float, ref_median: float, band: float = 2.0) -> int:
     return int(energy < ref_median / band or energy > ref_median * band)
 
 
-def _load_file_item(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    cscan = load_canonical_cscan_from_tdms(file_path=file_path)
-    raw_ptp = extract_cscan_raw_features(cscan, method="filtered_ptp")
-    return cscan, raw_ptp
-
-
 def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int = 4, lookahead: int = 4):
-    """Yields (file_path, canonical_cscan, raw_ptp) in order, decoding up to `lookahead`
-    TDMS files and filtering raw heatmaps concurrently on background threads while the caller processes
+    """Yields (file_path, canonical_cscan) in order, decoding up to `lookahead`
+    TDMS files concurrently on background threads while the caller processes
     the current file. Processing order, RNG consumption, and results are identical to the sequential loop;
     use_prefetch=False reproduces the sequential loop exactly.
     """
     if not use_prefetch or len(files) <= 1:
         for fp in files:
-            cscan, raw_ptp = _load_file_item(fp)
-            yield fp, cscan, raw_ptp
+            yield fp, load_canonical_cscan_from_tdms(file_path=fp)
         return
     from collections import deque
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -271,16 +264,16 @@ def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int =
         def _pump():
             nonlocal nxt
             while nxt < len(files) and len(pending) < lookahead:
-                pending.append((files[nxt], pool.submit(_load_file_item, files[nxt])))
+                pending.append((files[nxt], pool.submit(load_canonical_cscan_from_tdms, files[nxt])))
                 nxt += 1
 
         _pump()
         for fp in files:
             wfp, fut = pending.popleft()
             assert wfp == fp, "Prefetch stream out of order"
-            cscan, raw_ptp = fut.result()
+            cscan = fut.result()
             _pump()
-            yield fp, cscan, raw_ptp
+            yield fp, cscan
 
 
 def evaluate_canonical_test_time_adaptation(
@@ -696,14 +689,14 @@ def main():
                           desc="Fitting Readouts on Train Pool", file=sys.stdout, dynamic_ncols=True)
         rng = np.random.RandomState(42)
 
-        for fp, cscan, raw_ptp in pbar_train:
+        for fp, cscan in pbar_train:
             meta = extract_file_metadata(fp)
             sp = meta["specimen"]
 
             gt_mask = gt_masks[sp]["mask"]
             latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
             cached_all_latents[fp] = latents
-            cached_raw_heatmaps[fp] = raw_ptp
+            cached_raw_heatmaps[fp] = extract_cscan_raw_features(cscan, method="filtered_ptp")
             train_energies.append(scan_feature_energy(latents))
 
             flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
@@ -827,8 +820,8 @@ def main():
                 assert next_loaded is not None and next_loaded[0] == fp, \
                     "Prefetch stream out of order"
                 cscan_cur = next_loaded[1]
-                raw_ptp = next_loaded[2]
                 latents = extractor.extract_full_cscan(cscan_cur, self_calibrate=args.self_calibration)
+                raw_ptp = extract_cscan_raw_features(cscan_cur, method="filtered_ptp")
                 cached_raw_heatmaps[fp] = raw_ptp
                 next_loaded = next(load_stream, None)
                 cached_all_latents[fp] = latents
