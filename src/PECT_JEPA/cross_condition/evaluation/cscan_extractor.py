@@ -33,6 +33,32 @@ class CScanFeatureExtractor:
         _star_radii = tuple(getattr(model.config, "star_radii", (1, 3, 7)))
         self.topology = ConcentricStarTopology(star_radii=_star_radii)
         self.offsets = self.topology.offsets  # [25, 2] in grid units
+        self._cached_coord_batches = {}
+
+    def _get_coord_batches(self, H: int, W: int, pad: int):
+        key = (H, W, pad, self.batch_size)
+        if key in self._cached_coord_batches:
+            return self._cached_coord_batches[key]
+
+        rr, cc = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+        rr_flat = rr.flatten() + pad
+        cc_flat = cc.flatten() + pad
+        N_pts = len(rr_flat)
+
+        offsets_r = self.offsets[:, 0]
+        offsets_c = self.offsets[:, 1]
+
+        batches = []
+        for start_idx in range(0, N_pts, self.batch_size):
+            end_idx = min(start_idx + self.batch_size, N_pts)
+            b_r = rr_flat[start_idx:end_idx]
+            b_c = cc_flat[start_idx:end_idx]
+            r_coords = b_r[:, None] + offsets_r[None, :]
+            c_coords = b_c[:, None] + offsets_c[None, :]
+            batches.append((start_idx, end_idx, r_coords, c_coords))
+
+        self._cached_coord_batches[key] = (N_pts, batches)
+        return N_pts, batches
 
     @torch.inference_mode()
     def extract_full_cscan(self, cscan: np.ndarray, self_calibrate: bool = False) -> np.ndarray:
@@ -49,11 +75,7 @@ class CScanFeatureExtractor:
         pad = int(max(1, np.max(np.abs(self.offsets))))
         padded = np.pad(cscan, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
 
-        # Meshgrid of all pixel centers
-        rr, cc = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-        rr_flat = rr.flatten() + pad
-        cc_flat = cc.flatten() + pad
-        N_pts = len(rr_flat)
+        N_pts, batches = self._get_coord_batches(H, W, pad)
 
         if getattr(self.model.config, "latent_disentanglement", False):
             latent_type = getattr(self.model.config, "downstream_latent_type", "scattering")
@@ -68,19 +90,8 @@ class CScanFeatureExtractor:
 
         out_features = np.zeros((N_pts, embed_dim), dtype=np.float32)
 
-        offsets_r = self.offsets[:, 0]  # [25]
-        offsets_c = self.offsets[:, 1]  # [25]
-
         # Process in batches
-        for start_idx in range(0, N_pts, self.batch_size):
-            end_idx = min(start_idx + self.batch_size, N_pts)
-            b_r = rr_flat[start_idx:end_idx]
-            b_c = cc_flat[start_idx:end_idx]
-
-            # Vectorized coordinate broadcasting: [B, 25]
-            r_coords = b_r[:, None] + offsets_r[None, :]
-            c_coords = b_c[:, None] + offsets_c[None, :]
-
+        for start_idx, end_idx, r_coords, c_coords in batches:
             # Fetch patches: [B, 25, C] -> reshape to 5x5 concentric grid.
             # grid_indices is the identity arange(25).reshape(5, 5), so a plain
             # reshape view yields the identical layout with zero extra copy

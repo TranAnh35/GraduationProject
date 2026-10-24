@@ -67,9 +67,15 @@ from src.PECT_JEPA.cross_condition.downstream.test_time_adaptation import (
 )
 from src.PECT_JEPA.cross_condition.evaluation.cscan_extractor import CScanFeatureExtractor
 from src.PECT_JEPA.cross_condition.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
+from src.PECT_JEPA.cross_condition.evaluation.raw_signal_features import (
+    extract_cscan_raw_features,
+    extract_all_raw_heatmaps,
+)
 from src.PECT_JEPA.cross_condition.evaluation.visualizations import (
+    AsyncPlotSaver,
     plot_probability_heatmap,
     plot_detection_summary_map,
+    plot_raw_multi_method_heatmaps,
     plot_cscan_anomaly_map,
     plot_sizing_calibration,
     plot_defect_contours_and_iou,
@@ -240,17 +246,22 @@ def regime_flag(energy: float, ref_median: float, band: float = 2.0) -> int:
     return int(energy < ref_median / band or energy > ref_median * band)
 
 
-def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int = 2, lookahead: int = 2):
-    """Yields (file_path, canonical_cscan) in order, decoding up to `lookahead`
-    TDMS files concurrently on background threads while the caller processes
-    the current file (TDMS decode + filtering ~3 s hidden behind GPU
-    extraction + sklearn + plots). Processing order, RNG consumption, and
-    results are identical to the sequential loop; use_prefetch=False
-    reproduces the old loop exactly.
+def _load_file_item(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    cscan = load_canonical_cscan_from_tdms(file_path=file_path)
+    raw_ptp = extract_cscan_raw_features(cscan, method="filtered_ptp")
+    return cscan, raw_ptp
+
+
+def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int = 4, lookahead: int = 4):
+    """Yields (file_path, canonical_cscan, raw_ptp) in order, decoding up to `lookahead`
+    TDMS files and filtering raw heatmaps concurrently on background threads while the caller processes
+    the current file. Processing order, RNG consumption, and results are identical to the sequential loop;
+    use_prefetch=False reproduces the sequential loop exactly.
     """
     if not use_prefetch or len(files) <= 1:
         for fp in files:
-            yield fp, load_canonical_cscan_from_tdms(file_path=fp)
+            cscan, raw_ptp = _load_file_item(fp)
+            yield fp, cscan, raw_ptp
         return
     from collections import deque
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -260,16 +271,16 @@ def _iter_with_prefetch(files: List[str], use_prefetch: bool, max_workers: int =
         def _pump():
             nonlocal nxt
             while nxt < len(files) and len(pending) < lookahead:
-                pending.append((files[nxt], pool.submit(load_canonical_cscan_from_tdms, files[nxt])))
+                pending.append((files[nxt], pool.submit(_load_file_item, files[nxt])))
                 nxt += 1
 
         _pump()
         for fp in files:
             wfp, fut = pending.popleft()
             assert wfp == fp, "Prefetch stream out of order"
-            cscan = fut.result()
+            cscan, raw_ptp = fut.result()
             _pump()
-            yield fp, cscan
+            yield fp, cscan, raw_ptp
 
 
 def evaluate_canonical_test_time_adaptation(
@@ -285,6 +296,7 @@ def evaluate_canonical_test_time_adaptation(
     tta_trim_ratio: float = 0.75,
     tta_shrinkage: float = 1e-2,
     cached_raw_heatmaps: Optional[Dict[str, np.ndarray]] = None,
+    async_saver: Optional[AsyncPlotSaver] = None,
 ) -> Dict[str, Any]:
     """
     Evaluates Test-Time Adaptation (TTA) Suite across the 4 canonical single-variable domain shifts:
@@ -408,7 +420,7 @@ def evaluate_canonical_test_time_adaptation(
                     raw_ptp = cached_raw_heatmaps.get(fp) if cached_raw_heatmaps is not None else None
                     if raw_ptp is None:
                         cscan_tmp = load_canonical_cscan_from_tdms(fp)
-                        raw_ptp = np.ptp(cscan_tmp, axis=-1).astype(np.float32)
+                        raw_ptp = extract_cscan_raw_features(cscan_tmp, method="filtered_ptp")
                         if cached_raw_heatmaps is not None:
                             cached_raw_heatmaps[fp] = raw_ptp
 
@@ -419,18 +431,33 @@ def evaluate_canonical_test_time_adaptation(
                         if len(s_idx) > 0 and len(d_idx) > 0:
                             target_cnr = float((np.mean(flat_maha[d_idx]) - np.mean(flat_maha[s_idx])) / (np.std(flat_maha[s_idx]) + 1e-6))
 
-                    plot_tta_summary_map(
-                        ground_truth_mask=gt_mask,
-                        lp_raw_prob_map=lp_raw_map,
-                        lp_tta_prob_map=lp_tta_map,
-                        file_title=f"[{shift.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
-                        save_path=comp_path,
-                        raw_heatmap=raw_ptp,
-                        maha_map=maha_scores,
-                        lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
-                        lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
-                        maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
-                    )
+                    if async_saver is not None:
+                        async_saver.submit(
+                            plot_tta_summary_map,
+                            ground_truth_mask=gt_mask,
+                            lp_raw_prob_map=lp_raw_map,
+                            lp_tta_prob_map=lp_tta_map,
+                            file_title=f"[{shift.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
+                            save_path=comp_path,
+                            raw_heatmap=raw_ptp,
+                            maha_map=maha_scores,
+                            lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
+                            lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
+                            maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
+                        )
+                    else:
+                        plot_tta_summary_map(
+                            ground_truth_mask=gt_mask,
+                            lp_raw_prob_map=lp_raw_map,
+                            lp_tta_prob_map=lp_tta_map,
+                            file_title=f"[{shift.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
+                            save_path=comp_path,
+                            raw_heatmap=raw_ptp,
+                            maha_map=maha_scores,
+                            lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
+                            lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
+                            maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
+                        )
 
                 if not has_both:
                     print(f"    [skip] {set_name} {fname}: GT mask has a single class")
@@ -536,6 +563,7 @@ def main():
     # Resolve paths to unify checkpoints and evaluations in the same folder
     ckpt_path, out_dir = resolve_paths(args)
     os.makedirs(out_dir, exist_ok=True)
+    async_saver = AsyncPlotSaver(max_workers=4)
 
     task_dirs = {
         "anomaly": os.path.join(out_dir, "1_Anomaly_Detection"),
@@ -663,19 +691,19 @@ def main():
 
         train_eval_files = [fp for fp in splits["train"]
                             if extract_file_metadata(fp)["specimen"] in gt_masks]
-        pbar_train = tqdm(_iter_with_prefetch(train_eval_files, args.prefetch),
+        pbar_train = tqdm(_iter_with_prefetch(train_eval_files, args.prefetch, max_workers=4, lookahead=4),
                           total=len(train_eval_files),
                           desc="Fitting Readouts on Train Pool", file=sys.stdout, dynamic_ncols=True)
         rng = np.random.RandomState(42)
 
-        for fp, cscan in pbar_train:
+        for fp, cscan, raw_ptp in pbar_train:
             meta = extract_file_metadata(fp)
             sp = meta["specimen"]
 
             gt_mask = gt_masks[sp]["mask"]
             latents = extractor.extract_full_cscan(cscan, self_calibrate=args.self_calibration)
             cached_all_latents[fp] = latents
-            cached_raw_heatmaps[fp] = np.ptp(cscan, axis=-1).astype(np.float32)
+            cached_raw_heatmaps[fp] = raw_ptp
             train_energies.append(scan_feature_energy(latents))
 
             flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
@@ -772,7 +800,7 @@ def main():
         eval_files = [fp for fp in split_files
                       if extract_file_metadata(fp)["specimen"] in gt_masks]
         uncached = [fp for fp in eval_files if fp not in cached_all_latents]
-        load_stream = iter(_iter_with_prefetch(uncached, args.prefetch))
+        load_stream = iter(_iter_with_prefetch(uncached, args.prefetch, max_workers=4, lookahead=4))
         next_loaded = next(load_stream, None)
 
         pbar = tqdm(eval_files, desc=f"Evaluating [{split_name.upper()}]", file=sys.stdout, dynamic_ncols=True)
@@ -790,12 +818,18 @@ def main():
             # Load or retrieve cached latents (prefetched in order)
             if fp in cached_all_latents:
                 latents = cached_all_latents[fp]
+                raw_ptp = cached_raw_heatmaps.get(fp)
+                if raw_ptp is None:
+                    cscan_temp = load_canonical_cscan_from_tdms(fp)
+                    raw_ptp = extract_cscan_raw_features(cscan_temp, method="filtered_ptp")
+                    cached_raw_heatmaps[fp] = raw_ptp
             else:
                 assert next_loaded is not None and next_loaded[0] == fp, \
                     "Prefetch stream out of order"
                 cscan_cur = next_loaded[1]
+                raw_ptp = next_loaded[2]
                 latents = extractor.extract_full_cscan(cscan_cur, self_calibrate=args.self_calibration)
-                cached_raw_heatmaps[fp] = np.ptp(cscan_cur, axis=-1).astype(np.float32)
+                cached_raw_heatmaps[fp] = raw_ptp
                 next_loaded = next(load_stream, None)
                 cached_all_latents[fp] = latents
 
@@ -893,16 +927,18 @@ def main():
             raw_ptp = cached_raw_heatmaps.get(fp)
             if raw_ptp is None:
                 cscan_temp = load_canonical_cscan_from_tdms(fp)
-                raw_ptp = np.ptp(cscan_temp, axis=-1).astype(np.float32)
+                raw_ptp = extract_cscan_raw_features(cscan_temp, method="filtered_ptp")
                 cached_raw_heatmaps[fp] = raw_ptp
 
-            plot_detection_summary_map(
+            async_saver.submit(
+                plot_detection_summary_map,
                 prob_map=prob_map,
                 anomaly_map=anom_res["anomaly_scores"],
                 ground_truth_mask=gt_mask,
                 file_title=f"[{split_name.upper()}] {specimen} | {sensor} | {waveform} | {liftoff}",
                 save_path=summary_plot_path,
                 raw_heatmap=raw_ptp,
+                raw_method_name="Filtered PECT (V_pp)",
                 metrics={"linear_probe_auc": det_res["auc_roc"], "linear_probe_ap": det_res["average_precision"], "mahalanobis_auc": anom_res["auc_roc"], "cnr": anom_res["cnr"]},
             )
 
@@ -926,7 +962,8 @@ def main():
             # 2. Sizing Scatter Plot (if applicable)
             if specimen == "Corrosion" and len(sizing_res["y_true"]) > 0:
                 sizing_plot_path = os.path.join(task_dirs["sizing"], f"{bname}_sizing.png")
-                plot_sizing_calibration(
+                async_saver.submit(
+                    plot_sizing_calibration,
                     true_size=sizing_res["y_true"],
                     pred_size=sizing_res["y_pred"],
                     save_path=sizing_plot_path,
@@ -969,6 +1006,9 @@ def main():
                 "CNR": f"{anom_res['cnr']:.2f}",
                 "IoU": f"{iou_res['iou']:.4f}",
             })
+
+    # Wait for split evaluation plots to finish saving
+    async_saver.wait_all()
 
     # 6. STEP 3: Save Split-Specific Metrics & Task CSVs
     print("\n" + "=" * 75)
@@ -1013,7 +1053,9 @@ def main():
             tta_trim_ratio=args.tta_trim_ratio,
             tta_shrinkage=args.tta_shrinkage,
             cached_raw_heatmaps=cached_raw_heatmaps,
+            async_saver=async_saver,
         )
+        async_saver.wait_all()
     else:
         print("\n" + "=" * 75)
         print("STEP 4: Canonical Test-Time Adaptation (TTA) Benchmark [SKIPPED by user configuration]")
@@ -1247,6 +1289,7 @@ def main():
         n_flag = sum(1 for r in master_results if r["split"] == sp and r.get("regime_ood", 0) == 1)
         n_sp = sum(1 for r in master_results if r["split"] == sp)
         print(f"[REGIME] {sp.upper():5s}: {n_flag}/{n_sp} files flagged OOD-regime (E||z||^2 outside 2x train median {ref_energy:.1f})")
+    async_saver.shutdown()
     print(f"\nAll results saved to: {out_dir}")
     print("=" * 80 + "\n", flush=True)
 

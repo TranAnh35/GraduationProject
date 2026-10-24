@@ -14,14 +14,40 @@ Provides publication-quality plots:
 import os
 import time
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
+from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.patches import Patch
 import scipy.ndimage as ndi
+
+
+class AsyncPlotSaver:
+    """
+    Non-blocking thread pool for asynchronous figure rendering and disk saving.
+    Prevents matplotlib I/O from stalling the evaluation loop.
+    """
+    def __init__(self, max_workers: int = 4):
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="AsyncPlotSaver")
+        self.futures = []
+
+    def submit(self, fn, *args, **kwargs):
+        fut = self.executor.submit(fn, *args, **kwargs)
+        self.futures.append(fut)
+        return fut
+
+    def wait_all(self):
+        for fut in self.futures:
+            fut.result()
+        self.futures.clear()
+
+    def shutdown(self):
+        self.wait_all()
+        self.executor.shutdown(wait=True)
 
 
 def to_safe_path(path: str) -> str:
@@ -153,41 +179,43 @@ def plot_detection_summary_map(
     file_title: str,
     save_path: str,
     raw_heatmap: Optional[np.ndarray] = None,
+    raw_method_name: str = "Filtered PECT (V_pp)",
     metrics: Optional[Dict[str, Any]] = None,
     dpi: int = 150,
 ) -> None:
     """
     Side-by-side 4-panel figure for Anomaly Detection:
     - Panel 1: 1) CAD Ground Truth Mask (cmap='Blues')
-    - Panel 2: 2) Raw Heatmap (Peak-to-Peak V_pp) (cmap='viridis')
-    - Panel 3: 3) Unsupervised Mahalanobis Anomaly Distance Map (cmap='jet')
-    - Panel 4: 4) Trained Linear Probe Probability Map (cmap='jet')
+    - Panel 2: 2) Raw Heatmap (Filtered PECT V_pp) (cmap='jet', interpolation='bilinear')
+    - Panel 3: 3) Unsupervised Mahalanobis Anomaly Distance Map (cmap='jet', interpolation='bilinear')
+    - Panel 4: 4) Trained Linear Probe Probability Map (cmap='jet', interpolation='bilinear')
     """
     save_path = to_safe_path(save_path)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig, axes = plt.subplots(1, 4, figsize=(22, 5), dpi=dpi)
+    fig = Figure(figsize=(22, 5), dpi=dpi)
+    axes = fig.subplots(1, 4)
 
     # 1. Ground Truth CAD Mask
     im0 = axes[0].imshow(ground_truth_mask, cmap="Blues", origin="lower", vmin=0, vmax=1)
     axes[0].set_title(f"1) Ground Truth CAD Mask\n{file_title}", fontsize=10, fontweight="bold")
     axes[0].set_xlabel("X (pixels)", fontsize=9)
     axes[0].set_ylabel("Y (pixels)", fontsize=9)
-    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
-    # 2. Raw Heatmap (Peak-to-Peak V_pp)
+    # 2. Raw Heatmap (Authoritative NDT Bilinear Jet Rendering)
     if raw_heatmap is not None:
-        im1 = axes[1].imshow(raw_heatmap, cmap="jet", origin="lower")
-        t1 = f"2) Raw PECT Signal (Peak-to-Peak)\nV_pp range: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
+        im1 = axes[1].imshow(raw_heatmap, cmap="jet", origin="lower", interpolation="bilinear")
+        t1 = f"2) Raw PECT Signal ({raw_method_name})\nRange: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
     else:
-        im1 = axes[1].imshow(np.zeros_like(ground_truth_mask), cmap="jet", origin="lower")
+        im1 = axes[1].imshow(np.zeros_like(ground_truth_mask), cmap="jet", origin="lower", interpolation="bilinear")
         t1 = "2) Raw PECT Signal (Not Provided)"
     axes[1].set_title(t1, fontsize=10, fontweight="bold")
     axes[1].set_xlabel("X (pixels)", fontsize=9)
     axes[1].set_ylabel("Y (pixels)", fontsize=9)
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
     # 3. Unsupervised Mahalanobis Distance Map
-    im2 = axes[2].imshow(anomaly_map, cmap="jet", origin="lower")
+    im2 = axes[2].imshow(anomaly_map, cmap="jet", origin="lower", interpolation="bilinear")
     t2 = "3) Unsupervised Mahalanobis Distance"
     if metrics:
         m_auc = metrics.get("mahalanobis_auc", 0.0)
@@ -196,11 +224,11 @@ def plot_detection_summary_map(
     axes[2].set_title(t2, fontsize=10, fontweight="bold")
     axes[2].set_xlabel("X (pixels)", fontsize=9)
     axes[2].set_ylabel("Y (pixels)", fontsize=9)
-    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+    fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
 
     # 4. Trained Linear Probe Probability
     p_disp = np.clip(prob_map, 0.0, 1.0)
-    im3 = axes[3].imshow(p_disp, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    im3 = axes[3].imshow(p_disp, cmap="jet", origin="lower", vmin=0.0, vmax=1.0, interpolation="bilinear")
     t3 = "4) Trained Linear Probe P(Defect | z)"
     if metrics:
         lp_auc = metrics.get("linear_probe_auc", 0.0)
@@ -209,11 +237,55 @@ def plot_detection_summary_map(
     axes[3].set_title(t3, fontsize=10, fontweight="bold")
     axes[3].set_xlabel("X (pixels)", fontsize=9)
     axes[3].set_ylabel("Y (pixels)", fontsize=9)
-    plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
+    fig.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
 
-    plt.tight_layout()
+    fig.tight_layout()
     _safe_savefig(fig, save_path, bbox_inches="tight")
-    plt.close(fig)
+
+
+def plot_raw_multi_method_heatmaps(
+    cscan: np.ndarray,
+    save_path: str,
+    file_title: str = "",
+    lpf_cutoff: float = 0.15,
+    lpf_order: int = 2,
+    dpi: int = 150,
+) -> None:
+    """
+    4-Panel Raw TDMS feature extraction comparison matching references/plot_all_1Hall_heatmaps:
+    1. Slice: Mean absolute transient amplitude within active window
+    2. LOI: Peak absolute temporal gradient / derivative
+    3. PTP: Standard Peak-to-Peak (max - min)
+    4. Filtered PTP: Zero-phase LPF + baseline subtraction + PTP
+    All subplots use cmap='jet' and interpolation='bilinear'.
+    """
+    from .raw_signal_features import extract_all_raw_heatmaps
+
+    save_path = to_safe_path(save_path)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    feats = extract_all_raw_heatmaps(cscan, lpf_cutoff=lpf_cutoff, lpf_order=lpf_order)
+
+    fig = Figure(figsize=(22, 5), dpi=dpi)
+    axes = fig.subplots(1, 4)
+
+    panels = [
+        ("1) Slice (Transient Window)", feats["slice"], f"[{np.min(feats['slice']):.3f}, {np.max(feats['slice']):.3f}]"),
+        ("2) LOI (Gradient / Derivative)", feats["loi"], f"[{np.min(feats['loi']):.3f}, {np.max(feats['loi']):.3f}]"),
+        ("3) Peak-to-Peak (Raw V_pp)", feats["ptp"], f"[{np.min(feats['ptp']):.2f}, {np.max(feats['ptp']):.2f}]"),
+        ("4) Filtered PTP (LPF Baseline-Corrected)", feats["filtered_ptp"], f"[{np.min(feats['filtered_ptp']):.2f}, {np.max(feats['filtered_ptp']):.2f}]"),
+    ]
+
+    for idx, (title, img_data, range_str) in enumerate(panels):
+        ax = axes[idx]
+        im = ax.imshow(img_data, cmap="jet", origin="lower", interpolation="bilinear")
+        ax.set_title(f"{title}\n{file_title}\nRange: {range_str}", fontsize=9.5, fontweight="bold")
+        ax.set_xlabel("X (pixels)", fontsize=8.5)
+        ax.set_ylabel("Y (pixels)", fontsize=8.5)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    _safe_savefig(fig, save_path, bbox_inches="tight")
 
 
 def plot_tta_summary_map(
@@ -245,7 +317,8 @@ def plot_tta_summary_map(
 
     num_panels = 3 + (1 if has_raw else 0) + (1 if has_maha else 0)
     fig_w = 5.5 * num_panels
-    fig, axes = plt.subplots(1, num_panels, figsize=(fig_w, 5), dpi=dpi)
+    fig = Figure(figsize=(fig_w, 5), dpi=dpi)
+    axes = fig.subplots(1, num_panels)
 
     ax_idx = 0
 
@@ -254,22 +327,22 @@ def plot_tta_summary_map(
     axes[ax_idx].set_title(f"1) Ground Truth CAD Mask\n{file_title}", fontsize=10, fontweight="bold")
     axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
     axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
-    plt.colorbar(im_gt, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+    fig.colorbar(im_gt, ax=axes[ax_idx], fraction=0.046, pad=0.04)
     ax_idx += 1
 
     # 2. Raw PECT Peak-to-Peak (if present)
     if has_raw:
-        im_raw = axes[ax_idx].imshow(raw_heatmap, cmap="jet", origin="lower")
-        t_raw = f"2) Raw PECT Signal (Peak-to-Peak)\nV_pp range: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
+        im_raw = axes[ax_idx].imshow(raw_heatmap, cmap="jet", origin="lower", interpolation="bilinear")
+        t_raw = f"2) Raw PECT Signal (Filtered V_pp)\nRange: [{np.min(raw_heatmap):.2f}, {np.max(raw_heatmap):.2f}]"
         axes[ax_idx].set_title(t_raw, fontsize=10, fontweight="bold")
         axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
         axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
-        plt.colorbar(im_raw, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+        fig.colorbar(im_raw, ax=axes[ax_idx], fraction=0.046, pad=0.04)
         ax_idx += 1
 
     # 3. Baseline Zero-Shot Linear Probe (Before TTA)
     p0 = np.clip(lp_raw_prob_map, 0.0, 1.0)
-    im0 = axes[ax_idx].imshow(p0, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    im0 = axes[ax_idx].imshow(p0, cmap="jet", origin="lower", vmin=0.0, vmax=1.0, interpolation="bilinear")
     t0 = "3) Zero-Shot Linear Probe (Before TTA)"
     raw_auc = 0.0
     if lp_raw_metrics:
@@ -279,12 +352,12 @@ def plot_tta_summary_map(
     axes[ax_idx].set_title(t0, fontsize=10, fontweight="bold")
     axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
     axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
-    plt.colorbar(im0, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+    fig.colorbar(im0, ax=axes[ax_idx], fraction=0.046, pad=0.04)
     ax_idx += 1
 
     # 4. TTA Calibrated Linear Probe (After TTA)
     p1 = np.clip(lp_tta_prob_map, 0.0, 1.0)
-    im1 = axes[ax_idx].imshow(p1, cmap="jet", origin="lower", vmin=0.0, vmax=1.0)
+    im1 = axes[ax_idx].imshow(p1, cmap="jet", origin="lower", vmin=0.0, vmax=1.0, interpolation="bilinear")
     t1 = "4) TTA Calibrated Linear Probe (After TTA)"
     if lp_tta_metrics:
         tta_auc = lp_tta_metrics.get("auc", 0.0)
@@ -295,12 +368,12 @@ def plot_tta_summary_map(
     axes[ax_idx].set_title(t1, fontsize=10, fontweight="bold")
     axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
     axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
-    plt.colorbar(im1, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+    fig.colorbar(im1, ax=axes[ax_idx], fraction=0.046, pad=0.04)
     ax_idx += 1
 
     # 5. TTA Mahalanobis Energy Map (Unsupervised) [if present]
     if has_maha:
-        im_m = axes[ax_idx].imshow(maha_map, cmap="jet", origin="lower")
+        im_m = axes[ax_idx].imshow(maha_map, cmap="jet", origin="lower", interpolation="bilinear")
         t_m = "5) TTA Mahalanobis (Unsupervised Energy)"
         if maha_metrics:
             m_auc = maha_metrics.get("auc", 0.0)
@@ -310,11 +383,10 @@ def plot_tta_summary_map(
         axes[ax_idx].set_title(t_m, fontsize=10, fontweight="bold")
         axes[ax_idx].set_xlabel("X (pixels)", fontsize=9)
         axes[ax_idx].set_ylabel("Y (pixels)", fontsize=9)
-        plt.colorbar(im_m, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+        fig.colorbar(im_m, ax=axes[ax_idx], fraction=0.046, pad=0.04)
 
-    plt.tight_layout()
+    fig.tight_layout()
     _safe_savefig(fig, save_path, bbox_inches="tight")
-    plt.close(fig)
 
 
 def plot_uda_summary_map(
@@ -419,13 +491,18 @@ def plot_defect_contours_and_iou(
         if threshold is not None:
             best_tau = float(threshold)
         else:
-            best_dice = -1.0
-            best_tau = 0.5
-            for tau in np.linspace(0.2, 0.95, 31):
-                d = f1_score(y_true, (p_val >= tau).astype(int), zero_division=0)
-                if d > best_dice:
-                    best_dice = d
-                    best_tau = float(tau)
+            taus = np.linspace(0.2, 0.95, 31)
+            p_pos = p_val[y_true == 1]
+            p_neg = p_val[y_true == 0]
+            if len(p_pos) > 0 and len(p_neg) > 0:
+                tp = np.sum(p_pos[:, None] >= taus[None, :], axis=0).astype(np.float64)
+                fp = np.sum(p_neg[:, None] >= taus[None, :], axis=0).astype(np.float64)
+                fn = len(p_pos) - tp
+                dices = np.divide(2.0 * tp, 2.0 * tp + fp + fn, out=np.zeros_like(tp), where=(2.0 * tp + fp + fn > 0))
+                best_idx = int(np.argmax(dices))
+                best_tau = float(taus[best_idx])
+            else:
+                best_tau = 0.5
 
         y_pred_raw = (p_val >= best_tau).astype(int)
         raw_iou = float(jaccard_score(y_true, y_pred_raw, zero_division=0))
@@ -455,7 +532,8 @@ def plot_defect_contours_and_iou(
 
     gt_core_map = (gt_mask == 1).astype(int)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=dpi)
+    fig = Figure(figsize=(18, 6), dpi=dpi)
+    axes = fig.subplots(1, 3)
 
     # -------------------------------------------------------------
     # Panel 1: Ground Truth CAD Flaws & BBoxes (Clean Canvas)
@@ -545,7 +623,6 @@ def plot_defect_contours_and_iou(
     fig.suptitle(f"{title}\nIoU: {clean_iou*100:.1f}% | Precision: {clean_prec*100:.1f}% | Recall: {clean_rec*100:.1f}%, Sound Metal FPR: {sound_fpr_clean*100:.2f}%", fontsize=12, fontweight="bold", y=0.99)
     fig.tight_layout()
     _safe_savefig(fig, save_path, bbox_inches="tight")
-    plt.close(fig)
 
     return {
         "iou": clean_iou,
@@ -573,7 +650,8 @@ def plot_sizing_calibration(
     """
     save_path = to_safe_path(save_path)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6, 5.5), dpi=dpi)
+    fig = Figure(figsize=(6, 5.5), dpi=dpi)
+    ax = fig.subplots()
 
     y_t = true_size.flatten()
     y_p = pred_size.flatten()
@@ -607,7 +685,6 @@ def plot_sizing_calibration(
 
     fig.tight_layout()
     _safe_savefig(fig, save_path, bbox_inches="tight")
-    plt.close(fig)
 
 
 def plot_training_curves(

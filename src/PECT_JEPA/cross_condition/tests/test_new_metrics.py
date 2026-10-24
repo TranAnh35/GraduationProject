@@ -19,6 +19,14 @@ from src.PECT_JEPA.cross_condition.evaluation.downstream_benchmarks import (
     compute_instance_pod,
     DownstreamBenchmarkSuite,
 )
+from src.PECT_JEPA.cross_condition.evaluation.raw_signal_features import (
+    filter_cscan_waveforms,
+    extract_cscan_raw_features,
+    extract_all_raw_heatmaps,
+)
+from src.PECT_JEPA.cross_condition.evaluation.cscan_extractor import CScanFeatureExtractor
+from src.PECT_JEPA.cross_condition.evaluation.visualizations import AsyncPlotSaver, Figure
+from unittest.mock import MagicMock
 
 
 class TestNewEvaluationMetrics(unittest.TestCase):
@@ -99,6 +107,78 @@ class TestNewEvaluationMetrics(unittest.TestCase):
         self.assertGreater(res["iou_otsu"], 0.8)
         self.assertLess(res["sound_fpr_05"], 0.01)
         self.assertGreater(res["f1_max"], 0.9)
+
+    def test_filter_cscan_waveforms(self):
+        """Verify Butterworth LPF and DC baseline subtraction."""
+        rng = np.random.RandomState(42)
+        # Synthetic cscan [20, 20, 128] with DC offset 5.0 and high freq noise
+        t = np.linspace(0, 1, 128)
+        signal = np.sin(2 * np.pi * 3 * t)  # 3 Hz smooth signal
+        noise = 0.5 * rng.randn(20, 20, 128)
+        raw_cscan = 5.0 + signal[None, None, :] + noise
+
+        filtered = filter_cscan_waveforms(raw_cscan, cutoff=0.15, order=2, subtract_baseline=True)
+        self.assertEqual(filtered.shape, raw_cscan.shape)
+        # First sample after baseline subtraction should be near 0
+        self.assertTrue(np.allclose(filtered[:, :, 0], 0.0, atol=1e-5))
+        # High frequency noise variance should be substantially reduced
+        self.assertLess(float(np.var(np.diff(filtered, axis=-1))), float(np.var(np.diff(raw_cscan, axis=-1))))
+
+    def test_extract_cscan_raw_features_and_all_methods(self):
+        """Verify the 4 reference methods extract proper 2D heatmaps."""
+        t = np.linspace(0, 1, 128)
+        signal = np.sin(2 * np.pi * 3 * t)
+        mock_cscan = np.zeros((30, 30, 128), dtype=np.float32)
+        mock_cscan[:] = signal[None, None, :]
+        # Add peak in center
+        mock_cscan[10:20, 10:20, :] *= 2.0
+
+        for method in ["slice", "loi", "ptp", "filtered_ptp"]:
+            feat = extract_cscan_raw_features(mock_cscan, method=method)
+            self.assertEqual(feat.shape, (30, 30))
+            self.assertEqual(feat.dtype, np.float32)
+            self.assertFalse(np.isnan(feat).any())
+
+        all_feats = extract_all_raw_heatmaps(mock_cscan)
+        self.assertIn("slice", all_feats)
+        self.assertIn("loi", all_feats)
+        self.assertIn("ptp", all_feats)
+        self.assertIn("filtered_ptp", all_feats)
+        self.assertEqual(len(all_feats), 4)
+
+    def test_async_plot_saver(self):
+        """Verify AsyncPlotSaver non-blocking execution and wait_all."""
+        import tempfile
+        saver = AsyncPlotSaver(max_workers=2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "test_async.png")
+
+            def dummy_save(path):
+                fig = Figure(figsize=(4, 4))
+                ax = fig.subplots()
+                ax.plot([0, 1], [0, 1])
+                fig.savefig(path)
+
+            fut = saver.submit(dummy_save, out_path)
+            saver.wait_all()
+            saver.shutdown()
+            self.assertTrue(os.path.exists(out_path))
+            self.assertGreater(os.path.getsize(out_path), 0)
+
+    def test_cscan_feature_extractor_coord_caching(self):
+        """Verify CScanFeatureExtractor caches coordinate batches across calls."""
+        import torch
+        mock_model = MagicMock()
+        mock_model.config.star_radii = (1, 3, 7)
+        mock_model.config.latent_disentanglement = False
+        mock_model.config.embed_dim = 64
+
+        extractor = CScanFeatureExtractor(model=mock_model, device=torch.device("cpu"), batch_size=2048)
+        n1, b1 = extractor._get_coord_batches(270, 270, pad=7)
+        n2, b2 = extractor._get_coord_batches(270, 270, pad=7)
+
+        self.assertEqual(n1, 270 * 270)
+        self.assertIs(b1, b2)  # Identical cached object reference
 
 
 if __name__ == "__main__":

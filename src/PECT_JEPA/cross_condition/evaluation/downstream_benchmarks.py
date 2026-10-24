@@ -523,21 +523,33 @@ class DownstreamBenchmarkSuite:
             rec = float(recall_score(y_true, y_pred, zero_division=0))
             sound_fpr_opt = float(np.mean(y_pred[sound_idx])) if n_sound > 0 else 0.0
         else:
-            best_dice = -1.0
-            best_iou = 0.0
-            best_tau = 0.5
-            prec, rec = 0.0, 0.0
-            sound_fpr_opt = 0.0
-            for tau in np.linspace(0.1, 0.95, 35):
-                c_pred = (p_val >= tau).astype(int)
-                d = f1_score(y_true, c_pred, zero_division=0)
-                if d > best_dice:
-                    best_dice = float(d)
-                    best_tau = float(tau)
-                    best_iou = float(jaccard_score(y_true, c_pred, zero_division=0))
-                    prec = float(precision_score(y_true, c_pred, zero_division=0))
-                    rec = float(recall_score(y_true, c_pred, zero_division=0))
-                    sound_fpr_opt = float(np.mean(c_pred[sound_idx])) if n_sound > 0 else 0.0
+            taus = np.linspace(0.1, 0.95, 35)
+            p_pos = p_val[y_true == 1]
+            p_neg = p_val[sound_idx]
+            n_pos = len(p_pos)
+            n_neg = len(p_neg)
+
+            if n_pos > 0 and n_neg > 0:
+                tp = np.sum(p_pos[:, None] >= taus[None, :], axis=0).astype(np.float64)
+                fp = np.sum(p_neg[:, None] >= taus[None, :], axis=0).astype(np.float64)
+                fn = n_pos - tp
+
+                precisions = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp > 0))
+                recalls = np.divide(tp, n_pos, out=np.zeros_like(tp), where=(n_pos > 0))
+                dices = np.divide(2.0 * tp, 2.0 * tp + fp + fn, out=np.zeros_like(tp), where=(2.0 * tp + fp + fn > 0))
+                ious = np.divide(tp, tp + fp + fn, out=np.zeros_like(tp), where=(tp + fp + fn > 0))
+                fprs = np.divide(fp, n_neg, out=np.zeros_like(fp), where=(n_neg > 0))
+
+                best_idx = int(np.argmax(dices))
+                best_dice = float(dices[best_idx])
+                best_tau = float(taus[best_idx])
+                best_iou = float(ious[best_idx])
+                prec = float(precisions[best_idx])
+                rec = float(recalls[best_idx])
+                sound_fpr_opt = float(fprs[best_idx])
+            else:
+                best_dice, best_iou, best_tau = 0.0, 0.0, 0.5
+                prec, rec, sound_fpr_opt = 0.0, 0.0, 0.0
 
         return {
             "iou": round(best_iou, 4),
