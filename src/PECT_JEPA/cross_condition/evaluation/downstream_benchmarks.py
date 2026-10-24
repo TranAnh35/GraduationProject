@@ -37,6 +37,149 @@ from sklearn.exceptions import ConvergenceWarning
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 
+def compute_otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
+    """
+    Computes Otsu's optimal threshold on a 1D continuous array by maximizing
+    inter-class variance between background and foreground distributions.
+    """
+    vals = np.asarray(values).reshape(-1)
+    vals = vals[~np.isnan(vals)]
+    if len(vals) == 0:
+        return 0.5
+    vmin, vmax = float(np.min(vals)), float(np.max(vals))
+    if vmax <= vmin + 1e-7:
+        return vmin
+
+    counts, bin_edges = np.histogram(vals, bins=n_bins, range=(vmin, vmax))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    total = float(np.sum(counts))
+    if total == 0:
+        return 0.5
+
+    p = counts / total
+    omega = np.cumsum(p)
+    mu = np.cumsum(p * bin_centers)
+    mu_t = mu[-1]
+
+    denom = omega * (1.0 - omega)
+    valid = denom > 1e-10
+    sigma_b_sq = np.zeros_like(omega)
+    sigma_b_sq[valid] = ((mu_t * omega[valid] - mu[valid]) ** 2) / denom[valid]
+
+    best_idx = int(np.argmax(sigma_b_sq))
+    return float(bin_centers[best_idx])
+
+
+def compute_instance_pod(
+    score_map: np.ndarray,
+    flaw_config: Dict[str, Any],
+    threshold: float = 0.5,
+    margin_px: int = 2,
+) -> Dict[str, Any]:
+    """
+    Computes Instance-level Probability of Detection (POD) / Defect Hit Rate.
+    Evaluates whether each known CAD flaw has a maximum detection score in its
+    neighborhood exceeding the given threshold.
+
+    Parameters:
+    - score_map: [H, W] continuous score (probability or anomaly distance)
+    - flaw_config: dictionary with 'features' list from CAD ground truth config
+    - threshold: decision threshold for calling a hit
+    - margin_px: pixel buffer margin around the CAD flaw boundary
+
+    Returns:
+    - dict with pod (hit rate), num_hits, num_defects, hit_details
+    """
+    if score_map is None or flaw_config is None or "features" not in flaw_config:
+        return {"pod": 0.0, "num_hits": 0, "num_defects": 0, "threshold": float(threshold), "hit_details": []}
+
+    H, W = score_map.shape[:2]
+    features = flaw_config.get("features", [])
+    hit_details = []
+    num_hits = 0
+    num_defects = 0
+
+    for feat in features:
+        # Check if feature is a genuine defect (not sound metal or sound rivet)
+        kind = str(feat.get("kind", "")).lower()
+        depth = feat.get("depth")
+        # Defect criteria: either depth > 0 or kind indicates corrosion/defect
+        if depth is not None:
+            try:
+                is_defect = float(depth) > 0.0
+            except (ValueError, TypeError):
+                is_defect = False
+        else:
+            is_defect = ("corrosion" in kind or "defect" in kind) and ("only" not in kind)
+
+        if not is_defect:
+            continue
+
+        num_defects += 1
+        fid = feat.get("id", num_defects)
+
+        # Flaw center
+        if feat.get("corrosionX") is not None and feat.get("corrosionY") is not None:
+            cx = float(feat["corrosionX"])
+            cy = float(feat["corrosionY"])
+        elif feat.get("x") is not None and feat.get("y") is not None:
+            cx = float(feat["x"])
+            cy = float(feat["y"])
+        else:
+            continue
+
+        dia = float(feat.get("diameter", 0.0) or 0.0)
+        rad = max(2.0, dia / 2.0)
+        eff_rad = rad + margin_px
+
+        # Bounding box coordinates with clipping
+        r0 = max(0, int(np.floor(cy - eff_rad)))
+        r1 = min(H, int(np.ceil(cy + eff_rad + 1)))
+        c0 = max(0, int(np.floor(cx - eff_rad)))
+        c1 = min(W, int(np.ceil(cx + eff_rad + 1)))
+
+        if r1 <= r0 or c1 <= c0:
+            hit_details.append({
+                "id": fid,
+                "diameter": dia,
+                "depth": depth,
+                "peak_score": 0.0,
+                "hit": False,
+            })
+            continue
+
+        patch = score_map[r0:r1, c0:c1]
+        grid_r, grid_c = np.mgrid[r0:r1, c0:c1]
+        dist_sq = (grid_r - cy) ** 2 + (grid_c - cx) ** 2
+        in_circle = dist_sq <= (eff_rad ** 2)
+
+        if np.any(in_circle):
+            peak_val = float(np.max(patch[in_circle]))
+        else:
+            peak_val = float(np.max(patch))
+
+        is_hit = bool(peak_val >= threshold)
+        if is_hit:
+            num_hits += 1
+
+        hit_details.append({
+            "id": fid,
+            "diameter": dia,
+            "depth": depth,
+            "peak_score": round(peak_val, 4),
+            "hit": is_hit,
+        })
+
+    pod = float(num_hits / num_defects) if num_defects > 0 else 0.0
+    return {
+        "pod": round(pod, 4),
+        "num_hits": num_hits,
+        "num_defects": num_defects,
+        "threshold": round(float(threshold), 4),
+        "hit_details": hit_details,
+    }
+
+
 class DownstreamBenchmarkSuite:
     """
     Evaluates Linear Probe and MLP 2-Layer on frozen PECT-JEPA representations.
@@ -334,8 +477,43 @@ class DownstreamBenchmarkSuite:
         p_val = flat_p[valid]
 
         if len(np.unique(y_true)) < 2:
-            return {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0, "optimal_threshold": 0.5}
+            return {
+                "iou": 0.0,
+                "dice": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "optimal_threshold": 0.5,
+                "iou_05": 0.0,
+                "dice_05": 0.0,
+                "sound_fpr_05": 0.0,
+                "threshold_otsu": 0.5,
+                "iou_otsu": 0.0,
+                "dice_otsu": 0.0,
+                "sound_fpr_otsu": 0.0,
+                "threshold_opt": 0.5,
+                "iou_opt": 0.0,
+                "dice_opt": 0.0,
+                "sound_fpr_opt": 0.0,
+                "sound_metal_fpr": 0.0,
+            }
 
+        sound_idx = (y_true == 0)
+        n_sound = int(np.sum(sound_idx))
+
+        # 1. Fixed standard threshold 0.5
+        pred_05 = (p_val >= 0.5).astype(int)
+        iou_05 = float(jaccard_score(y_true, pred_05, zero_division=0))
+        dice_05 = float(f1_score(y_true, pred_05, zero_division=0))
+        sound_fpr_05 = float(np.mean(pred_05[sound_idx])) if n_sound > 0 else 0.0
+
+        # 2. Otsu adaptive threshold
+        tau_otsu = compute_otsu_threshold(p_val)
+        pred_otsu = (p_val >= tau_otsu).astype(int)
+        iou_otsu = float(jaccard_score(y_true, pred_otsu, zero_division=0))
+        dice_otsu = float(f1_score(y_true, pred_otsu, zero_division=0))
+        sound_fpr_otsu = float(np.mean(pred_otsu[sound_idx])) if n_sound > 0 else 0.0
+
+        # 3. Optimal threshold search
         if threshold is not None:
             best_tau = float(threshold)
             y_pred = (p_val >= best_tau).astype(int)
@@ -343,12 +521,14 @@ class DownstreamBenchmarkSuite:
             best_dice = float(f1_score(y_true, y_pred, zero_division=0))
             prec = float(precision_score(y_true, y_pred, zero_division=0))
             rec = float(recall_score(y_true, y_pred, zero_division=0))
+            sound_fpr_opt = float(np.mean(y_pred[sound_idx])) if n_sound > 0 else 0.0
         else:
             best_dice = -1.0
             best_iou = 0.0
             best_tau = 0.5
             prec, rec = 0.0, 0.0
-            for tau in np.linspace(0.2, 0.95, 31):
+            sound_fpr_opt = 0.0
+            for tau in np.linspace(0.1, 0.95, 35):
                 c_pred = (p_val >= tau).astype(int)
                 d = f1_score(y_true, c_pred, zero_division=0)
                 if d > best_dice:
@@ -357,6 +537,7 @@ class DownstreamBenchmarkSuite:
                     best_iou = float(jaccard_score(y_true, c_pred, zero_division=0))
                     prec = float(precision_score(y_true, c_pred, zero_division=0))
                     rec = float(recall_score(y_true, c_pred, zero_division=0))
+                    sound_fpr_opt = float(np.mean(c_pred[sound_idx])) if n_sound > 0 else 0.0
 
         return {
             "iou": round(best_iou, 4),
@@ -364,7 +545,33 @@ class DownstreamBenchmarkSuite:
             "precision": round(prec, 4),
             "recall": round(rec, 4),
             "optimal_threshold": round(best_tau, 4),
+            "iou_05": round(iou_05, 4),
+            "dice_05": round(dice_05, 4),
+            "sound_fpr_05": round(sound_fpr_05, 4),
+            "threshold_otsu": round(tau_otsu, 4),
+            "iou_otsu": round(iou_otsu, 4),
+            "dice_otsu": round(dice_otsu, 4),
+            "sound_fpr_otsu": round(sound_fpr_otsu, 4),
+            "threshold_opt": round(best_tau, 4),
+            "iou_opt": round(best_iou, 4),
+            "dice_opt": round(best_dice, 4),
+            "f1_max": round(best_dice, 4),
+            "sound_fpr_opt": round(sound_fpr_opt, 4),
+            "sound_metal_fpr": round(sound_fpr_05, 4),
         }
+
+    @staticmethod
+    def compute_otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
+        return compute_otsu_threshold(values, n_bins)
+
+    @staticmethod
+    def compute_instance_pod(
+        score_map: np.ndarray,
+        flaw_config: Dict[str, Any],
+        threshold: float = 0.5,
+        margin_px: int = 2,
+    ) -> Dict[str, Any]:
+        return compute_instance_pod(score_map, flaw_config, threshold, margin_px)
 
     # =========================================================================
     # Task 2: Quantitative Physical Sizing (Conditional Hurdle Regression)

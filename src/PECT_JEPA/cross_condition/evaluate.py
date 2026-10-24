@@ -112,18 +112,20 @@ def load_ground_truth_masks(data_dir: Optional[str] = None) -> Dict[str, Any]:
 
     # 2. Rivet_v1
     r1_gt_path = os.path.join(gt_root, "rivet_v1", "rivet_v1_gt_mask.npy")
+    r1_cfg_path = os.path.join(gt_root, "rivet_v1", "rivet_v1_flaws_config.json")
     if os.path.exists(r1_gt_path):
         masks["Rivet_v1"] = {
             "mask": np.load(r1_gt_path),
-            "config": None,
+            "config": json.load(open(r1_cfg_path, "r", encoding="utf-8")) if os.path.exists(r1_cfg_path) else None,
         }
 
     # 3. Rivet_v2
     r2_gt_path = os.path.join(gt_root, "rivet_v2", "rivet_v2_gt_mask.npy")
+    r2_cfg_path = os.path.join(gt_root, "rivet_v2", "rivet_v2_flaws_config.json")
     if os.path.exists(r2_gt_path):
         masks["Rivet_v2"] = {
             "mask": np.load(r2_gt_path),
-            "config": None,
+            "config": json.load(open(r2_cfg_path, "r", encoding="utf-8")) if os.path.exists(r2_cfg_path) else None,
         }
 
     return masks
@@ -821,6 +823,7 @@ def main():
                 )
 
             # TASK 3: Segmentation IoU & Bounding Box Overlap Map (spatiotemporal_5x5 standard)
+            seg_metrics = suite.benchmark_segmentation_iou(prob_map=prob_map, gt_mask=gt_mask)
             seg_plot_path = os.path.join(task_dirs["segmentation"], f"{bname}_segmentation_iou.png")
             iou_res = plot_defect_contours_and_iou(
                 prob_map=prob_map,
@@ -830,6 +833,22 @@ def main():
                 min_defect_area=8,
                 title=f"[{split_name.upper()}] Defect Segmentation Bounding Boxes | {specimen} - {sensor} - {waveform}",
             )
+
+            # TASK 1c: Probability of Detection (POD) & Sound Metal False Positive Rate
+            specimen_cfg = gt_masks.get(specimen, {}).get("config")
+            pod_rate_05 = 0.0
+            pod_rate_otsu = 0.0
+            if specimen_cfg is not None:
+                pod_05_res = suite.compute_instance_pod(score_map=prob_map, flaw_config=specimen_cfg, threshold=0.5)
+                pod_otsu_res = suite.compute_instance_pod(score_map=prob_map, flaw_config=specimen_cfg, threshold=seg_metrics.get("threshold_otsu", 0.5))
+                pod_rate_05 = pod_05_res["pod"]
+                pod_rate_otsu = pod_otsu_res["pod"]
+
+            sound_fpr_05 = seg_metrics.get("sound_fpr_05", iou_res.get("sound_metal_fpr", 0.0))
+            sound_fpr_otsu = seg_metrics.get("sound_fpr_otsu", 0.0)
+            iou_otsu = seg_metrics.get("iou_otsu", 0.0)
+            dice_otsu = seg_metrics.get("dice_otsu", 0.0)
+            f1_max = seg_metrics.get("dice_opt", seg_metrics.get("dice", 0.0))
 
             # Record metrics row
             row = {
@@ -848,8 +867,15 @@ def main():
                 "mahalanobis_auc": anom_res["auc_roc"],
                 "mahalanobis_ap": anom_res["average_precision"],
                 "cnr": anom_res["cnr"],
+                "pod_rate_05": pod_rate_05,
+                "pod_rate_otsu": pod_rate_otsu,
+                "sound_fpr_05": sound_fpr_05,
+                "sound_fpr_otsu": sound_fpr_otsu,
+                "f1_max": f1_max,
                 "segmentation_iou": iou_res["iou"],
                 "segmentation_dice": iou_res["dice"],
+                "segmentation_iou_otsu": iou_otsu,
+                "segmentation_dice_otsu": dice_otsu,
                 "segmentation_precision": iou_res["precision"],
                 "segmentation_recall": iou_res["recall"],
                 "sizing_r2": sizing_res["r2_score"],
@@ -892,6 +918,9 @@ def main():
                 "mahalanobis_auc": anom_res["auc_roc"],
                 "mahalanobis_ap": anom_res["average_precision"],
                 "cnr": anom_res["cnr"],
+                "pod_rate_05": pod_rate_05,
+                "pod_rate_otsu": pod_rate_otsu,
+                "sound_fpr_05": sound_fpr_05,
             })
 
             # 2. Sizing Scatter Plot (if applicable)
@@ -924,15 +953,19 @@ def main():
                 "liftoff": liftoff,
                 "iou": iou_res["iou"],
                 "dice": iou_res["dice"],
+                "iou_otsu": iou_otsu,
+                "dice_otsu": dice_otsu,
+                "f1_max": f1_max,
+                "sound_fpr_05": sound_fpr_05,
+                "sound_fpr_otsu": sound_fpr_otsu,
                 "precision": iou_res["precision"],
                 "recall": iou_res["recall"],
             })
 
-
-
             pbar.set_postfix({
                 "LP_AUC": f"{det_res['auc_roc']:.4f}",
                 "LP_AP": f"{det_res['average_precision']:.4f}",
+                "POD": f"{pod_rate_otsu:.2f}",
                 "CNR": f"{anom_res['cnr']:.2f}",
                 "IoU": f"{iou_res['iou']:.4f}",
             })
@@ -1000,8 +1033,15 @@ def main():
         lp_ap = [r["linear_probe_ap"] for r in rows]
         mahal_auc = [r["mahalanobis_auc"] for r in rows]
         cnr = [r["cnr"] for r in rows]
+        pod_05 = [r.get("pod_rate_05", 0.0) for r in rows]
+        pod_otsu = [r.get("pod_rate_otsu", 0.0) for r in rows]
+        sound_fpr_05 = [r.get("sound_fpr_05", 0.0) for r in rows]
+        sound_fpr_otsu = [r.get("sound_fpr_otsu", 0.0) for r in rows]
+        f1_max = [r.get("f1_max", 0.0) for r in rows]
         iou = [r["segmentation_iou"] for r in rows]
         dice = [r["segmentation_dice"] for r in rows]
+        iou_otsu = [r.get("segmentation_iou_otsu", 0.0) for r in rows]
+        dice_otsu = [r.get("segmentation_dice_otsu", 0.0) for r in rows]
         sz_r2 = [r["sizing_r2"] for r in rows if r["specimen"] == "Corrosion"]
         sz_mae = [r["sizing_mae_mm"] for r in rows if r["specimen"] == "Corrosion"]
         return {
@@ -1012,8 +1052,15 @@ def main():
             "linear_probe_ap_std": float(np.std(lp_ap)),
             "mahalanobis_auc_mean": float(np.mean(mahal_auc)),
             "cnr_mean": float(np.mean(cnr)),
+            "pod_rate_05_mean": float(np.mean(pod_05)),
+            "pod_rate_otsu_mean": float(np.mean(pod_otsu)),
+            "sound_fpr_05_mean": float(np.mean(sound_fpr_05)),
+            "sound_fpr_otsu_mean": float(np.mean(sound_fpr_otsu)),
+            "f1_max_mean": float(np.mean(f1_max)),
             "segmentation_iou_mean": float(np.mean(iou)),
             "segmentation_dice_mean": float(np.mean(dice)),
+            "segmentation_iou_otsu_mean": float(np.mean(iou_otsu)),
+            "segmentation_dice_otsu_mean": float(np.mean(dice_otsu)),
             "sizing_r2_mean": float(np.mean(sz_r2)) if sz_r2 else 0.0,
             "sizing_mae_mean": float(np.mean(sz_mae)) if sz_mae else 0.0,
         }
@@ -1100,34 +1147,40 @@ def main():
         f.write(f"- **Total Files Evaluated**: {len(master_results)}\n\n")
 
         f.write("## 1. Split Performance Breakdown\n\n")
-        f.write("| Split | Files | Linear Probe AUC | Linear Probe AP | CNR | Mahalanobis AUC | Seg IoU | Sizing R² |\n")
-        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
+        f.write("| Split | Files | Linear Probe AUC | Linear Probe AP | CNR | Mahalanobis AUC | POD (Otsu) | Seg IoU (Otsu) | Sound FPR | Sizing R² |\n")
+        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for sp in args.eval_splits:
             st = master_summary["by_split"].get(sp, {})
             if st:
-                f.write(f"| **{sp.upper()}** | {st['count']} | {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['mahalanobis_auc_mean']:.4f} | {st['segmentation_iou_mean']:.4f} | {st['sizing_r2_mean']:.4f} |\n")
+                f.write(f"| **{sp.upper()}** | {st['count']} | {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['mahalanobis_auc_mean']:.4f} | {st.get('pod_rate_otsu_mean', 0.0):.4f} | {st.get('segmentation_iou_otsu_mean', 0.0):.4f} | {st.get('sound_fpr_otsu_mean', 0.0):.4f} | {st['sizing_r2_mean']:.4f} |\n")
 
         f.write("\n## 2. Generalization Disaggregation\n\n")
         f.write("> AUDIT-2026-10-23: these tables are **test-only** (`by_*_test`). The "
                 "`by_*` fields in the JSON still span every evaluated split and must not "
                 "be quoted as generalization.\n\n")
         f.write("### By Waveform\n")
-        f.write("| Waveform | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
+        f.write("| Waveform | Files | LP AUC | LP AP | CNR | POD (Otsu) | Otsu IoU | Sound FPR |\n| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for wf, st in master_summary.get("by_waveform_test", master_summary["by_waveform"]).items():
             if st.get("count", 0) > 0:
-                f.write(f"| {wf} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
+                f.write(f"| {wf} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st.get('pod_rate_otsu_mean', 0.0):.4f} | {st.get('segmentation_iou_otsu_mean', 0.0):.4f} | {st.get('sound_fpr_otsu_mean', 0.0):.4f} |\n")
 
         f.write("\n### By Sensor\n")
-        f.write("| Sensor | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
+        f.write("| Sensor | Files | LP AUC | LP AP | CNR | POD (Otsu) | Otsu IoU | Sound FPR |\n| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for sn, st in master_summary.get("by_sensor_test", master_summary["by_sensor"]).items():
             if st.get("count", 0) > 0:
-                f.write(f"| {sn} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
+                f.write(f"| {sn} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st.get('pod_rate_otsu_mean', 0.0):.4f} | {st.get('segmentation_iou_otsu_mean', 0.0):.4f} | {st.get('sound_fpr_otsu_mean', 0.0):.4f} |\n")
 
         f.write("\n### By Lift-off\n")
-        f.write("| Lift-off | Files | LP AUC | LP AP | CNR | Seg IoU |\n| :--- | :---: | :---: | :---: | :---: | :--- |\n")
+        f.write("| Lift-off | Files | LP AUC | LP AP | CNR | POD (Otsu) | Otsu IoU | Sound FPR |\n| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for lo, st in master_summary.get("by_liftoff_test", master_summary["by_liftoff"]).items():
             if st.get("count", 0) > 0:
-                f.write(f"| {lo} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['segmentation_iou_mean']:.4f} |\n")
+                f.write(f"| {lo} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st.get('pod_rate_otsu_mean', 0.0):.4f} | {st.get('segmentation_iou_otsu_mean', 0.0):.4f} | {st.get('sound_fpr_otsu_mean', 0.0):.4f} |\n")
+
+        f.write("\n### By Specimen\n")
+        f.write("| Specimen | Files | LP AUC | LP AP | CNR | POD (Otsu) | Otsu IoU | Sound FPR |\n| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
+        for sp, st in master_summary.get("by_specimen_test", master_summary["by_specimen"]).items():
+            if st.get("count", 0) > 0:
+                f.write(f"| {sp} | {st['count']} | {st['linear_probe_auc_mean']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st.get('pod_rate_otsu_mean', 0.0):.4f} | {st.get('segmentation_iou_otsu_mean', 0.0):.4f} | {st.get('sound_fpr_otsu_mean', 0.0):.4f} |\n")
 
         # Section 3: Canonical TTA Benchmark
         if canonical_tta_results:
