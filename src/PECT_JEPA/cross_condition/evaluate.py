@@ -323,8 +323,7 @@ def evaluate_canonical_test_time_adaptation(
     for shift in canonical_shifts:
         src_files, tgt_files = get_canonical_shift_files(all_files, shift)
         shift_out_dir = os.path.join(out_dir, "4. Test Time Adaptation", shift)
-        vis_dir = os.path.join(shift_out_dir, "visualizations")
-        os.makedirs(vis_dir, exist_ok=True)
+        os.makedirs(shift_out_dir, exist_ok=True)
 
         print("\n" + "-" * 75)
         print(f"Evaluating Canonical Shift [{shift.upper()}]: Test-Time Adaptation (TTA)")
@@ -407,50 +406,51 @@ def evaluate_canonical_test_time_adaptation(
                     auc_maha = float(roc_auc_score(gt_mask.reshape(-1)[valid], flat_maha[valid]))
                     ap_maha = float(average_precision_score(gt_mask.reshape(-1)[valid], flat_maha[valid]))
 
-                # Save Visualizations for target files (Comprehensive TTA Display)
-                if set_name == "target":
-                    comp_path = os.path.join(vis_dir, f"{bname}_tta_comparison.png")
-                    raw_ptp = cached_raw_heatmaps.get(fp) if cached_raw_heatmaps is not None else None
-                    if raw_ptp is None:
-                        cscan_tmp = load_canonical_cscan_from_tdms(fp)
-                        raw_ptp = extract_cscan_raw_features(cscan_tmp, method="filtered_ptp")
-                        if cached_raw_heatmaps is not None:
-                            cached_raw_heatmaps[fp] = raw_ptp
+                # Save Visualizations for both source and target files in their respective folders
+                set_dir = os.path.join(shift_out_dir, set_name)
+                os.makedirs(set_dir, exist_ok=True)
+                comp_path = os.path.join(set_dir, f"{bname}_tta_comparison.png")
+                raw_ptp = cached_raw_heatmaps.get(fp) if cached_raw_heatmaps is not None else None
+                if raw_ptp is None:
+                    cscan_tmp = load_canonical_cscan_from_tdms(fp)
+                    raw_ptp = extract_cscan_raw_features(cscan_tmp, method="filtered_ptp")
+                    if cached_raw_heatmaps is not None:
+                        cached_raw_heatmaps[fp] = raw_ptp
 
-                    target_cnr = 0.0
-                    if has_both:
-                        s_idx = np.where(gt_mask.reshape(-1) == 0)[0]
-                        d_idx = np.where(gt_mask.reshape(-1) == 1)[0]
-                        if len(s_idx) > 0 and len(d_idx) > 0:
-                            target_cnr = float((np.mean(flat_maha[d_idx]) - np.mean(flat_maha[s_idx])) / (np.std(flat_maha[s_idx]) + 1e-6))
+                target_cnr = 0.0
+                if has_both:
+                    s_idx = np.where(gt_mask.reshape(-1) == 0)[0]
+                    d_idx = np.where(gt_mask.reshape(-1) == 1)[0]
+                    if len(s_idx) > 0 and len(d_idx) > 0:
+                        target_cnr = float((np.mean(flat_maha[d_idx]) - np.mean(flat_maha[s_idx])) / (np.std(flat_maha[s_idx]) + 1e-6))
 
-                    if async_saver is not None:
-                        async_saver.submit(
-                            plot_tta_summary_map,
-                            ground_truth_mask=gt_mask,
-                            lp_raw_prob_map=lp_raw_map,
-                            lp_tta_prob_map=lp_tta_map,
-                            file_title=f"[{shift.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
-                            save_path=comp_path,
-                            raw_heatmap=raw_ptp,
-                            maha_map=maha_scores,
-                            lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
-                            lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
-                            maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
-                        )
-                    else:
-                        plot_tta_summary_map(
-                            ground_truth_mask=gt_mask,
-                            lp_raw_prob_map=lp_raw_map,
-                            lp_tta_prob_map=lp_tta_map,
-                            file_title=f"[{shift.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
-                            save_path=comp_path,
-                            raw_heatmap=raw_ptp,
-                            maha_map=maha_scores,
-                            lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
-                            lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
-                            maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
-                        )
+                if async_saver is not None:
+                    async_saver.submit(
+                        plot_tta_summary_map,
+                        ground_truth_mask=gt_mask,
+                        lp_raw_prob_map=lp_raw_map,
+                        lp_tta_prob_map=lp_tta_map,
+                        file_title=f"[{shift.upper()} - {set_name.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
+                        save_path=comp_path,
+                        raw_heatmap=raw_ptp,
+                        maha_map=maha_scores,
+                        lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
+                        lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
+                        maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
+                    )
+                else:
+                    plot_tta_summary_map(
+                        ground_truth_mask=gt_mask,
+                        lp_raw_prob_map=lp_raw_map,
+                        lp_tta_prob_map=lp_tta_map,
+                        file_title=f"[{shift.upper()} - {set_name.upper()}] {sp} | {meta['sensor']} | {meta['waveform']}",
+                        save_path=comp_path,
+                        raw_heatmap=raw_ptp,
+                        maha_map=maha_scores,
+                        lp_raw_metrics={"auc": auc_raw_lp, "ap": ap_raw_lp},
+                        lp_tta_metrics={"auc": auc_tta_lp, "ap": ap_tta_lp},
+                        maha_metrics={"auc": auc_maha, "ap": ap_maha, "cnr": target_cnr},
+                    )
 
                 if not has_both:
                     print(f"    [skip] {set_name} {fname}: GT mask has a single class")
@@ -486,6 +486,18 @@ def evaluate_canonical_test_time_adaptation(
                 writer = csv.DictWriter(f, fieldnames=list(shift_rows[0].keys()))
                 writer.writeheader()
                 writer.writerows(shift_rows)
+
+            # Save per-domain metrics.csv (source / target)
+            for s_name in ["source", "target"]:
+                s_rows = [r for r in shift_rows if r["domain_set"] == s_name]
+                if s_rows:
+                    s_dir = os.path.join(shift_out_dir, s_name)
+                    os.makedirs(s_dir, exist_ok=True)
+                    s_csv = os.path.join(s_dir, "metrics.csv")
+                    with open(s_csv, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=list(s_rows[0].keys()))
+                        writer.writeheader()
+                        writer.writerows(s_rows)
 
             shift_summary: Dict[str, Any] = {"shift": shift, "methods": {}}
             method_keys = [
@@ -851,7 +863,9 @@ def main():
 
             # TASK 3: Segmentation IoU & Bounding Box Overlap Map (spatiotemporal_5x5 standard)
             seg_metrics = suite.benchmark_segmentation_iou(prob_map=prob_map, gt_mask=gt_mask)
-            seg_plot_path = os.path.join(task_dirs["segmentation"], f"{bname}_segmentation_iou.png")
+            split_seg_dir = os.path.join(task_dirs["segmentation"], split_name)
+            os.makedirs(split_seg_dir, exist_ok=True)
+            seg_plot_path = os.path.join(split_seg_dir, f"{bname}_segmentation_iou.png")
             iou_res = plot_defect_contours_and_iou(
                 prob_map=prob_map,
                 gt_mask=gt_mask,
@@ -916,7 +930,9 @@ def main():
 
             # Save task-specific visualizations
             # 1. Anomaly Detection: 4-Panel Summary Map (1. CAD GT, 2. Raw Peak-to-Peak, 3. Mahalanobis, 4. Linear Probe)
-            summary_plot_path = os.path.join(task_dirs["anomaly"], f"{bname}_detection_summary.png")
+            split_anom_dir = os.path.join(task_dirs["anomaly"], split_name)
+            os.makedirs(split_anom_dir, exist_ok=True)
+            summary_plot_path = os.path.join(split_anom_dir, f"{bname}_detection_summary.png")
             raw_ptp = cached_raw_heatmaps.get(fp)
             if raw_ptp is None:
                 cscan_temp = load_canonical_cscan_from_tdms(fp)
@@ -954,7 +970,9 @@ def main():
 
             # 2. Sizing Scatter Plot (if applicable)
             if specimen == "Corrosion" and len(sizing_res["y_true"]) > 0:
-                sizing_plot_path = os.path.join(task_dirs["sizing"], f"{bname}_sizing.png")
+                split_sizing_dir = os.path.join(task_dirs["sizing"], split_name)
+                os.makedirs(split_sizing_dir, exist_ok=True)
+                sizing_plot_path = os.path.join(split_sizing_dir, f"{bname}_sizing.png")
                 async_saver.submit(
                     plot_sizing_calibration,
                     true_size=sizing_res["y_true"],
@@ -1011,7 +1029,25 @@ def main():
     for tname in ["anomaly", "sizing", "segmentation"]:
         all_task_rows = []
         for sp in args.eval_splits:
-            all_task_rows.extend(split_task_results[sp][tname])
+            sp_rows = split_task_results[sp][tname]
+            all_task_rows.extend(sp_rows)
+            if sp_rows:
+                sp_dir = os.path.join(task_dirs[tname], sp)
+                os.makedirs(sp_dir, exist_ok=True)
+                with open(os.path.join(sp_dir, "metrics.csv"), "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(sp_rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(sp_rows)
+
+                sp_summary = {}
+                for k in sp_rows[0].keys():
+                    vals = [r[k] for r in sp_rows if isinstance(r[k], (int, float))]
+                    if vals:
+                        sp_summary[f"mean_{k}"] = float(np.mean(vals))
+                        sp_summary[f"std_{k}"] = float(np.std(vals))
+                with open(os.path.join(sp_dir, "summary.json"), "w", encoding="utf-8") as f:
+                    json.dump({"task": tname, "split": sp, "count": len(sp_rows), "metrics": sp_summary}, f, indent=2)
+
         if all_task_rows:
             t_csv = os.path.join(task_dirs[tname], "metrics.csv")
             with open(t_csv, "w", newline="", encoding="utf-8") as f:

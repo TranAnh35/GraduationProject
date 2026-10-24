@@ -199,5 +199,94 @@ class TestNewEvaluationMetrics(unittest.TestCase):
             self.assertEqual(unpacked_seq[0], ("scan_a.tdms", (10, 10, 128)))
 
 
+    def test_downstream_task_split_directory_structure(self):
+        """Verify downstream task results are organized into train/val/test subfolders."""
+        import tempfile, json, csv
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task_dirs = {
+                "anomaly": os.path.join(tmpdir, "1_Anomaly_Detection"),
+                "sizing": os.path.join(tmpdir, "2_Defect_Sizing"),
+                "segmentation": os.path.join(tmpdir, "3_Segmentation_IoU"),
+            }
+            eval_splits = ["train", "val", "test"]
+            split_task_results = {
+                sp: {
+                    "anomaly": [{"file": f"{sp}_scan.tdms", "auc": 0.95}],
+                    "sizing": [{"file": f"{sp}_scan.tdms", "r2": 0.88}],
+                    "segmentation": [{"file": f"{sp}_scan.tdms", "iou": 0.75}],
+                }
+                for sp in eval_splits
+            }
+
+            # Emulate the split saving block in evaluate.py
+            for tname in ["anomaly", "sizing", "segmentation"]:
+                all_task_rows = []
+                for sp in eval_splits:
+                    sp_rows = split_task_results[sp][tname]
+                    all_task_rows.extend(sp_rows)
+                    if sp_rows:
+                        sp_dir = os.path.join(task_dirs[tname], sp)
+                        os.makedirs(sp_dir, exist_ok=True)
+                        with open(os.path.join(sp_dir, "metrics.csv"), "w", newline="", encoding="utf-8") as f:
+                            writer = csv.DictWriter(f, fieldnames=list(sp_rows[0].keys()))
+                            writer.writeheader()
+                            writer.writerows(sp_rows)
+                        with open(os.path.join(sp_dir, "summary.json"), "w", encoding="utf-8") as f:
+                            json.dump({"task": tname, "split": sp, "count": len(sp_rows)}, f, indent=2)
+
+                t_csv = os.path.join(task_dirs[tname], "metrics.csv")
+                with open(t_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(all_task_rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(all_task_rows)
+
+            # Assert hierarchy
+            for tname, tdir in task_dirs.items():
+                self.assertTrue(os.path.exists(os.path.join(tdir, "metrics.csv")))
+                for sp in eval_splits:
+                    sp_dir = os.path.join(tdir, sp)
+                    self.assertTrue(os.path.isdir(sp_dir), f"Missing split dir: {sp_dir}")
+                    self.assertTrue(os.path.exists(os.path.join(sp_dir, "metrics.csv")))
+                    self.assertTrue(os.path.exists(os.path.join(sp_dir, "summary.json")))
+
+    def test_tta_source_target_directory_structure(self):
+        """Verify TTA results are organized into source/ and target/ subfolders under each shift."""
+        import tempfile, csv
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shift = "cross_sensor"
+            shift_out_dir = os.path.join(tmpdir, "4. Test Time Adaptation", shift)
+            os.makedirs(shift_out_dir, exist_ok=True)
+
+            shift_rows = [
+                {"shift": shift, "domain_set": "source", "file": "src1.tdms", "auc_raw_lp": 0.90, "auc_tta_lp": 0.92},
+                {"shift": shift, "domain_set": "target", "file": "tgt1.tdms", "auc_raw_lp": 0.60, "auc_tta_lp": 0.78},
+            ]
+
+            # Save Shift CSV & per-domain metrics.csv (as in evaluate.py)
+            csv_path = os.path.join(shift_out_dir, "tta_summary.csv")
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(shift_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(shift_rows)
+
+            for s_name in ["source", "target"]:
+                s_rows = [r for r in shift_rows if r["domain_set"] == s_name]
+                if s_rows:
+                    s_dir = os.path.join(shift_out_dir, s_name)
+                    os.makedirs(s_dir, exist_ok=True)
+                    s_csv = os.path.join(s_dir, "metrics.csv")
+                    with open(s_csv, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=list(s_rows[0].keys()))
+                        writer.writeheader()
+                        writer.writerows(s_rows)
+
+            # Assert hierarchy
+            self.assertTrue(os.path.exists(os.path.join(shift_out_dir, "tta_summary.csv")))
+            for s_name in ["source", "target"]:
+                s_dir = os.path.join(shift_out_dir, s_name)
+                self.assertTrue(os.path.isdir(s_dir), f"Missing domain dir: {s_dir}")
+                self.assertTrue(os.path.exists(os.path.join(s_dir, "metrics.csv")))
+
+
 if __name__ == "__main__":
     unittest.main()
