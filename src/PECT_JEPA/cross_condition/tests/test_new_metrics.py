@@ -125,7 +125,7 @@ class TestNewEvaluationMetrics(unittest.TestCase):
         self.assertLess(float(np.var(np.diff(filtered, axis=-1))), float(np.var(np.diff(raw_cscan, axis=-1))))
 
     def test_extract_cscan_raw_features_and_all_methods(self):
-        """Verify the 4 reference methods extract proper 2D heatmaps."""
+        """Verify raw PTP and Filtered PTP extract proper 2D heatmaps."""
         t = np.linspace(0, 1, 128)
         signal = np.sin(2 * np.pi * 3 * t)
         mock_cscan = np.zeros((30, 30, 128), dtype=np.float32)
@@ -133,18 +133,16 @@ class TestNewEvaluationMetrics(unittest.TestCase):
         # Add peak in center
         mock_cscan[10:20, 10:20, :] *= 2.0
 
-        for method in ["slice", "loi", "ptp", "filtered_ptp"]:
+        for method in ["ptp", "filtered_ptp", "rms"]:
             feat = extract_cscan_raw_features(mock_cscan, method=method)
             self.assertEqual(feat.shape, (30, 30))
             self.assertEqual(feat.dtype, np.float32)
             self.assertFalse(np.isnan(feat).any())
 
         all_feats = extract_all_raw_heatmaps(mock_cscan)
-        self.assertIn("slice", all_feats)
-        self.assertIn("loi", all_feats)
         self.assertIn("ptp", all_feats)
         self.assertIn("filtered_ptp", all_feats)
-        self.assertEqual(len(all_feats), 4)
+        self.assertEqual(len(all_feats), 2)
 
     def test_async_plot_saver(self):
         """Verify AsyncPlotSaver non-blocking execution and wait_all."""

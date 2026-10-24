@@ -252,11 +252,9 @@ def plot_raw_multi_method_heatmaps(
     dpi: int = 150,
 ) -> None:
     """
-    4-Panel Raw TDMS feature extraction comparison matching references/plot_all_1Hall_heatmaps:
-    1. Slice: Mean absolute transient amplitude within active window
-    2. LOI: Peak absolute temporal gradient / derivative
-    3. PTP: Standard Peak-to-Peak (max - min)
-    4. Filtered PTP: Zero-phase LPF + baseline subtraction + PTP
+    2-Panel Raw PECT feature extraction comparison:
+    1. Peak-to-Peak: Standard Raw V_pp (max - min)
+    2. Filtered PTP: Zero-phase LPF + baseline DC offset subtraction + V_pp (NDT reference method)
     All subplots use cmap='jet' and interpolation='bilinear'.
     """
     from .raw_signal_features import extract_all_raw_heatmaps
@@ -266,22 +264,20 @@ def plot_raw_multi_method_heatmaps(
 
     feats = extract_all_raw_heatmaps(cscan, lpf_cutoff=lpf_cutoff, lpf_order=lpf_order)
 
-    fig = Figure(figsize=(22, 5), dpi=dpi)
-    axes = fig.subplots(1, 4)
+    fig = Figure(figsize=(11, 5), dpi=dpi)
+    axes = fig.subplots(1, 2)
 
     panels = [
-        ("1) Slice (Transient Window)", feats["slice"], f"[{np.min(feats['slice']):.3f}, {np.max(feats['slice']):.3f}]"),
-        ("2) LOI (Gradient / Derivative)", feats["loi"], f"[{np.min(feats['loi']):.3f}, {np.max(feats['loi']):.3f}]"),
-        ("3) Peak-to-Peak (Raw V_pp)", feats["ptp"], f"[{np.min(feats['ptp']):.2f}, {np.max(feats['ptp']):.2f}]"),
-        ("4) Filtered PTP (LPF Baseline-Corrected)", feats["filtered_ptp"], f"[{np.min(feats['filtered_ptp']):.2f}, {np.max(feats['filtered_ptp']):.2f}]"),
+        ("1) Peak-to-Peak (Raw V_pp)", feats["ptp"], f"[{np.min(feats['ptp']):.2f}, {np.max(feats['ptp']):.2f}]"),
+        ("2) Filtered PTP (LPF Baseline-Corrected)", feats["filtered_ptp"], f"[{np.min(feats['filtered_ptp']):.2f}, {np.max(feats['filtered_ptp']):.2f}]"),
     ]
 
     for idx, (title, img_data, range_str) in enumerate(panels):
         ax = axes[idx]
         im = ax.imshow(img_data, cmap="jet", origin="lower", interpolation="bilinear")
-        ax.set_title(f"{title}\n{file_title}\nRange: {range_str}", fontsize=9.5, fontweight="bold")
-        ax.set_xlabel("X (pixels)", fontsize=8.5)
-        ax.set_ylabel("Y (pixels)", fontsize=8.5)
+        ax.set_title(f"{title}\n{file_title}\nRange: {range_str}", fontsize=10, fontweight="bold")
+        ax.set_xlabel("X (pixels)", fontsize=9)
+        ax.set_ylabel("Y (pixels)", fontsize=9)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     fig.tight_layout()
