@@ -375,8 +375,11 @@ class CrossConditionTrainer:
         )
 
         sample_reps = []
+        seen_batches = 0
+        skipped_steps = 0
 
         for batch_idx, batch in enumerate(pbar):
+            seen_batches += 1
             x_a = batch["x_a"].to(self.device, non_blocking=True)
             x_b = batch["x_b"].to(self.device, non_blocking=True)
             ref_b = batch["ref_b"].to(self.device, non_blocking=True)
@@ -404,32 +407,41 @@ class CrossConditionTrainer:
                 )
                 loss = outputs["total_loss"]
 
-            self.scaler.scale(loss).backward()
-            if self.config.grad_clip_norm > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+            # A non-finite loss (AMP overflow / exploding batch) must never reach
+            # backward(): one NaN poisons every weight for the rest of the run
+            # and only surfaces later as a LAPACK failure in the SVD telemetry.
+            # Skip the step, leave the GradScaler state untouched, count it.
+            if not bool(torch.isfinite(loss).item()):
+                skipped_steps += 1
+                self.optimizer.zero_grad(set_to_none=True)
+            else:
+                self.scaler.scale(loss).backward()
+                if self.config.grad_clip_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
-            # EMA update
-            self.model.update_target_encoder(momentum=ema_momentum)
+                # EMA update
+                self.model.update_target_encoder(momentum=ema_momentum)
 
-            # Sync-free accumulation (detach keeps the graph released)
-            acc_loss += loss.detach().double()
-            acc_pred += outputs["pred_loss"].detach().double()
-            acc_aux += outputs["aux_loss"].detach().double()
-            acc_var += outputs["var_loss"].detach().double()
-            acc_cov += outputs["cov_loss"].detach().double()
-            acc_inv += outputs["inv_loss"].detach().double()
-            acc_keep += outputs["inv_keep_frac"].detach().double()
+                # Sync-free accumulation (detach keeps the graph released)
+                acc_loss += loss.detach().double()
+                acc_pred += outputs["pred_loss"].detach().double()
+                acc_aux += outputs["aux_loss"].detach().double()
+                acc_var += outputs["var_loss"].detach().double()
+                acc_cov += outputs["cov_loss"].detach().double()
+                acc_inv += outputs["inv_loss"].detach().double()
+                acc_keep += outputs["inv_keep_frac"].detach().double()
 
             if batch_idx < 5:
                 sample_reps.append(outputs["H_ctx_a"].detach().cpu())
 
             # Refresh displayed values at most every LOG_EVERY batches
             if batch_idx % LOG_EVERY == 0:
-                snap = torch.stack([acc_loss, acc_pred, acc_aux, acc_var, acc_inv]).cpu() / (batch_idx + 1)
+                seen = max(1, batch_idx + 1 - skipped_steps)
+                snap = torch.stack([acc_loss, acc_pred, acc_aux, acc_var, acc_inv]).cpu() / seen
                 snap_list = snap.tolist()
                 disp = {"loss": snap_list[0], "pred": snap_list[1], "aux": snap_list[2],
                         "var": snap_list[3], "inv": snap_list[4]}
@@ -442,16 +454,32 @@ class CrossConditionTrainer:
                 "lr": f"{lr:.2e}",
             })
 
-        avg_loss = (acc_loss / total_batches).item()
-        avg_pred = (acc_pred / total_batches).item()
-        avg_aux = (acc_aux / total_batches).item()
-        avg_var = (acc_var / total_batches).item()
-        avg_cov = (acc_cov / total_batches).item()
-        avg_inv = (acc_inv / total_batches).item()
-        avg_keep = (acc_keep / total_batches).item()
+        denom = max(1, seen_batches - skipped_steps)
+        avg_loss = (acc_loss / denom).item()
+        avg_pred = (acc_pred / denom).item()
+        avg_aux = (acc_aux / denom).item()
+        avg_var = (acc_var / denom).item()
+        avg_cov = (acc_cov / denom).item()
+        avg_inv = (acc_inv / denom).item()
+        avg_keep = (acc_keep / denom).item()
+
+        if skipped_steps:
+            msg = (f"[WARN] Epoch {epoch:02d}: skipped {skipped_steps}/{seen_batches} "
+                   f"batches with non-finite loss (weights kept from the last good step)")
+            if self.logger:
+                self.logger.info(msg)
+            else:
+                print(msg, flush=True)
 
         all_reps = torch.cat(sample_reps, dim=0)
         svd_res = compute_svd_diagnostics(all_reps)
+        if svd_res.get("n_nonfinite_rows", 0):
+            msg = (f"[WARN] Epoch {epoch:02d}: {svd_res['n_nonfinite_rows']}/{all_reps.shape[0]} "
+                   f"sampled latents were non-finite and excluded from the R_eff spectrum")
+            if self.logger:
+                self.logger.info(msg)
+            else:
+                print(msg, flush=True)
 
         return {
             "epoch": epoch,
