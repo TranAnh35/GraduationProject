@@ -17,7 +17,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .split import extract_file_metadata, filter_base_domain_files
+from .split import extract_file_metadata
 from .topologies import get_spatial_topology_offsets
 from .preprocessing import load_canonical_cscan_from_tdms, get_canonical_transformer
 
@@ -45,7 +45,6 @@ class PairedPECTDataset(Dataset):
         self,
         file_paths: Optional[List[str]] = None,
         data_dir: Optional[str] = None,
-        split_mode: str = "cross_specimen",
         grid_stride: int = 4,
         samples_per_epoch: Optional[int] = None,
         num_partitions: int = 10,
@@ -59,7 +58,6 @@ class PairedPECTDataset(Dataset):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
         self.seed = seed
-        self.split_mode = str(split_mode)
         import glob
 
         if file_paths is None:
@@ -72,10 +70,10 @@ class PairedPECTDataset(Dataset):
                 data_dir = "data"
             all_files = sorted(glob.glob(os.path.join(data_dir, "**", "*.tdms"), recursive=True))
             all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
-            # Fallback when no explicit file list is passed (standalone use / tests):
-            # the Base Domain of `split_mode`. Training always passes `file_paths`
-            # explicitly so the pretraining scope is decided in one visible place.
-            file_paths = filter_base_domain_files(all_files, split_mode=self.split_mode)
+            # JEPA pretraining is label-free and uses EVERY file: the
+            # train/val/test partition belongs to the downstream stage, where the
+            # frozen encoder turns each split into latents.
+            file_paths = all_files
         self.file_paths = list(file_paths)
 
         self.grid_size = grid_size

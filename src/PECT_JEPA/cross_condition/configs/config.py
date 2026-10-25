@@ -81,19 +81,14 @@ class CrossConditionConfig:
     # condition-specific contrast instead of being averaged away.
     inv_trim_q: float = 0.75
 
-    # Data split protocol
+    # Data split protocol (DOWNSTREAM only)
     # 'cross_specimen'  : 16-file Base Domain (Corrosion, Rivet_v1) -> 12 train / 4 val, 65 test
     # 'cross_condition' : 24-file Base Domain (Corrosion, Rivet_v1, Rivet_v2) -> 18 train / 6 val, 57 test
+    # JEPA pretraining has no scope flag: it is label-free and always trains on
+    # every TDMS file under data_dir. `split_mode` only defines the downstream
+    # train/val/test roles (fit / telemetry / score) applied through the frozen
+    # encoder.
     split_mode: str = "cross_specimen"
-    # JEPA pretraining scope, explicit instead of the old boolean `use_full_dataset`:
-    # 'base_domain' : pretrain on the Base Domain files (train + val of `split_mode`)
-    #                 -> test files are never seen by the encoder (honest OOD).
-    # 'all'         : pretrain on every TDMS file, INCLUDING the test files
-    #                 (transductive; test metrics are then not comparable to
-    #                 'base_domain' runs).
-    # Downstream data is always the train/val/test partition of `split_mode`
-    # (fit on train, telemetry on val, score on test) regardless of this scope.
-    pretrain_scope: str = "base_domain"
     batch_size: int = 256
     num_partitions: int = 10    # K partitions per macro-cycle
     samples_per_epoch: Optional[int] = None

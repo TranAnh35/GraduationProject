@@ -101,7 +101,9 @@ class TestTrainCLIContract(unittest.TestCase):
         self.assertEqual(a.split_mode, "cross_specimen")
         self.assertIs(a.global_bg_energy_anchor, False)
         self.assertIs(a.inv_predictor, False)
-        self.assertEqual(a.pretrain_scope, "base_domain")
+        # JEPA pretraining has no data-scope flag: it always trains on all files.
+        self.assertFalse(hasattr(a, "pretrain_scope"))
+        self.assertFalse(hasattr(a, "use_full_dataset"))
         self.assertEqual(a.pred_loss_type, "l1")
         self.assertEqual(a.condition_modulation, "cross_attention")
         self.assertEqual(a.anti_hijack_ratio, 0.0)

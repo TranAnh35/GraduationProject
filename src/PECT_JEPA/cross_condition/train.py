@@ -39,8 +39,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size per training step")
     parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions K per macro-cycle (K sub-epochs = 100%% full universe pass)")
-    parser.add_argument("--split_mode", type=str, default="cross_specimen", choices=list(SPLIT_MODES), help="Split protocol: 'cross_specimen' = 16-file Base Domain (Corrosion, Rivet_v1), 'cross_condition' = 24-file Base Domain incl. Rivet_v2 (stratified 6 train + 2 val per specimen)")
-    parser.add_argument("--pretrain_scope", type=str, default="base_domain", choices=["base_domain", "all"], help="JEPA pretraining data: 'base_domain' = Base Domain of --split_mode (train+val, test files never seen); 'all' = every TDMS file INCLUDING test (transductive, test metrics not comparable)")
+    parser.add_argument("--split_mode", type=str, default="cross_specimen", choices=list(SPLIT_MODES), help="Downstream split protocol (telemetry / fit / score roles): 'cross_specimen' = 16-file Base Domain, 'cross_condition' = 24-file Base Domain incl. Rivet_v2. JEPA pretraining itself always uses all TDMS files")
     parser.add_argument("--grid_stride", type=int, default=1, help="Spatial pixel grid stride (1 = exhaustive 100%% all 72,900 pixels per scan, 4 = stride 4 subsampling)")
     parser.add_argument("--star_radii", type=int, nargs=3, default=[2, 4, 7], help="Concentric star ring radii in px (canonical default 2 4 7; legacy 1 3 7)")
     parser.add_argument("--samples_per_epoch", type=int, default=None, help="Explicit samples per epoch (default None: 100%% exhaustive dataset traversal)")
@@ -118,7 +117,6 @@ def main():
         best_reff_floor_ratio=args.best_reff_floor_ratio,
         eval_val_every=args.eval_val_every,
         split_mode=args.split_mode,
-        pretrain_scope=args.pretrain_scope,
         batch_size=args.batch_size,
         grid_stride=args.grid_stride,
         star_radii=tuple(args.star_radii),
@@ -207,54 +205,41 @@ def main():
                     f"early-stopping/divergence guards run on a reduced val set.")
     logger.info(f"Loaded {len(val_scans)} Validation Reference Scans for Real-time Downstream Telemetry.")
 
-    # ---- Data roles: JEPA pretraining set vs downstream split (never a boolean) ----
-    # JEPA pretraining is label-free, so the only question is which FILES the encoder
-    # may see. `pretrain_scope='base_domain'` keeps every test file unseen (honest
-    # OOD); 'all' is transductive and is logged as such.
-    if config.pretrain_scope == "all":
-        pretrain_files = sorted(_all_tdms)
-    else:
-        pretrain_files = sorted(_splits["train"] + _splits["val"])
-    _pretrain, _test = set(pretrain_files), set(_splits["test"])
-    _overlap = _pretrain & _test
-    if _overlap and config.pretrain_scope != "all":
-        raise RuntimeError(
-            f"pretrain_scope='{config.pretrain_scope}' leaks {len(_overlap)} test file(s) into JEPA "
-            f"pretraining (e.g. {sorted(_overlap)[0]}); refusing to start."
-        )
+    # ---- Data roles: JEPA pretraining vs downstream (no scope flag) ----
+    # JEPA pretraining is label-free and always uses EVERY TDMS file. The
+    # train/val/test partition is a downstream-only concept: the frozen encoder
+    # turns each split into latents for the probes. `split_mode` therefore only
+    # selects which files provide telemetry / fit / score below.
+    pretrain_files = sorted(_all_tdms)
     logger.info("Data roles [split_mode=%s, seed=42]:" % config.split_mode)
-    logger.info(f"  JEPA pretrain   ({config.pretrain_scope:11s}): {len(pretrain_files):3d} files")
+    logger.info(f"  JEPA pretrain (all files)        : {len(pretrain_files):3d} files")
     logger.info(f"  Downstream fit  (train)          : {len(_splits['train']):3d} files")
     logger.info(f"  Val telemetry   (val)            : {len(_splits['val']):3d} files")
     logger.info(f"  Test / OOD score(test)           : {len(_splits['test']):3d} files")
-    logger.info(f"  overlap(pretrain, test)          : {len(_overlap):3d} files")
-    if config.pretrain_scope == "all":
-        logger.info(f"[WARN] pretrain_scope='all' is TRANSDUCTIVE: the {len(_test)} test files are seen by "
-                    "the encoder, so test metrics are NOT comparable to pretrain_scope='base_domain' runs.")
+    logger.info("  note: telemetry/test files are inside the pretraining pool, so encoder-side "
+                "OOD is closed by construction; downstream numbers measure probe transfer only.")
     with open(os.path.join(run_dir, "data_manifest.json"), "w", encoding="utf-8") as _f:
         json.dump({
             "split_mode": config.split_mode,
             "seed": 42,
-            "pretrain_scope": config.pretrain_scope,
+            "pretrain": "all_files",
             "counts": {
                 "pretrain": len(pretrain_files),
                 "train": len(_splits["train"]),
                 "val": len(_splits["val"]),
                 "test": len(_splits["test"]),
-                "overlap_pretrain_test": len(_overlap),
             },
-            "pretrain": [os.path.basename(p) for p in pretrain_files],
+            "pretrain_files": [os.path.basename(p) for p in pretrain_files],
             "train": [os.path.basename(p) for p in _splits["train"]],
             "val": [os.path.basename(p) for p in _splits["val"]],
             "test": [os.path.basename(p) for p in _splits["test"]],
         }, _f, indent=1, ensure_ascii=False)
 
-    # Build Paired Dataset across all directed pairs of the pretraining files
-    logger.info(f"Loading JEPA pretraining set [{config.split_mode}, scope={config.pretrain_scope}] "
-                f"(Grid stride: {config.grid_stride}, K={config.num_partitions} partitions)...")
+    # Build Paired Dataset across all directed pairs of every loaded file
+    logger.info(f"Loading JEPA pretraining set (all files, grid stride {config.grid_stride}, "
+                f"K={config.num_partitions} partitions)...")
     dataset = PairedPECTDataset(
         file_paths=pretrain_files,
-        split_mode=config.split_mode,
         grid_stride=config.grid_stride,
         samples_per_epoch=config.samples_per_epoch,
         num_partitions=config.num_partitions,
