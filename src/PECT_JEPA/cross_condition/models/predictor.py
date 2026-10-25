@@ -1,7 +1,7 @@
 """
 Predictor for Cross-Condition PECT-JEPA.
 Predicts masked target representations of Condition B from Condition A context
-and Condition B self-supervised transfer function condition token c_B.
+and the self-supervised transfer-function condition token c_B.
 """
 
 from typing import Optional
@@ -17,7 +17,7 @@ class PredictorBlock(nn.Module):
     1. Self-Attention among Target Queries
     2. Cross-Attention from Target Queries to Context H_context
     3. Feed-Forward MLP
-    Supports AdaLN (Adaptive LayerNorm) modulation from condition token c_B.
+    Optionally AdaLN-modulated by the condition token c_B.
     """
     def __init__(
         self,
@@ -26,12 +26,10 @@ class PredictorBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         modulation: str = "adaln",
-        diffusion_attention: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.modulation = modulation
-        self.diffusion_attention = diffusion_attention
         self.norm_self = nn.LayerNorm(embed_dim)
         self.self_attn = MultiheadSelfAttention(
             embed_dim=embed_dim,
@@ -54,10 +52,6 @@ class PredictorBlock(nn.Module):
             dropout=dropout,
         )
 
-        if self.diffusion_attention:
-            self.gamma_self_log = nn.Parameter(torch.zeros(num_heads))
-            self.gamma_cross_log = nn.Parameter(torch.zeros(num_heads))
-
         if self.modulation == "adaln":
             # AdaLN maps condition vector c_B to scale and shift for norm_self and norm_mlp:
             # (gamma_self, beta_self, gamma_mlp, beta_mlp) in R^{4*D}
@@ -69,64 +63,16 @@ class PredictorBlock(nn.Module):
             # while allowing non-zero initial gradient flow back into condition token representations.
             nn.init.normal_(self.ada_mod[1].weight, std=1e-3)
             nn.init.zeros_(self.ada_mod[1].bias)
-        elif self.modulation == "pure_film":
-            # Pure Multiplicative FiLM (no additive beta bias): only scales norm_self and norm_mlp
-            # by (1 + tanh(gamma)), completely eliminating additive shortcut collapse!
-            self.film_mod = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(embed_dim, 2 * embed_dim),
-            )
-            nn.init.zeros_(self.film_mod[1].weight)
-            nn.init.zeros_(self.film_mod[1].bias)
 
     def forward(
         self,
         target_queries: torch.Tensor,
         H_context: torch.Tensor,
         condition_vec: Optional[torch.Tensor] = None,
-        tgt_coords: Optional[torch.Tensor] = None,
-        ctx_coords: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        attn_bias_self = None
-        attn_bias_cross = None
-        if self.diffusion_attention and tgt_coords is not None:
-            dist_tgt_sq = torch.cdist(tgt_coords, tgt_coords, p=2.0) ** 2  # [B, N_tgt, N_tgt]
-            gamma_s = torch.exp(self.gamma_self_log).view(1, self.num_heads, 1, 1)
-            attn_bias_self = -gamma_s * dist_tgt_sq.unsqueeze(1)
-        if self.diffusion_attention and tgt_coords is not None and ctx_coords is not None:
-            dist_cross_sq = torch.cdist(tgt_coords, ctx_coords, p=2.0) ** 2  # [B, N_tgt, N_ctx]
-            gamma_c = torch.exp(self.gamma_cross_log).view(1, self.num_heads, 1, 1)
-            attn_bias_cross = -gamma_c * dist_cross_sq.unsqueeze(1)
-
-        if self.modulation == "pure_film" and condition_vec is not None:
-            # Multiplicative FiLM: zero additive shift (blocks identity/DC shortcut)
-            c = condition_vec.squeeze(1) if condition_vec.ndim == 3 else condition_vec
-            params = self.film_mod(c)  # [B, 2*D]
-            gamma_s, gamma_m = params.chunk(2, dim=-1)
-            gamma_s = gamma_s.unsqueeze(1)  # [B, 1, D]
-            gamma_m = gamma_m.unsqueeze(1)
-
-            # 1. Scaled Self-Attention
-            norm_q = self.norm_self(target_queries) * (1.0 + torch.tanh(gamma_s))
-            q = target_queries + self.self_attn(norm_q, attn_bias=attn_bias_self)
-
-            # 2. Cross-Attention to Context
-            q = q + self.cross_attn(
-                query=self.norm_cross_q(q),
-                key_value=self.norm_cross_kv(H_context),
-                attn_bias=attn_bias_cross,
-            )
-
-            # 3. Scaled MLP
-            norm_m = self.norm_mlp(q) * (1.0 + torch.tanh(gamma_m))
-            q = q + self.mlp(norm_m)
-            return q
-        elif self.modulation == "adaln" and condition_vec is not None:
+        if self.modulation == "adaln" and condition_vec is not None:
             # condition_vec: [B, 1, D] -> [B, D]
-            if condition_vec.ndim == 3:
-                c = condition_vec.squeeze(1)
-            else:
-                c = condition_vec
+            c = condition_vec.squeeze(1) if condition_vec.ndim == 3 else condition_vec
             params = self.ada_mod(c)  # [B, 4*D]
             gamma_s, beta_s, gamma_m, beta_m = params.chunk(4, dim=-1)
             gamma_s = gamma_s.unsqueeze(1)  # [B, 1, D]
@@ -136,29 +82,27 @@ class PredictorBlock(nn.Module):
 
             # 1. Modulated Self-Attention
             norm_q = self.norm_self(target_queries) * (1.0 + gamma_s) + beta_s
-            q = target_queries + self.self_attn(norm_q, attn_bias=attn_bias_self)
+            q = target_queries + self.self_attn(norm_q)
 
             # 2. Cross-Attention to Context
             q = q + self.cross_attn(
                 query=self.norm_cross_q(q),
                 key_value=self.norm_cross_kv(H_context),
-                attn_bias=attn_bias_cross,
             )
 
             # 3. Modulated MLP
             norm_m = self.norm_mlp(q) * (1.0 + gamma_m) + beta_m
             q = q + self.mlp(norm_m)
             return q
-        else:
-            # Standard unmodulated forward
-            q = target_queries + self.self_attn(self.norm_self(target_queries), attn_bias=attn_bias_self)
-            q = q + self.cross_attn(
-                query=self.norm_cross_q(q),
-                key_value=self.norm_cross_kv(H_context),
-                attn_bias=attn_bias_cross,
-            )
-            q = q + self.mlp(self.norm_mlp(q))
-            return q
+
+        # Standard unmodulated forward
+        q = target_queries + self.self_attn(self.norm_self(target_queries))
+        q = q + self.cross_attn(
+            query=self.norm_cross_q(q),
+            key_value=self.norm_cross_kv(H_context),
+        )
+        q = q + self.mlp(self.norm_mlp(q))
+        return q
 
 
 class CrossConditionPredictor(nn.Module):
@@ -176,12 +120,12 @@ class CrossConditionPredictor(nn.Module):
         if config is None:
             config = CrossConditionConfig()
         self.config = config
-        self.modulation = getattr(config, "condition_modulation", "query_projection")
+        self.modulation = getattr(config, "condition_modulation", "cross_attention")
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        # When Option A continuous_pos_embed is active, decouple predictor mask_token
+        # With continuous_pos_embed active, decouple the predictor mask_token
         # query projection from tokenizer.pos_mlp so encoder coordinate embeddings
         # are trained purely by ContextEncoder without mask_token gradient pollution.
         if getattr(config, "continuous_pos_embed", False):
@@ -191,17 +135,6 @@ class CrossConditionPredictor(nn.Module):
         else:
             self.target_pos_proj = None
 
-        # Condition projection layer for query conditioning (only when condition token is active)
-        if getattr(config, "use_condition_token", False) and self.modulation == "query_projection":
-            self.cond_query_proj = nn.Sequential(
-                nn.Linear(config.embed_dim, config.embed_dim),
-                nn.GELU(),
-                nn.Linear(config.embed_dim, config.embed_dim),
-            )
-        else:
-            self.cond_query_proj = None
-
-        diff_attn = bool(getattr(config, "diffusion_attention", False))
         self.blocks = nn.ModuleList([
             PredictorBlock(
                 embed_dim=config.embed_dim,
@@ -209,31 +142,16 @@ class CrossConditionPredictor(nn.Module):
                 mlp_ratio=config.mlp_ratio,
                 dropout=config.dropout,
                 modulation=self.modulation,
-                diffusion_attention=diff_attn,
             )
             for _ in range(config.predictor_depth)
         ])
-        self.subspace_norm = bool(getattr(config, "subspace_norm", False)) and bool(
-            getattr(config, "latent_disentanglement", False)
-        )
-        if self.subspace_norm:
-            self.carrier_dim = int(getattr(config, "carrier_dim", config.embed_dim // 2))
-            self.scattering_dim = int(getattr(config, "scattering_dim", config.embed_dim - self.carrier_dim))
-            self.norm = None
-            self.norm_c = nn.LayerNorm(self.carrier_dim)
-            self.norm_s = nn.LayerNorm(self.scattering_dim, bias=False)
-        else:
-            self.norm = nn.LayerNorm(config.embed_dim)
-            self.norm_c = None
-            self.norm_s = None
+        self.norm = nn.LayerNorm(config.embed_dim)
 
     def forward(
         self,
         H_context: torch.Tensor,
         target_pos: torch.Tensor,
         condition_token: Optional[torch.Tensor] = None,
-        tgt_coords: Optional[torch.Tensor] = None,
-        ctx_coords: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N_tgt, D = target_pos.shape
         tgt_pos_q = self.target_pos_proj(target_pos.detach()) if self.target_pos_proj is not None else target_pos
@@ -242,35 +160,15 @@ class CrossConditionPredictor(nn.Module):
         H_context_kv = H_context
         cond_for_block = None
         if condition_token is not None:
-            if self.modulation == "query_projection":
-                # Condition B is projected into the query representations
-                # Queries specify: "At position (r,c), under Condition B, what is the field?"
-                # Key/Values remain strictly H_context (16 spatial probes), forcing attention to spatial diffusion!
-                c_proj = self.cond_query_proj(condition_token) if self.cond_query_proj is not None else condition_token
-                queries = queries + c_proj
-            elif self.modulation == "cross_attention":
-                if condition_token.ndim == 2:
-                    c = condition_token.unsqueeze(1)
-                else:
-                    c = condition_token
+            if self.modulation == "cross_attention":
+                # c_B joins the key/value memory: queries must read the target
+                # location out of the 16 spatial context probes *through* c_B.
+                c = condition_token.unsqueeze(1) if condition_token.ndim == 2 else condition_token
                 H_context_kv = torch.cat([H_context, c], dim=1)
-            elif self.modulation == "additive":
-                queries = queries + condition_token
-            elif self.modulation in ("adaln", "pure_film"):
+            else:
                 cond_for_block = condition_token
 
         q = queries
         for blk in self.blocks:
-            q = blk(
-                target_queries=q,
-                H_context=H_context_kv,
-                condition_vec=cond_for_block,
-                tgt_coords=tgt_coords,
-                ctx_coords=ctx_coords,
-            )
-
-        if self.subspace_norm:
-            q_c = self.norm_c(q[..., :self.carrier_dim])
-            q_s = self.norm_s(q[..., self.carrier_dim:])
-            return torch.cat([q_c, q_s], dim=-1)
+            q = blk(target_queries=q, H_context=H_context_kv, condition_vec=cond_for_block)
         return self.norm(q)

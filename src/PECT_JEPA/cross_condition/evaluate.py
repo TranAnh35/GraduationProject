@@ -55,13 +55,12 @@ from src.PECT_JEPA.cross_condition.data.preprocessing import (
     get_canonical_transformer,
 )
 from src.PECT_JEPA.cross_condition.data.split import (
+    SPLIT_MODES,
     extract_file_metadata,
     get_canonical_train_val_test_splits,
     get_canonical_shift_files,
-    is_base_domain_file,
 )
 from src.PECT_JEPA.cross_condition.downstream.test_time_adaptation import (
-    whiten_matrix,
     unsup_trimmed_bg_stats,
     TestTimeSelfCalibrator,
 )
@@ -167,6 +166,8 @@ def parse_args():
     parser.add_argument("--eval_splits", nargs="+", default=["train", "val", "test"], help="Splits to evaluate ('train', 'val', 'test')")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     parser.add_argument("--batch_size", type=int, default=8192, help="Batch size for feature extraction")
+    parser.add_argument("--split_mode", type=str, default="cross_specimen", choices=list(SPLIT_MODES), help="Split protocol: 'cross_specimen' (16-file Base Domain) or 'cross_condition' (24-file Base Domain incl. Rivet_v2)")
+    parser.add_argument("--sizing_log_target", type=lambda v: v.lower() == "true", default=True, help="Fit fallback sizing readouts on log1p(diameter) and invert at inference")
     parser.add_argument("--prefetch", type=lambda v: v.lower() == "true", default=True, help="Overlap next-file TDMS load with current-file GPU/CPU processing")
     parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True, help="Enable unsupervised spatial self-calibration (zero-centering C-scan against sound-metal background median)")
     parser.add_argument("--downstream_dir", type=str, default=None, help="Directory containing pre-trained downstream models (standard_probes.joblib)")
@@ -288,16 +289,19 @@ def evaluate_canonical_test_time_adaptation(
     device: torch.device,
     tta_trim_ratio: float = 0.75,
     tta_shrinkage: float = 1e-2,
+    split_mode: str = "cross_specimen",
     cached_raw_heatmaps: Optional[Dict[str, np.ndarray]] = None,
     async_saver: Optional[AsyncPlotSaver] = None,
 ) -> Dict[str, Any]:
     """
-    Evaluates Test-Time Adaptation (TTA) Suite across the 4 canonical single-variable domain shifts:
-    - cross_sensor:   Source (16 Base files) -> Target (8 TMR-only files)
-    - cross_waveform: Source (16 Base files) -> Target (8 Chirp-only files)
-    - cross_specimen: Source (16 Base files) -> Target (8 Rivet_v2-only files)
-    - cross_liftoff:  Source (16 Base files) -> Target (8 z2-only files)
-    
+    Evaluates Test-Time Adaptation (TTA) Suite across the canonical single-variable shifts:
+    - cross_sensor:   Source (Base Domain) -> Target (TMR-only files)
+    - cross_waveform: Source (Base Domain) -> Target (Chirp-only files)
+    - cross_specimen: Source (16 Base files) -> Target (8 Rivet_v2-only files);
+                      only defined under split_mode='cross_specimen' (Rivet_v2 is
+                      part of the source domain under 'cross_condition').
+    - cross_liftoff:  Source (Base Domain) -> Target (z2-only files)
+
     Structure:
       4. Test Time Adaptation/<shift>/visualizations/
       4. Test Time Adaptation/<shift>/tta_summary.csv
@@ -321,7 +325,10 @@ def evaluate_canonical_test_time_adaptation(
     calibrator = TestTimeSelfCalibrator(keep_q=tta_trim_ratio, eps=tta_shrinkage)
 
     for shift in canonical_shifts:
-        src_files, tgt_files = get_canonical_shift_files(all_files, shift)
+        if shift == "cross_specimen" and split_mode == "cross_condition":
+            print(f"\n[SKIP] shift '{shift}': Rivet_v2 belongs to the Base Domain under split_mode='cross_condition'.", flush=True)
+            continue
+        src_files, tgt_files = get_canonical_shift_files(all_files, shift, split_mode=split_mode)
         shift_out_dir = os.path.join(out_dir, "4. Test Time Adaptation", shift)
         os.makedirs(shift_out_dir, exist_ok=True)
 
@@ -613,7 +620,7 @@ def main():
     all_files = sorted(glob.glob(os.path.join(args.data_dir, "**", "*.tdms"), recursive=True))
     all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
 
-    splits = get_canonical_train_val_test_splits(all_files, val_files_count=4, seed=42)
+    splits = get_canonical_train_val_test_splits(all_files, split_mode=args.split_mode, seed=42)
     # Pre-build the canonical transformer on the main thread so background
     # prefetch workers never race on the lazy global.
     get_canonical_transformer()
@@ -756,12 +763,14 @@ def main():
             y_det=y_train_det,
             X_size=X_train_size_raw,
             y_size=y_train_size,
+            size_log_target=args.sizing_log_target,
         )
         tta_readouts = suite.fit_global_readouts(
             X_det=X_train_det_tta,
             y_det=y_train_det,
             X_size=X_train_size_tta,
             y_size=y_train_size,
+            size_log_target=args.sizing_log_target,
         )
         global_readouts = {
             "scaler_det": raw_readouts["scaler_det"],
@@ -1081,6 +1090,7 @@ def main():
             device=device,
             tta_trim_ratio=args.tta_trim_ratio,
             tta_shrinkage=args.tta_shrinkage,
+            split_mode=args.split_mode,
             cached_raw_heatmaps=cached_raw_heatmaps,
             async_saver=async_saver,
         )
@@ -1137,13 +1147,6 @@ def main():
         }
 
     def _effective_latent_dim(cfg) -> int:
-        if getattr(cfg, "unified_latent", False) or not getattr(cfg, "latent_disentanglement", False):
-            return int(cfg.embed_dim * 2)
-        lt = getattr(cfg, "downstream_latent_type", "scattering")
-        if lt == "scattering":
-            return int(getattr(cfg, "scattering_dim", cfg.embed_dim // 2) * 2)
-        if lt == "carrier":
-            return int(getattr(cfg, "carrier_dim", cfg.embed_dim // 2) * 2)
         return int(cfg.embed_dim * 2)
 
     _test_rows = [r for r in master_results if r["split"] == "test"]
@@ -1193,11 +1196,10 @@ def main():
                        "per-axis claims. latent_config records the effective "
                        "representation and calibration flags."),
         "latent_config": {
-            "downstream_latent_type": getattr(config, "downstream_latent_type", None),
-            "latent_disentanglement": bool(getattr(config, "latent_disentanglement", False)),
-            "unified_latent": bool(getattr(config, "unified_latent", False)),
+            "split_mode": args.split_mode,
             "self_calibration": bool(getattr(args, "self_calibration", False)),
             "eval_tta": bool(getattr(args, "eval_tta", False)),
+            "sizing_log_target": bool(getattr(args, "sizing_log_target", False)),
             "latent_dim": _effective_latent_dim(config),
         },
         **by_axis_test,

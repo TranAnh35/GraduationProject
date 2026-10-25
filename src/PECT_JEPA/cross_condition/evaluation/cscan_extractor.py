@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from ..data.topologies import ConcentricStarTopology
-from ..models.cross_condition_jepa import CrossConditionJEPA
+from ..models.cross_condition_jepa import CrossConditionJEPA, corner_background_energy
 
 
 class CScanFeatureExtractor:
@@ -33,6 +33,9 @@ class CScanFeatureExtractor:
         _star_radii = tuple(getattr(model.config, "star_radii", (1, 3, 7)))
         self.topology = ConcentricStarTopology(star_radii=_star_radii)
         self.offsets = self.topology.offsets  # [25, 2] in grid units
+        # Global background anchor must use the SAME corner-patch energy as the
+        # paired dataset, otherwise the time branch sees a different Delta E scale.
+        self.use_bg_anchor = bool(getattr(model.config, "global_bg_energy_anchor", False))
         self._cached_coord_batches = {}
 
     def _get_coord_batches(self, H: int, W: int, pad: int):
@@ -77,16 +80,11 @@ class CScanFeatureExtractor:
 
         N_pts, batches = self._get_coord_batches(H, W, pad)
 
-        if getattr(self.model.config, "latent_disentanglement", False):
-            latent_type = getattr(self.model.config, "downstream_latent_type", "scattering")
-            if latent_type == "scattering":
-                embed_dim = getattr(self.model.config, "scattering_dim", self.model.config.embed_dim // 2) * 2
-            elif latent_type == "carrier":
-                embed_dim = getattr(self.model.config, "carrier_dim", self.model.config.embed_dim // 2) * 2
-            else:
-                embed_dim = self.model.config.embed_dim * 2
-        else:
-            embed_dim = self.model.config.embed_dim * 2
+        embed_dim = self.model.config.embed_dim * 2
+
+        bg_energy = None
+        if self.use_bg_anchor:
+            bg_energy = corner_background_energy(cscan)
 
         out_features = np.zeros((N_pts, embed_dim), dtype=np.float32)
 
@@ -107,7 +105,13 @@ class CScanFeatureExtractor:
             x_tensor = x_cpu.to(self.device, non_blocking=(self.device.type == "cuda"))
 
             with torch.amp.autocast("cuda", enabled=self.use_amp and self.device.type == "cuda"):
-                feats = self.model.extract_features(x_tensor)  # [B, 2*D]
+                bg_tensor = None
+                if bg_energy is not None:
+                    bg_tensor = torch.full(
+                        (end_idx - start_idx,), float(bg_energy),
+                        dtype=torch.float32, device=self.device,
+                    )
+                feats = self.model.extract_features(x_tensor, bg_ref_energy=bg_tensor)  # [B, 2*D]
 
             out_features[start_idx:end_idx] = feats.cpu().float().numpy()
 

@@ -159,12 +159,9 @@ class CrossConditionTrainer:
             "pred_loss": [],
             "var_loss": [],
             "cov_loss": [],
+            "aux_loss": [],
             "inv_loss": [],
-            "inv_sound_frac": [],
-            "xcov_loss": [],
-            "zc_cond_loss": [],
-            "offset_loss": [],
-            "pool_var_loss": [],
+            "inv_keep_frac": [],
             "effective_rank": [],
             "lr": [],
             "val_loss": [],
@@ -184,8 +181,8 @@ class CrossConditionTrainer:
 
         No cross-condition pairs exist at eval time, so each val scan
         predicts itself: context probes -> core target probes within the
-        same scan (A == B self-pair). Uses the same scattering L1 objective
-        as training in disentangled mode. Returns mean over val scans.
+        same scan (A == B self-pair). Uses the same prediction objective
+        as training. Returns mean over val scans.
         """
         if not self.val_scans:
             return 0.0
@@ -313,7 +310,7 @@ class CrossConditionTrainer:
             self.history = ckpt["history"]
             # Backward compat: pad any missing/short key with zeros so resumed
             # history lists stay aligned (old ckpts lack val_loss, inv_loss,
-            # xcov_loss, val_ap, ...). Padding uses total_loss length as ref.
+            # aux_loss, val_ap, ...). Padding uses total_loss length as ref.
             n = len(self.history.get("total_loss", []))
             for k, v in self.history.items():
                 if isinstance(v, list) and len(v) < n:
@@ -337,16 +334,12 @@ class CrossConditionTrainer:
         LOG_EVERY = 10
         acc_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_pred = torch.zeros((), device=self.device, dtype=torch.float64)
-        acc_carrier = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_aux = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_var = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_cov = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_inv = torch.zeros((), device=self.device, dtype=torch.float64)
-        acc_sndf = torch.zeros((), device=self.device, dtype=torch.float64)
-        acc_xcov = torch.zeros((), device=self.device, dtype=torch.float64)
-        acc_zc = torch.zeros((), device=self.device, dtype=torch.float64)
-        acc_off = torch.zeros((), device=self.device, dtype=torch.float64)
-        acc_pool = torch.zeros((), device=self.device, dtype=torch.float64)
-        disp = {"loss": float("nan"), "pred": float("nan"), "car": float("nan"),
+        acc_keep = torch.zeros((), device=self.device, dtype=torch.float64)
+        disp = {"loss": float("nan"), "pred": float("nan"), "aux": float("nan"),
                 "var": float("nan"), "inv": float("nan")}
 
         # Linear Warmup + Cosine Annealing learning rate schedule
@@ -371,8 +364,6 @@ class CrossConditionTrainer:
         # P0-1 curriculum scales for this epoch (1.0 = legacy unscheduled path)
         inv_scale = _ramp_scale(epoch, getattr(self.config, "inv_start_epoch", 1),
                                 getattr(self.config, "inv_ramp_epochs", 0))
-        xcov_scale = _ramp_scale(epoch, getattr(self.config, "xcov_start_epoch", 1),
-                                 getattr(self.config, "xcov_ramp_epochs", 0))
 
         pbar = tqdm(
             loader,
@@ -395,13 +386,6 @@ class CrossConditionTrainer:
             scan_id = batch.get("scan_id")
             if scan_id is not None:
                 scan_id = scan_id.to(self.device, non_blocking=True)
-            # Stage-0 oracle mask (present only when the dataset was built
-            # with include_sound_mask=True; ignored unless inv_oracle_mask).
-            inv_sound_mask = None
-            if getattr(self.config, "inv_oracle_mask", False):
-                _sm = batch.get("sound_mask")
-                if _sm is not None:
-                    inv_sound_mask = _sm.to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -413,8 +397,6 @@ class CrossConditionTrainer:
                     ref_a=ref_a,
                     scan_id=scan_id,
                     inv_scale=inv_scale,
-                    xcov_scale=xcov_scale,
-                    inv_sound_mask=inv_sound_mask,
                 )
                 loss = outputs["total_loss"]
 
@@ -432,36 +414,25 @@ class CrossConditionTrainer:
             # Sync-free accumulation (detach keeps the graph released)
             acc_loss += loss.detach().double()
             acc_pred += outputs["pred_loss"].detach().double()
-            _car = outputs.get("carrier_loss", None)
-            acc_carrier += _car.detach().double() if _car is not None else 0.0
+            acc_aux += outputs["aux_loss"].detach().double()
             acc_var += outputs["var_loss"].detach().double()
             acc_cov += outputs["cov_loss"].detach().double()
-            _inv = outputs.get("inv_loss", None)
-            acc_inv += _inv.detach().double() if _inv is not None else 0.0
-            _sndf = outputs.get("inv_sound_frac", None)
-            acc_sndf += _sndf.detach().double() if _sndf is not None else 0.0
-            _xc = outputs.get("xcov_loss", None)
-            acc_xcov += _xc.detach().double() if _xc is not None else 0.0
-            _zc = outputs.get("zc_cond_loss", None)
-            acc_zc += _zc.detach().double() if _zc is not None else 0.0
-            _off = outputs.get("offset_loss", None)
-            acc_off += _off.detach().double() if _off is not None else 0.0
-            _pl = outputs.get("pool_var_loss", None)
-            acc_pool += _pl.detach().double() if _pl is not None else 0.0
+            acc_inv += outputs["inv_loss"].detach().double()
+            acc_keep += outputs["inv_keep_frac"].detach().double()
 
             if batch_idx < 5:
                 sample_reps.append(outputs["H_ctx_a"].detach().cpu())
 
             # Refresh displayed values at most every LOG_EVERY batches
             if batch_idx % LOG_EVERY == 0:
-                snap = torch.stack([acc_loss, acc_pred, acc_carrier, acc_var, acc_inv]).cpu() / (batch_idx + 1)
+                snap = torch.stack([acc_loss, acc_pred, acc_aux, acc_var, acc_inv]).cpu() / (batch_idx + 1)
                 snap_list = snap.tolist()
-                disp = {"loss": snap_list[0], "pred": snap_list[1], "car": snap_list[2],
+                disp = {"loss": snap_list[0], "pred": snap_list[1], "aux": snap_list[2],
                         "var": snap_list[3], "inv": snap_list[4]}
             pbar.set_postfix({
                 "loss": f"{disp['loss']:.4f}",
                 "pred": f"{disp['pred']:.4f}",
-                "car": f"{disp['car']:.4f}",
+                "aux": f"{disp['aux']:.4f}",
                 "var": f"{disp['var']:.4f}",
                 "inv": f"{disp['inv']:.4f}",
                 "lr": f"{lr:.2e}",
@@ -469,15 +440,11 @@ class CrossConditionTrainer:
 
         avg_loss = (acc_loss / total_batches).item()
         avg_pred = (acc_pred / total_batches).item()
-        avg_carrier = (acc_carrier / total_batches).item()
+        avg_aux = (acc_aux / total_batches).item()
         avg_var = (acc_var / total_batches).item()
         avg_cov = (acc_cov / total_batches).item()
         avg_inv = (acc_inv / total_batches).item()
-        avg_sndf = (acc_sndf / total_batches).item()
-        avg_xcov = (acc_xcov / total_batches).item()
-        avg_zc = (acc_zc / total_batches).item()
-        avg_off = (acc_off / total_batches).item()
-        avg_pool = (acc_pool / total_batches).item()
+        avg_keep = (acc_keep / total_batches).item()
 
         all_reps = torch.cat(sample_reps, dim=0)
         svd_res = compute_svd_diagnostics(all_reps)
@@ -486,15 +453,11 @@ class CrossConditionTrainer:
             "epoch": epoch,
             "total_loss": avg_loss,
             "pred_loss": avg_pred,
-            "carrier_loss": avg_carrier,
+            "aux_loss": avg_aux,
             "var_loss": avg_var,
             "cov_loss": avg_cov,
             "inv_loss": avg_inv,
-            "inv_sound_frac": avg_sndf,
-            "xcov_loss": avg_xcov,
-            "zc_cond_loss": avg_zc,
-            "offset_loss": avg_off,
-            "pool_var_loss": avg_pool,
+            "inv_keep_frac": avg_keep,
             "effective_rank": svd_res["effective_rank"],
             "lr": lr,
         }
@@ -570,7 +533,7 @@ class CrossConditionTrainer:
             f"\n=======================================================\n"
             f"Starting Cross-Condition JEPA Training{cycle_info}\n"
             f"Epochs: {self.start_epoch} -> {total_epochs} | Batches/Epoch: {batches_per_epoch:,} | Batch Size: {self.config.batch_size}\n"
-            f"Samples/Epoch: {len(dataset):,} across 112 Directed Pairs\n"
+            f"Samples/Epoch: {len(dataset):,} across {len(dataset.directed_pairs):,} Directed Pairs\n"
             f"Device: {self.device} | AMP Mixed Precision: {self.config.mixed_precision}\n"
             f"=======================================================\n"
         )

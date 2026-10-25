@@ -17,27 +17,22 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .split import extract_file_metadata
+from .split import extract_file_metadata, filter_base_domain_files
 from .topologies import get_spatial_topology_offsets
 from .preprocessing import load_canonical_cscan_from_tdms, get_canonical_transformer
 
 
-def context_sound_mask(gt_mask: np.ndarray, r: int, c: int,
-                       offsets: np.ndarray, n_context: int = 16) -> np.ndarray:
-    """Oracle sound mask for the N outer-ring context probes of a patch.
+def corner_median_ref_patch(cscan: np.ndarray) -> np.ndarray:
+    """Defect-free background patch: pixel-wise median of the 4 corner patches.
 
-    Context probes are the LAST n_context of the 25 star offsets (idx
-    9..24: core 0..8 are targets). Returns bool [n_context]: True where GT
-    says sound-metal (gt == 0). Defect (1) AND ignore (<0) tokens are
-    excluded. Coordinates clipped to mask bounds. Pure function (no TDMS)
-    so Stage-0 mask geometry is directly unit-testable.
+    Measured 0% GT defect pixels on Corrosion / Rivet_v1 / Rivet_v2, >=8.5 px
+    from the nearest defect, and robust to each file's canonical rotation/flip.
+    The legacy [10:15, 10:15] window sits inside the first corrosion defect site
+    (96% GT defect pixels), which poisons the condition token c_B.
     """
-    gt = np.asarray(gt_mask)
-    H, W = gt.shape[:2]
-    ctx_off = np.asarray(offsets)[-n_context:]
-    rr = np.clip(int(r) + ctx_off[:, 0].astype(int), 0, H - 1)
-    cc = np.clip(int(c) + ctx_off[:, 1].astype(int), 0, W - 1)
-    return (gt[rr, cc] == 0)
+    corners = (cscan[0:5, 0:5, :], cscan[0:5, -5:, :],
+               cscan[-5:, 0:5, :], cscan[-5:, -5:, :])
+    return np.median(np.stack(corners, axis=0), axis=0).astype(cscan.dtype)
 
 
 class PairedPECTDataset(Dataset):
@@ -51,6 +46,7 @@ class PairedPECTDataset(Dataset):
         file_paths: Optional[List[str]] = None,
         data_dir: Optional[str] = None,
         use_full_dataset: bool = False,
+        split_mode: str = "cross_specimen",
         grid_stride: int = 4,
         samples_per_epoch: Optional[int] = None,
         num_partitions: int = 10,
@@ -60,16 +56,13 @@ class PairedPECTDataset(Dataset):
         temporal_samples: int = 128,
         transform_csv: str = "data/ground_truth/raw_tdms_rotate_crop.csv",
         seed: int = 42,
-        include_sound_mask: bool = False,
-        dynamic_condition_token: bool = False,
-        ref_patch_mode: str = "legacy",
     ):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
         self.seed = seed
         self.use_full_dataset = bool(use_full_dataset)
+        self.split_mode = str(split_mode)
         import glob
-        from .split import filter_base_domain_files
 
         if file_paths is None:
             if data_dir is None or not os.path.isdir(data_dir):
@@ -84,33 +77,12 @@ class PairedPECTDataset(Dataset):
             if self.use_full_dataset:
                 file_paths = all_files
             else:
-                file_paths = filter_base_domain_files(all_files)
+                file_paths = filter_base_domain_files(all_files, split_mode=self.split_mode)
 
         self.grid_size = grid_size
         self.temporal_samples = temporal_samples
         self.grid_stride = max(1, int(grid_stride))
         self.rng = random.Random(seed)
-
-        # Stage-0 oracle sound masks (selective inv): per-specimen GT loaded
-        # once here (2 x 270x270, trivial RAM). Only consumed when the model
-        # flag inv_oracle_mask is on; otherwise __getitem__ skips the lookup.
-        self.include_sound_mask = bool(include_sound_mask)
-        self.dynamic_condition_token = bool(dynamic_condition_token)
-        self.ref_patch_mode = str(ref_patch_mode)
-        _gt_base = data_dir if data_dir is not None else "data"
-        self.gt_by_specimen: Dict[str, np.ndarray] = {}
-        if self.include_sound_mask:
-            for _spec, _rel in (
-                ("Corrosion", os.path.join("ground_truth", "corrosion", "corrosion_gt_mask.npy")),
-                ("Rivet_v1", os.path.join("ground_truth", "rivet_v1", "rivet_v1_gt_mask.npy")),
-                ("Rivet_v2", os.path.join("ground_truth", "rivet_v2", "rivet_v2_gt_mask.npy")),
-            ):
-                _p = os.path.join(_gt_base, _rel)
-                if os.path.exists(_p):
-                    self.gt_by_specimen[_spec] = np.load(_p)
-            if len(self.gt_by_specimen) < 2:
-                print(f"[WARN] include_sound_mask=True but only {len(self.gt_by_specimen)} GT masks found; "
-                      f"samples without GT fall back to all-sound (blind inv).")
 
         self.offsets = get_spatial_topology_offsets(topology, star_radii, grid_size)
         self.max_off = int(np.max(np.abs(self.offsets)))
@@ -138,18 +110,6 @@ class PairedPECTDataset(Dataset):
             )
             sY, sX, C = cscan.shape
             padded = np.pad(cscan, ((_pad, _pad), (_pad, _pad), (0, 0)), mode="edge")
-            # Background "sound metal" reference patch consumed by the condition token.
-            # 'legacy': top-left 5x5, which sits inside the first defect site (15,15):
-            #   measured 96% GT defect pixels on Corrosion (audit_ref_patch.py).
-            # 'corner_median': pixel-wise median of the 4 corner patches -- 0% defect
-            #   pixels on all three specimens, >=8.5 px from the nearest defect, and
-            #   robust to the canonical rotation/flip of each file.
-            if ref_patch_mode == "corner_median":
-                _corners = (cscan[0:5, 0:5, :], cscan[0:5, -5:, :],
-                            cscan[-5:, 0:5, :], cscan[-5:, -5:, :])
-                ref_patch = np.median(np.stack(_corners, axis=0), axis=0).astype(cscan.dtype)
-            else:
-                ref_patch = cscan[10:15, 10:15, :].copy()
             return fpath, meta, {
                 "file_path": fpath,
                 "meta": meta,
@@ -157,7 +117,7 @@ class PairedPECTDataset(Dataset):
                 "sX": sX,
                 "C": C,
                 "padded": padded,
-                "ref_patch": ref_patch,
+                "ref_patch": corner_median_ref_patch(cscan),
             }
 
         max_workers = min(4, max(1, len(file_paths)))
@@ -272,41 +232,11 @@ class PairedPECTDataset(Dataset):
         patch_a = scan_a["padded"][sample_r, sample_c, :].reshape(self.grid_size, self.grid_size, -1)
         patch_b = scan_b["padded"][sample_r, sample_c, :].reshape(self.grid_size, self.grid_size, -1)
 
-        if self.dynamic_condition_token:
-            # Dynamically sample a 5x5 patch from the margin [10:35, 10:35].
-            # NOTE: for Corrosion the first defect site is (15,15) with a radius that
-            # reaches rows/cols 10..14, so this window is NOT defect-free either
-            # (audit_ref_patch.py). Prefer ref_patch_mode='corner_median' instead.
-            # Identical physical coordinates for both Condition A and Condition B:
-            ref_r = np.random.randint(10, 35) + self.pad
-            ref_c = np.random.randint(10, 35) + self.pad
-            ref_patch_a = scan_a["padded"][ref_r : ref_r + self.grid_size, ref_c : ref_c + self.grid_size, :]
-            ref_patch_b = scan_b["padded"][ref_r : ref_r + self.grid_size, ref_c : ref_c + self.grid_size, :]
-        else:
-            ref_patch_a = scan_a["ref_patch"]
-            ref_patch_b = scan_b["ref_patch"]
-
-        sample = {
+        return {
             "x_a": torch.from_numpy(patch_a).float(),
             "x_b": torch.from_numpy(patch_b).float(),
-            "ref_a": torch.from_numpy(ref_patch_a).float(),
-            "ref_b": torch.from_numpy(ref_patch_b).float(),
+            "ref_a": torch.from_numpy(scan_a["ref_patch"]).float(),
+            "ref_b": torch.from_numpy(scan_b["ref_patch"]).float(),
             "coord": torch.tensor([r, c], dtype=torch.long),
             "scan_id": torch.tensor(pair_idx, dtype=torch.long),
         }
-
-        # Stage-0 oracle: sound mask over all 25 star probes (0..24), resolved
-        # from the A-scan's specimen GT at the patch's probe coordinates.
-        # Emitting [25] allows CrossConditionJEPA.forward to index via ctx_idx
-        # for both legacy fixed masking (ctx_idx = 9..24) and contiguous_masking.
-        # Missing GT -> all-True (blind inv for that sample, never a crash).
-        if self.include_sound_mask:
-            _gt = self.gt_by_specimen.get(scan_a["meta"]["specimen"])
-            n_probes = len(self.offsets)
-            if _gt is not None:
-                _m = context_sound_mask(_gt, int(r), int(c), self.offsets, n_context=n_probes)
-            else:
-                _m = np.ones(n_probes, dtype=bool)
-            sample["sound_mask"] = torch.from_numpy(_m)
-
-        return sample

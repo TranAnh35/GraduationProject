@@ -14,7 +14,9 @@ import json
 import warnings
 from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
+from scipy import ndimage as ndi
 
+from ..downstream.test_time_adaptation import whiten_matrix
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.metrics import (
@@ -68,6 +70,80 @@ def compute_otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
 
     best_idx = int(np.argmax(sigma_b_sq))
     return float(bin_centers[best_idx])
+
+
+HALO_RADIUS_PX = 2       # boundary ring excluded from readout fitting/mining
+HARD_NEG_PER_SCAN = 2000  # top P0 false alarms mined as hard negatives per scan
+
+
+def halo_ring(gt_mask: np.ndarray, radius: int = HALO_RADIUS_PX) -> np.ndarray:
+    """Boolean ring around defect boundaries (dilated defect minus defect).
+
+    Halo pixels are partial-volume mixtures: the CAD mask calls them sound while
+    the measured field already responds to the flaw. Mining them as confident
+    negatives taught P2 to suppress defect edges (train AUC collapsed to 0.37),
+    so both probe fitting and hard-negative mining skip this ring.
+    """
+    defect = (gt_mask == 1)
+    if not np.any(defect):
+        return np.zeros_like(defect, dtype=bool)
+    dil = ndi.binary_dilation(defect, iterations=int(max(1, radius)))
+    return (dil & ~defect)
+
+
+def whiten_stats(bg: np.ndarray, eps: float = 1e-4) -> Tuple[np.ndarray, np.ndarray]:
+    """(mu, W) with W = (cov + eps*I)^(-1/2) estimated on a background pixel set."""
+    bg = np.asarray(bg, dtype=np.float64)
+    mu = bg.mean(axis=0).astype(np.float32)
+    cov = np.cov(bg, rowvar=False)
+    return mu, whiten_matrix(cov, eps=eps)
+
+
+def unsup_bg_stats(flat_z: np.ndarray, valid_mask: Optional[np.ndarray] = None,
+                   eps: float = 1e-4) -> Tuple[np.ndarray, np.ndarray]:
+    """Background stats over ALL valid pixels (no GT, no anomaly cut)."""
+    zv = flat_z[valid_mask] if valid_mask is not None else flat_z
+    return whiten_stats(zv, eps=eps)
+
+
+def scan_adaptive_features(
+    flat_z: np.ndarray,
+    valid_mask: Optional[np.ndarray] = None,
+    keep_q: float = 0.75,
+    eps: float = 1e-2,
+) -> np.ndarray:
+    """P1u_trim_s2: per-scan unsupervised background whitening (deployable default).
+
+    Estimates (mu, W) from the lowest-|energy| keep_q fraction of valid pixels
+    (zero GT labels) and returns (z - mu) @ W. This is the same estimator as the
+    official TTA path, so training and inference cannot drift apart.
+    """
+    from ..downstream.test_time_adaptation import unsup_trimmed_bg_stats
+
+    mu, W = unsup_trimmed_bg_stats(flat_z, keep_q=keep_q, eps=eps, valid_mask=valid_mask)
+    return (flat_z - mu).dot(W).astype(np.float32)
+
+
+def mine_hard_negatives(
+    gt_mask: np.ndarray,
+    scores: np.ndarray,
+    k: int = HARD_NEG_PER_SCAN,
+    halo_radius: int = HALO_RADIUS_PX,
+) -> np.ndarray:
+    """P2h: indices of the k highest-scoring sound pixels, halo ring excluded.
+
+    `scores` is a per-pixel false-alarm score from the base probe (e.g. P0
+    predicted probability). Mining these structured background regions as
+    negatives teaches the probe to suppress scan-specific clutter instead of
+    memorising it as defect evidence.
+    """
+    y = gt_mask.reshape(-1)
+    ring = halo_ring(gt_mask, radius=halo_radius).reshape(-1)
+    sound = np.where((y == 0) & ~ring)[0]
+    if len(sound) == 0:
+        return np.zeros(0, dtype=np.int64)
+    kk = min(int(k), len(sound))
+    return sound[np.argpartition(-np.asarray(scores).reshape(-1)[sound], kk - 1)[:kk]]
 
 
 def compute_instance_pod(
@@ -212,12 +288,19 @@ class DownstreamBenchmarkSuite:
         y_det: np.ndarray,
         X_size: Optional[np.ndarray] = None,
         y_size: Optional[np.ndarray] = None,
+        size_log_target: bool = False,
     ) -> Dict[str, Any]:
         """
         Fits global downstream readouts on representations from the training pool:
         1. StandardScaler + LogisticRegression(class_weight="balanced") for Defect Detection
         2. StandardScaler + MLPClassifier for Non-linear Defect Detection
         3. StandardScaler + Ridge(alpha=10.0) for Quantitative Flaw Sizing (diameter in mm)
+
+        size_log_target=True fits the regressors on log1p(diameter) instead of raw
+        mm: defect diameters span 2-14 mm, so a raw L2 target lets the large flaws
+        dominate the fit and the small ones collapse toward the mean (H31: sizing
+        worse than a constant). `readouts["size_target"]` records the transform so
+        inference inverts it exactly.
         """
         readouts = {}
 
@@ -253,10 +336,12 @@ class DownstreamBenchmarkSuite:
         if X_size is not None and len(X_size) > 0 and y_size is not None:
             scaler_size = StandardScaler()
             X_size_s = scaler_size.fit_transform(X_size)
+            y_fit = np.log1p(y_size.astype(np.float64)) if size_log_target else y_size
             ridge = Ridge(alpha=10.0, random_state=self.random_state)
-            ridge.fit(X_size_s, y_size)
+            ridge.fit(X_size_s, y_fit)
             readouts["scaler_size"] = scaler_size
             readouts["ridge_size"] = ridge
+            readouts["size_target"] = "log1p" if size_log_target else "identity"
 
         return readouts
 
@@ -333,7 +418,11 @@ class DownstreamBenchmarkSuite:
         ridge = readouts["ridge_size"]
 
         feats_s = scaler.transform(flat_feats)
-        pred_all = np.maximum(0.0, ridge.predict(feats_s))
+        raw_pred = ridge.predict(feats_s)
+        if readouts.get("size_target") == "log1p":
+            pred_all = np.maximum(0.0, np.expm1(raw_pred))
+        else:
+            pred_all = np.maximum(0.0, raw_pred)
 
         if focus_defects_only:
             valid_idx = np.where(flat_size > 0.0)[0]
@@ -593,6 +682,7 @@ class DownstreamBenchmarkSuite:
         features: np.ndarray,
         size_map: np.ndarray,  # continuous defect diameter or depth in mm
         focus_defects_only: bool = True,
+        log_target: bool = False,
     ) -> Dict[str, Any]:
         flat_feats = features.reshape(-1, features.shape[-1])
         flat_size = size_map.reshape(-1)
@@ -608,13 +698,17 @@ class DownstreamBenchmarkSuite:
         if len(y) < self.n_splits or np.ptp(y) < 1e-4:
             return {"error": "Too few samples or zero variance for sizing regression"}
 
+        # Fit in log1p space (wide 2-14 mm range) and invert for the reported metrics.
+        y_fit = np.log1p(y.astype(np.float64)) if log_target else y
+        inv = (lambda v: np.maximum(0.0, np.expm1(v))) if log_target else (lambda v: v)
+
         kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
         linear_r2, linear_mae, linear_rmse = [], [], []
         mlp_r2, mlp_mae, mlp_rmse = [], [], []
 
         for train_idx, test_idx in kf.split(X, y):
             X_tr, X_te = X[train_idx], X[test_idx]
-            y_tr, y_te = y[train_idx], y[test_idx]
+            y_tr, y_te = y_fit[train_idx], y[test_idx]
 
             scaler = StandardScaler()
             X_tr_s = scaler.fit_transform(X_tr)
@@ -623,7 +717,7 @@ class DownstreamBenchmarkSuite:
             # 1. Ridge Regressor
             ridge = Ridge(alpha=10.0, random_state=self.random_state)
             ridge.fit(X_tr_s, y_tr)
-            y_pred_lr = ridge.predict(X_te_s)
+            y_pred_lr = inv(ridge.predict(X_te_s))
 
             linear_r2.append(float(r2_score(y_te, y_pred_lr)))
             linear_mae.append(float(mean_absolute_error(y_te, y_pred_lr)))
@@ -639,7 +733,7 @@ class DownstreamBenchmarkSuite:
                 random_state=self.random_state,
             )
             mlp.fit(X_tr_s, y_tr)
-            y_pred_mlp = mlp.predict(X_te_s)
+            y_pred_mlp = inv(mlp.predict(X_te_s))
 
             mlp_r2.append(float(r2_score(y_te, y_pred_mlp)))
             mlp_mae.append(float(mean_absolute_error(y_te, y_pred_mlp)))

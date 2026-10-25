@@ -55,6 +55,7 @@ from src.PECT_JEPA.cross_condition.data.preprocessing import (
     get_canonical_transformer,
 )
 from src.PECT_JEPA.cross_condition.data.split import (
+    SPLIT_MODES,
     extract_file_metadata,
     get_canonical_train_val_test_splits,
 )
@@ -64,18 +65,23 @@ from src.PECT_JEPA.cross_condition.evaluate import (
     _iter_with_prefetch,
 )
 from src.PECT_JEPA.cross_condition.evaluation.cscan_extractor import CScanFeatureExtractor
-from src.PECT_JEPA.cross_condition.evaluation.downstream_benchmarks import DownstreamBenchmarkSuite
+from src.PECT_JEPA.cross_condition.evaluation.downstream_benchmarks import (
+    DownstreamBenchmarkSuite,
+    compute_otsu_threshold,
+    halo_ring,
+    unsup_bg_stats,
+    whiten_stats,
+)
+from src.PECT_JEPA.cross_condition.downstream.test_time_adaptation import unsup_trimmed_bg_stats
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.utils.class_weight import compute_sample_weight
 from scipy.stats import spearmanr
-from scipy import ndimage as ndi
 
 BG_Q = 0.80       # pseudo-sound cut: Mahalanobis below 80th pct
 HARD_K = 2000     # hard negatives per train scan
-HALO_R = 2        # halo exclusion radius (px) around GT defect boundaries
 SHRINK_EPS = 1e-2  # stronger diagonal loading for shrinkage-tuned whitening
 
 
@@ -88,6 +94,7 @@ def parse_args():
     parser.add_argument("--eval_splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_size", type=int, default=8192)
+    parser.add_argument("--split_mode", type=str, default="cross_specimen", choices=list(SPLIT_MODES))
     parser.add_argument("--prefetch", type=lambda v: v.lower() == "true", default=True)
     parser.add_argument("--self_calibration", type=lambda v: v.lower() == "true", default=True)
     # Backward compatibility / no-op flags
@@ -117,97 +124,6 @@ def fit_mlp(X: np.ndarray, y: np.ndarray, seed: int = 42):
     sw = compute_sample_weight("balanced", y)
     mlp.fit(X, y, sample_weight=sw)
     return mlp
-
-
-def whiten_stats(bg: np.ndarray, eps: float = 1e-4) -> tuple:
-    """(mu, W) with W = inv-sqrt(cov + eps*I) via eigh. bg: [Nb, D].
-
-    eps = shrinkage: larger eps damps noisy eigen-directions (TMR hurt
-    diagnosis). v3 sweeps eps to retune per-condition response.
-    """
-    mu = bg.mean(axis=0)
-    cov = np.cov(bg, rowvar=False) + np.eye(bg.shape[1], dtype=np.float64) * eps
-    vals, vecs = np.linalg.eigh(cov)
-    vals = np.clip(vals, 1e-6, None)
-    W = (vecs / np.sqrt(vals)).dot(vecs.T).astype(np.float32)
-    return mu.astype(np.float32), W
-
-
-def unsup_bg_stats(flat_z: np.ndarray, valid_mask: np.ndarray, eps: float = 1e-4) -> tuple:
-    """Fully-unsupervised bg stats (NO ground truth, NO Mahalanobis cut).
-
-    Uses ALL valid pixels: defects are ~1-3% so contamination is tiny.
-    Tests whether P1 gains survive without any GT leakage (v2 P1 built bg
-    stats from GT-derived Mahalanobis scores on test scans).
-    """
-    return whiten_stats(flat_z[valid_mask], eps=eps)
-
-
-def unsup_trimmed_bg_stats(
-    flat_z: np.ndarray,
-    valid_mask: np.ndarray,
-    eps: float = 1e-4,
-    keep_q: float = 0.75,
-) -> tuple:
-    """Unsupervised outlier-trimmed bg stats (zero GT labels, fixes high-defect contamination).
-
-    On Rivet_v1 (15% defect area) and Rivet_v2 (25.2% defect area), all-pixel
-    mean/cov is contaminated by defect/rivet responses. Ranks valid pixels by
-    unsupervised MAD-normalized energy distance from the coordinate-wise median
-    and keeps the lowest keep_q (default 75%) before computing (mu, W).
-    """
-    zv = flat_z[valid_mask].astype(np.float64)
-    med = np.median(zv, axis=0, keepdims=True)
-    mad = np.median(np.abs(zv - med), axis=0, keepdims=True) + 1e-6
-    d2 = np.mean(((zv - med) / mad) ** 2, axis=1)
-    cut = float(np.quantile(d2, keep_q))
-    keep = d2 <= cut
-    if int(np.sum(keep)) < max(64, zv.shape[1] * 2):
-        keep = np.ones(len(zv), dtype=bool)
-    return whiten_stats(zv[keep].astype(np.float32), eps=eps)
-
-
-def halo_ring(gt_mask: np.ndarray, radius: int = HALO_R) -> np.ndarray:
-    """Boolean ring around defect boundaries (dilated minus original).
-
-    Halo pixels carry partial-volume label noise: P2 mined them as hard
-    negatives (train AUC 0.37 collapse). Excluding the ring from probe
-    fitting AND hard-neg mining tests the label-noise diagnosis.
-    valid = (gt >= 0); defects = (gt == 1).
-    """
-    defect = (gt_mask == 1)
-    if not np.any(defect):
-        return np.zeros_like(defect, dtype=bool)
-    dil = ndi.binary_dilation(defect, iterations=int(max(1, radius)))
-    return (dil & ~defect)
-
-
-def otsu_threshold(prob: np.ndarray, nbins: int = 256) -> float:
-    """Unsupervised operating point: Otsu on the score histogram.
-
-    Legit (no test labels) counterpart to the oracle iou_opt sweep.
-    Threshold-free AUC is unaffected by design; this only moves the
-    F1/IoU operating point. Returns tau in [0,1].
-    """
-    p = np.asarray(prob).reshape(-1)
-    p = p[np.isfinite(p)]
-    if p.size == 0 or np.ptp(p) < 1e-12:
-        return 0.5
-    lo, hi = float(p.min()), float(p.max())
-    hist, edges = np.histogram(p, bins=nbins, range=(lo, hi))
-    hist = hist.astype(np.float64)
-    total = hist.sum()
-    if total <= 0:
-        return 0.5
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    w1 = np.cumsum(hist) / total
-    w0 = 1.0 - w1
-    mu1 = np.cumsum(hist * centers) / np.maximum(np.cumsum(hist), 1e-12)
-    muT = (hist * centers).sum() / total
-    mu0 = np.where(w0 > 0, (muT - w1 * mu1) / np.maximum(w0, 1e-12), 0.0)
-    between = w0 * w1 * (mu0 - mu1) ** 2
-    between[(w0 <= 0) | (w1 <= 0)] = -1.0
-    return float(centers[int(np.argmax(between))])
 
 
 def main():
@@ -244,7 +160,8 @@ def main():
 
     all_files = sorted(glob.glob(os.path.join(args.data_dir, "**", "*.tdms"), recursive=True))
     all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
-    splits = get_canonical_train_val_test_splits(all_files, val_files_count=4, seed=42)
+    splits = get_canonical_train_val_test_splits(
+        all_files, split_mode=args.split_mode, val_files_per_specimen=2, seed=42)
     get_canonical_transformer()
 
     # ---- STEP 1 (mirror evaluate.py): pool + P0 base probe ----
@@ -323,8 +240,10 @@ def main():
         valid_all = gt_of[fp].reshape(-1) >= 0
         bg_stats_uns[fp] = unsup_bg_stats(flat_all, valid_all)
         bg_stats_uns_s2[fp] = unsup_bg_stats(flat_all, valid_all, eps=SHRINK_EPS)
-        bg_stats_uns_trim_s2[fp] = unsup_trimmed_bg_stats(flat_all, valid_all, eps=SHRINK_EPS, keep_q=0.75)
-        bg_stats_uns_s5[fp] = unsup_trimmed_bg_stats(flat_all, valid_all, eps=1e-5, keep_q=0.85)
+        bg_stats_uns_trim_s2[fp] = unsup_trimmed_bg_stats(
+            flat_all, keep_q=0.75, eps=SHRINK_EPS, valid_mask=valid_all)
+        bg_stats_uns_s5[fp] = unsup_trimmed_bg_stats(
+            flat_all, keep_q=0.85, eps=1e-5, valid_mask=valid_all)
 
     def _wblack(stats: Dict[str, tuple], fp: str, X: np.ndarray) -> np.ndarray:
         mu, W = stats[fp]
@@ -495,8 +414,10 @@ def main():
                 muW_uns = unsup_bg_stats(flat_all_l, v0)
                 muW_s2 = whiten_stats(flat_all_l[bgm], eps=SHRINK_EPS)
                 muW_uns_s2 = unsup_bg_stats(flat_all_l, v0, eps=SHRINK_EPS)
-                muW_uns_trim_s2 = unsup_trimmed_bg_stats(flat_all_l, v0, eps=SHRINK_EPS, keep_q=0.75)
-                muW_uns_s5 = unsup_trimmed_bg_stats(flat_all_l, v0, eps=1e-5, keep_q=0.85)
+                muW_uns_trim_s2 = unsup_trimmed_bg_stats(
+                    flat_all_l, keep_q=0.75, eps=SHRINK_EPS, valid_mask=v0)
+                muW_uns_s5 = unsup_trimmed_bg_stats(
+                    flat_all_l, keep_q=0.85, eps=1e-5, valid_mask=v0)
 
             flat = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
             y = gt_mask.reshape(-1).astype(np.int64)
@@ -596,7 +517,7 @@ def main():
             iou05 = suite.benchmark_segmentation_iou(prob_map, gt_mask, threshold=0.5)
             iouopt = suite.benchmark_segmentation_iou(prob_map, gt_mask, threshold=None)
             # v3: legit unsupervised operating point (Otsu, no test labels)
-            tau_otsu = otsu_threshold(prob_map)
+            tau_otsu = compute_otsu_threshold(prob_map)
             iou_otsu_d = suite.benchmark_segmentation_iou(prob_map, gt_mask, threshold=tau_otsu)
             prob3 = lr3.predict_proba(flat_w)[:, 1].reshape(gt_mask.shape)
             iou05_p3 = suite.benchmark_segmentation_iou(prob3, gt_mask, threshold=0.5)

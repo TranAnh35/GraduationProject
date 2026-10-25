@@ -169,7 +169,7 @@ class TestNewEvaluationMetrics(unittest.TestCase):
         import torch
         mock_model = MagicMock()
         mock_model.config.star_radii = (1, 3, 7)
-        mock_model.config.latent_disentanglement = False
+        mock_model.config.global_bg_energy_anchor = False
         mock_model.config.embed_dim = 64
 
         extractor = CScanFeatureExtractor(model=mock_model, device=torch.device("cpu"), batch_size=2048)

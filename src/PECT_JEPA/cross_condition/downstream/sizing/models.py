@@ -40,21 +40,27 @@ class SizingRegressorBundle:
         scaler: StandardScaler,
         ridge_regressor: Ridge,
         mlp_regressor: Optional[MLPRegressor] = None,
+        target_transform: str = "identity",
     ):
         self.scaler = scaler
         self.ridge_regressor = ridge_regressor
         self.mlp_regressor = mlp_regressor
+        # "log1p" => the regressors were fitted on log1p(mm); invert at inference.
+        self.target_transform = target_transform
+
+    def _invert(self, pred: np.ndarray) -> np.ndarray:
+        if self.target_transform == "log1p":
+            return np.maximum(np.expm1(pred), 0.0)
+        return np.maximum(pred, 0.0)
 
     def predict_ridge(self, X: np.ndarray) -> np.ndarray:
         """Predicts flaw dimension (mm) using Ridge Regressor. X: [N, D]"""
         Xs = self.scaler.transform(X)
-        pred = self.ridge_regressor.predict(Xs)
-        return np.maximum(pred, 0.0)
+        return self._invert(self.ridge_regressor.predict(Xs))
 
     def predict_mlp(self, X: np.ndarray) -> Optional[np.ndarray]:
         """Predicts flaw dimension (mm) using MLP Regressor. X: [N, D]"""
         if self.mlp_regressor is None:
             return None
         Xs = self.scaler.transform(X)
-        pred = self.mlp_regressor.predict(Xs)
-        return np.maximum(pred, 0.0)
+        return self._invert(self.mlp_regressor.predict(Xs))

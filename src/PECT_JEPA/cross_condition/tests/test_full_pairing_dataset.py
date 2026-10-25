@@ -39,13 +39,12 @@ class TestFullPairingDataset(unittest.TestCase):
         ds.num_partitions = 10
         ds.seed = 42
         ds.use_full_dataset = True
+        ds.split_mode = "cross_condition"
         ds.grid_size = 5
         ds.temporal_samples = 128
         ds.grid_stride = 4
         ds.offsets = np.zeros((25, 2), dtype=np.int32)
         ds.pad = 7
-        ds.dynamic_condition_token = False
-        ds.include_sound_mask = False
 
         # Group mock scans by specimen
         ds.scans_by_specimen = {"Corrosion": [], "Rivet_v1": [], "Rivet_v2": []}

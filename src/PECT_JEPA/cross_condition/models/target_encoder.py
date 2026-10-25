@@ -33,6 +33,5 @@ class TargetEncoder(nn.Module):
         self,
         target_tokens: torch.Tensor,
         target_pos: torch.Tensor,
-        coords: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.encoder(target_tokens, target_pos, coords=coords)
+        return self.encoder(target_tokens, target_pos)

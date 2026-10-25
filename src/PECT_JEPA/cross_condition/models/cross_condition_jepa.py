@@ -1,15 +1,19 @@
 """
 Cross-Condition Paired JEPA Architecture for PECT.
 
-Core Principles:
-- Inputs: Pair (x_A, x_B) at identical physical coordinates from two distinct measurement conditions.
-- Condition Extraction: Pure self-supervised condition token c_B extracted from background sound-metal patch ref_B.
-- Masking: Context from outer ring of Condition A (16 probes), Target from inner core of Condition B (9 probes).
-- Objective: Predict H_tgt(B) from H_ctx(A) conditioned on c_B using pure L1 loss + Context VICReg.
-- Representation: Unified frozen representation Z = [h_center, h_context] in R^{2D} for all downstream tasks.
+Single canonical pipeline:
+- Inputs: pair (x_A, x_B) at identical physical coordinates from two measurement conditions.
+- Condition token: Dodd-Deeds spectral signature c_B extracted from the sound-metal
+  background patch ref_B of Condition B (0% DC leakage).
+- Masking: context from a contiguous non-enclosing wedge of Condition A, target from the
+  complementary wedge of Condition B.
+- Objective: predict H_tgt(B) from H_ctx(A) conditioned on c_B, plus VICReg rank guards
+  and an optional background-gated cross-condition invariance term.
+- Representation: unified 64D latent, pooled as Z = [h_center, mean(h_context)] in R^128.
 """
 
 from typing import Dict, Optional, Tuple
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,28 +26,37 @@ from .target_encoder import TargetEncoder
 from .predictor import CrossConditionPredictor
 
 
-# EXP-68 spectral condition token: number of harmonic bins kept above DC.
+# Dodd-Deeds spectral condition token: number of harmonic bins kept above DC.
 SPECTRAL_N_HARMONICS = 8
 
 
-def spectral_token_dim(config) -> int:
-    """Feature width of the Dodd-Deeds condition signature.
+def spectral_token_dim(config=None) -> int:
+    """Feature width of the spectral condition signature.
 
-    'cos_sin' (default): each harmonic contributes (cos theta_k, sin theta_k) so the
-    signature has no discontinuity at the +-pi branch cut, then a normalized energy
-    ratio per harmonic. 'raw': theta_k / pi in [-1, 1] as in the first exp68 draft.
+    Each harmonic contributes (cos theta_k, sin theta_k) weighted by sqrt(E_k/sum E)
+    -- continuous at the +-pi branch cut -- plus its normalized energy ratio.
     """
-    enc = getattr(config, "spectral_phase_encoding", "cos_sin")
-    phase_dim = 2 * SPECTRAL_N_HARMONICS if enc == "cos_sin" else SPECTRAL_N_HARMONICS
-    return phase_dim + SPECTRAL_N_HARMONICS
+    return 3 * SPECTRAL_N_HARMONICS
 
 
-def normalized_probe_l1(pred: torch.Tensor, tgt: torch.Tensor, focus_gamma: float = 0.0) -> torch.Tensor:
-    """EXP-68 probe-wise normalized L1: z-score each probe over its feature dimension.
+def corner_background_energy(cscan: np.ndarray) -> float:
+    """Median per-probe temporal variance of the four defect-free corner patches.
 
-    Invariant to any per-probe rescaling of the representation, so shrinking the latent
-    cannot reduce the loss (removes the death-spiral descent direction of raw L1), while
-    a position-blind / constant prediction is still heavily penalized.
+    Mirrors PairedPECTDataset's corner-median reference patch so the global
+    background anchor of the tokenizer is identical at train and inference time.
+    """
+    c = np.asarray(cscan, dtype=np.float32)
+    corners = np.stack([c[0:5, 0:5, :], c[0:5, -5:, :], c[-5:, 0:5, :], c[-5:, -5:, :]], axis=0)
+    ref = np.median(corners, axis=0).reshape(-1, c.shape[-1])
+    return float(np.median(ref.std(axis=-1) ** 2))
+
+
+def normalized_probe_l1(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    """Probe-wise normalized L1: z-score each probe over its feature dimension.
+
+    Invariant to any per-probe rescaling of the representation, so shrinking the
+    latent cannot reduce the loss (removes the death-spiral descent direction of
+    raw L1), while a position-blind / constant prediction is still penalized.
     """
     pred_m = pred.mean(dim=-1, keepdim=True)
     pred_s = pred.std(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -52,23 +65,13 @@ def normalized_probe_l1(pred: torch.Tensor, tgt: torch.Tensor, focus_gamma: floa
     tgt_m = tgt.mean(dim=-1, keepdim=True)
     tgt_s = tgt.std(dim=-1, keepdim=True).clamp_min(1e-8)
     h_tgt_norm = (tgt - tgt_m) / tgt_s
-
-    sample_loss = (h_pred_norm - h_tgt_norm).abs().mean(dim=(-2, -1))
-    if focus_gamma > 0:
-        tgt_dev = torch.norm(tgt.detach(), p=2, dim=-1).mean(dim=-1)
-        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-        weights = weights / (weights.mean() + 1e-8)
-        weights = torch.clamp(weights, min=0.2, max=5.0)
-        weights = weights / (weights.mean() + 1e-8)
-        return (weights * sample_loss).mean()
-    return sample_loss.mean()
+    return (h_pred_norm - h_tgt_norm).abs().mean(dim=(-2, -1)).mean()
 
 
 def center_by_group(z_f: torch.Tensor, group_id: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    Center a 2D tensor z_f [N, D] (float32) per group_id [N] if provided,
-    or globally across N if group_id is None. Singletons fallback to global mean
-    so no sample remains uncentered.
+    """Center a 2D tensor z_f [N, D] per group_id [N] (global mean if None).
+
+    Singletons fall back to the global mean so no sample remains uncentered.
     """
     if group_id is None:
         return z_f - z_f.mean(dim=0, keepdim=True)
@@ -92,31 +95,24 @@ def compute_vicreg_loss(
     eps: float = 1e-4,
     scan_id: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    VICReg coordinate-wise variance hinge and covariance decorrelation penalty.
-    If scan_id is provided, z is centered per-scan (z_centered = z - mean_{scan}(z))
-    before computing variance and covariance. This strictly prevents between-scan drift
-    from falsely satisfying the variance regularizer, forcing the model to amplify
-    true within-scan flaw/defect variance!
+    """VICReg coordinate-wise variance hinge and covariance decorrelation penalty.
 
-    Vectorized via scatter (index_add_) over 0..S-1 remapped ids: a single pass
-    instead of one Python-level masked pass per unique scan (~100 kernel-launch
-    rounds per training step -> 3 kernels). Singletons keep z unchanged.
+    If scan_id is provided, z is centered per scan before computing variance and
+    covariance, so between-scan drift cannot falsely satisfy the variance
+    regularizer; the model must amplify true within-scan flaw variance.
+    Vectorized via index_add_ (one pass instead of one masked pass per scan).
     """
     z_f = z.float()
     if scan_id is not None:
-        # z: [N, D], scan_id: [N] (arbitrary ids)
-        uniq, inv = torch.unique(scan_id, return_inverse=True)  # inv: [N] in 0..S-1
+        uniq, inv = torch.unique(scan_id, return_inverse=True)
         n_groups = uniq.numel()
-        # float32 accumulators for stable means and covariance under AMP fp16 inputs
-        counts = torch.bincount(inv, minlength=n_groups)  # [S] int64
+        counts = torch.bincount(inv, minlength=n_groups)
         sums = torch.zeros(n_groups, z_f.shape[1], device=z_f.device, dtype=torch.float32)
         sums.index_add_(0, inv, z_f)
-        means = sums / counts.clamp_min(1).unsqueeze(1).float()  # [S, D]
-        m = means[inv]  # [N, D] float32
-        singleton = (counts[inv] <= 1).unsqueeze(1)  # [N, 1]
+        means = sums / counts.clamp_min(1).unsqueeze(1).float()
+        m = means[inv]
+        singleton = (counts[inv] <= 1).unsqueeze(1)
         z_cent = torch.where(singleton, z_f, z_f - m)
-        # Standard deviation computed strictly on within-scan centered perturbations
         std = torch.sqrt(z_cent.var(dim=0, unbiased=False) + eps)
     else:
         std = torch.sqrt(z_f.var(dim=0, unbiased=False) + eps)
@@ -134,176 +130,159 @@ def compute_vicreg_loss(
 
 
 class CrossConditionJEPA(nn.Module):
-    """
-    Self-Supervised Cross-Condition Paired JEPA Model (Zero Metadata Injection).
-    """
+    """Self-supervised cross-condition paired JEPA model (zero metadata injection)."""
+
     def __init__(self, config: Optional[CrossConditionConfig] = None):
         super().__init__()
         if config is None:
             config = CrossConditionConfig()
         self.config = config
 
-        # 1. Physical Dual-Domain Tokenizer
+        # 1. Physical dual-domain tokenizer
         self.tokenizer = DualDomainTokenizer(config)
 
-        # 2. Context Encoder (Condition A)
+        # 2. Context encoder (Condition A) / 3. target encoder (Condition B, EMA teacher)
         self.context_encoder = ContextEncoder(config)
-
-        # 3. Target Encoder (Condition B, EMA teacher)
         self.target_encoder = TargetEncoder(config)
         self._init_target_encoder()
 
-        # 4. Self-Supervised Condition Projector
+        # 4. Self-supervised condition projector (legacy c_B path, kept for parity)
         self.cond_proj = nn.Sequential(
             nn.Linear(config.embed_dim, config.embed_dim),
             nn.GELU(),
             nn.Linear(config.embed_dim, config.embed_dim),
         )
+        # 4b. Dodd-Deeds spectral condition projector
+        self.spec_cond_proj = nn.Sequential(
+            nn.Linear(spectral_token_dim(), config.embed_dim),
+            nn.GELU(),
+            nn.Linear(config.embed_dim, config.embed_dim),
+        )
 
-        # 4b. Relative Domain Transfer Operator Projector T(c_A, c_B)
-        # Inactive unless relative_condition_operator is True so legacy checkpoints load with strict=True.
-        if getattr(config, "relative_condition_operator", False):
-            self.transfer_proj = nn.Sequential(
-                nn.Linear(config.embed_dim + 1, config.embed_dim),
-                nn.GELU(),
-                nn.Linear(config.embed_dim, config.embed_dim),
-            )
-        else:
-            self.transfer_proj = None
-
-        # 4c. Spectral Dodd-Deeds condition projector (EXP-68)
-        # Inactive unless spectral_condition_token is True so legacy checkpoints load with strict=True.
-        if getattr(config, "spectral_condition_token", False):
-            self.spec_cond_proj = nn.Sequential(
-                nn.Linear(spectral_token_dim(config), config.embed_dim),
-                nn.GELU(),
-                nn.Linear(config.embed_dim, config.embed_dim),
-            )
-        else:
-            self.spec_cond_proj = None
-
-        # 5. Cross-Condition Predictor
+        # 5. Cross-condition predictor
         self.predictor = CrossConditionPredictor(config)
 
-        # 6. z_c grounding head: gives the carrier subspace an explicit job
-        # (predict Condition-B token from pooled z_c) so the [z_c, z_s]
-        # split is enforced by an objective instead of being decorative.
-        # Inactive unless latent_disentanglement and zc_cond_weight > 0.
-        if getattr(config, "latent_disentanglement", False):
-            _D_c = getattr(config, "carrier_dim", config.embed_dim // 2)
-            self.zc_cond_head = nn.Sequential(
-                nn.Linear(_D_c, _D_c),
-                nn.GELU(),
-                nn.Linear(_D_c, config.embed_dim),
-            )
-        else:
-            self.zc_cond_head = None
-
-        # 7. Asymmetric-inv predictor head (BYOL-style): absorbs the
-        # cross-condition alignment work so the z_s encoder itself is never
-        # directly pulled toward the target branch. Created ONLY when both
-        # disentanglement and inv_predictor are on: legacy configs get no new
-        # parameters, so old checkpoints keep loading with strict=True.
-        if getattr(config, "latent_disentanglement", False) and getattr(config, "inv_predictor", False):
-            _D_s = getattr(config, "scattering_dim", config.embed_dim - getattr(config, "carrier_dim", config.embed_dim // 2))
-            _H = max(2 * _D_s, 64)
+        # 6. Asymmetric invariance predictor (BYOL-style). Absorbs the alignment
+        # work of L_inv so the encoder itself is never pulled directly onto the
+        # EMA target (FM6: direct symmetric L_inv collapses rank 23D -> 1.2D).
+        if getattr(config, "inv_predictor", False):
+            _D = config.embed_dim
+            _H = max(2 * _D, 64)
             self.inv_head = nn.Sequential(
-                nn.Linear(_D_s, _H),
+                nn.Linear(_D, _H),
                 nn.GELU(),
-                nn.Linear(_H, _D_s),
+                nn.Linear(_H, _D),
             )
         else:
             self.inv_head = None
 
-        # Concentric star partitioning:
-        # Indices 0..8: Core 9 probes (center + 8 inner ring probes)
-        # Indices 9..24: Outer 16 probes (outer rings)
+        # Concentric star partitioning: indices 0..8 core (target), 9..24 outer (context)
         self.register_buffer("target_idx", torch.arange(config.num_target_probes, dtype=torch.long))
         self.register_buffer("context_idx", torch.arange(config.num_target_probes, 25, dtype=torch.long))
 
-        # Contiguous non-enclosing wedge mask bank (16 masks: 8 Family A outer half-plane wedges
-        # with Center 0 in Context + 8 Family B apex-inclusive wedges with Center 0 in Target).
-        # Registered with persistent=False so legacy checkpoints load with strict=True.
+        # Contiguous non-enclosing wedge mask bank (16 masks: 8 outer half-plane
+        # wedges with center 0 in context + 8 apex-inclusive wedges with center 0
+        # in target). Non-persistent so checkpoints stay lean.
         _rays = getattr(config, "num_target_rays", 3)
         tgt_bank_np, ctx_bank_np = get_contiguous_star_masks(
-            star_radii=tuple(getattr(config, "star_radii", (1, 3, 7))),
+            star_radii=tuple(getattr(config, "star_radii", (2, 4, 7))),
             num_target_rays=_rays,
         )
         self.register_buffer("target_idx_bank", torch.from_numpy(tgt_bank_np).long(), persistent=False)
         self.register_buffer("context_idx_bank", torch.from_numpy(ctx_bank_np).long(), persistent=False)
 
     def _init_target_encoder(self):
-        """Initialize Target Encoder weights identical to Context Encoder."""
+        """Initialize target encoder weights identical to the context encoder."""
         for p_tgt, p_ctx in zip(self.target_encoder.encoder.parameters(), self.context_encoder.parameters()):
             p_tgt.data.copy_(p_ctx.data)
             p_tgt.requires_grad = False
 
     def update_target_encoder(self, momentum: float = 0.996):
-        """Update Target Encoder parameters with EMA momentum."""
+        """EMA update of the target encoder."""
         self.target_encoder.update_ema(self.context_encoder, momentum=momentum)
 
     def extract_spectral_condition_token(self, ref_b: torch.Tensor) -> torch.Tensor:
         """
-        EXP-68: Extracts the Dodd-Deeds spectral signature c_B from the sound-metal patch ref_b.
-        Completely eliminates DC amplitude (0% DC leakage) and lift-off attenuation.
-        Components (per harmonic k = 1..8):
-          - w_k * cos theta_k, w_k * sin theta_k  with w_k = sqrt(E_k / sum E) and
-            theta_k = arg(X_k). The (cos, sin) pair has no discontinuity at the +-pi branch
-            cut, and the energy weight keeps harmonics that carry no energy from injecting
-            their (numerically arbitrary) phase into the token.
-          - normalized spectral energy ratio E_k / sum(E) in [0, 1]
-        'spectral_phase_encoding=raw' reproduces the original theta_k / pi encoding (ablation).
+        Extracts the Dodd-Deeds spectral signature c_B from the sound-metal patch ref_b.
+        Eliminates DC amplitude and lift-off attenuation. Per harmonic k = 1..8:
+          - w_k * cos theta_k, w_k * sin theta_k with w_k = sqrt(E_k / sum E),
+            theta_k = arg(X_k) -- continuous at the +-pi branch cut, and bins with
+            ~zero energy (arbitrary phase) contribute ~zero;
+          - normalized spectral energy ratio E_k / sum(E).
         Args:
-            ref_b: [B, 5, 5, C] raw background sound-metal patch (C=128 temporal samples).
+            ref_b: [B, 5, 5, C] raw background sound-metal patch.
         Returns:
             c_b: [B, 1, D] condition token.
         """
         B = ref_b.shape[0]
         C = ref_b.shape[-1]
-        ref_flat = ref_b.view(B, -1, C)  # [B, 25, C]
+        ref_flat = ref_b.view(B, -1, C)
         ref_mean = ref_flat.mean(dim=1)  # [B, C]
-        # Zero-center temporal waveform to eliminate 100% DC offset
-        ref_ac = ref_mean - ref_mean.mean(dim=-1, keepdim=True)
-        # RFFT: [B, C // 2 + 1] complex
-        X = torch.fft.rfft(ref_ac, dim=-1)
-        # Extract first 8 harmonics (k = 1..8, skip DC bin 0)
-        X_harm = X[:, 1:1 + SPECTRAL_N_HARMONICS]  # [B, 8]
-        mags = torch.abs(X_harm)  # [B, 8]
+        ref_ac = ref_mean - ref_mean.mean(dim=-1, keepdim=True)  # remove DC
+        X = torch.fft.rfft(ref_ac, dim=-1)  # [B, C // 2 + 1] complex
+        X_harm = X[:, 1:1 + SPECTRAL_N_HARMONICS]
+        mags = torch.abs(X_harm)
         energies = mags ** 2
-        energy_ratios = energies / (energies.sum(dim=-1, keepdim=True) + 1e-8)  # [B, 8]
-        encoding = getattr(self.config, "spectral_phase_encoding", "cos_sin")
-        if encoding == "raw":
-            phase_feat = torch.angle(X_harm) / torch.pi  # [B, 8] in [-1, 1]
-        else:
-            theta = torch.angle(X_harm)  # [B, 8] in [-pi, pi]
-            weight = torch.sqrt(energy_ratios.clamp_min(0.0))  # [B, 8] in [0, 1]
-            # interleave (w*cos, w*sin) per harmonic -> continuous at the branch cut, and
-            # a bin with ~zero energy (arbitrary phase) contributes ~zero.
-            phase_feat = torch.stack([weight * torch.cos(theta),
-                                      weight * torch.sin(theta)], dim=-1).reshape(B, -1)
-        spec_feat = torch.cat([phase_feat, energy_ratios], dim=-1)  # [B, token_dim]
-        if self.spec_cond_proj is not None:
-            c_b = self.spec_cond_proj(spec_feat).unsqueeze(1)  # [B, 1, D]
-        else:
-            dim = spec_feat.shape[-1]
-            rep = max(1, self.config.embed_dim // dim)
-            c_b = spec_feat.repeat(1, rep)[:, :self.config.embed_dim].unsqueeze(1)
-        return c_b
+        energy_ratios = energies / (energies.sum(dim=-1, keepdim=True) + 1e-8)
+
+        theta = torch.angle(X_harm)  # [B, 8] in [-pi, pi]
+        weight = torch.sqrt(energy_ratios.clamp_min(0.0))
+        phase_feat = torch.stack(
+            [weight * torch.cos(theta), weight * torch.sin(theta)], dim=-1
+        ).reshape(B, -1)
+        spec_feat = torch.cat([phase_feat, energy_ratios], dim=-1)
+        return self.spec_cond_proj(spec_feat).unsqueeze(1)
 
     def extract_condition_token(self, ref_b: torch.Tensor) -> torch.Tensor:
+        """Extracts c_B [B, 1, D] from the sound-metal background patch of Condition B."""
+        return self.extract_spectral_condition_token(ref_b)
+
+    @staticmethod
+    def _bg_ref_energy(ref: torch.Tensor) -> torch.Tensor:
+        """Median per-probe temporal variance of a reference patch -> [B, 1, 1]."""
+        B = ref.shape[0]
+        rf = ref.reshape(B, -1, ref.shape[-1]).float()
+        return torch.median(rf.std(dim=-1) ** 2, dim=1, keepdim=True).values.unsqueeze(-1)
+
+    @staticmethod
+    def _probe_relative_energy(x: torch.Tensor) -> torch.Tensor:
+        """Unsupervised per-probe spatial energy contrast -> [B, 25].
+
+        Same quantity the tokenizer feeds the time branch as Delta E_local, used
+        here only to decide which tokens are sound metal (no labels involved).
         """
-        Extracts condition token c_B from sound-metal background patch ref_b of Condition B.
-        Args:
-            ref_b: [B, 5, 5, C] raw background patch.
-        Returns:
-            c_b: [B, 1, D] transfer function condition token.
+        B = x.shape[0]
+        xf = x.reshape(B, 25, -1).float()
+        e_probe = xf.std(dim=-1) ** 2
+        e_context = e_probe[:, 1:].mean(dim=1, keepdim=True) + 1e-8
+        return torch.log1p(e_probe) - torch.log1p(e_context)
+
+    def _background_gate(
+        self,
+        x_a: torch.Tensor,
+        ctx_idx: torch.Tensor,
+        batch_arange: torch.Tensor,
+        keep_q: float,
+    ) -> Tuple[Optional[torch.Tensor], float]:
+        """Selects the lowest-|Delta E| tokens (sound metal) for L_inv.
+
+        Defect-edge tokens carry large condition-specific scattering contrast; a
+        blind L_inv over all tokens washes that boundary away. Gating is fully
+        unsupervised (energy rank within the batch, no ground truth).
+        Returns (flat bool mask over B*N_ctx or None, kept fraction).
         """
-        if getattr(self.config, "spectral_condition_token", False):
-            return self.extract_spectral_condition_token(ref_b)
-        with torch.no_grad():
-            ref_tokens, _ = self.tokenizer(ref_b)  # [B, 25, D]
-            ref_mean = torch.mean(ref_tokens, dim=1)  # [B, D]
-        return self.cond_proj(ref_mean).unsqueeze(1)  # [B, 1, D]
+        if keep_q <= 0.0 or keep_q >= 1.0:
+            return None, 1.0
+        rel = self._probe_relative_energy(x_a)  # [B, 25]
+        score = rel.gather(1, ctx_idx).abs().reshape(-1)
+        if score.numel() < 8:
+            return None, 1.0
+        cut = torch.quantile(score, keep_q)
+        keep = score <= cut
+        kept = int(keep.sum())
+        if kept < max(1, int(0.05 * score.numel())):
+            return None, 1.0
+        return keep, float(kept) / float(score.numel())
 
     def forward(
         self,
@@ -313,52 +292,33 @@ class CrossConditionJEPA(nn.Module):
         ref_a: Optional[torch.Tensor] = None,
         scan_id: Optional[torch.Tensor] = None,
         inv_scale: float = 1.0,
-        xcov_scale: float = 1.0,
-        inv_sound_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass during self-supervised pretraining:
         x_a:     [B, 5, 5, C] measurement patch from Condition A
         x_b:     [B, 5, 5, C] measurement patch from Condition B (same physical coordinate)
-        ref_b:   [B, 5, 5, C] background sound-metal patch of Condition B
-        ref_a:   [B, 5, 5, C] background sound-metal patch of Condition A (optional for domain transfer)
+        ref_b:   [B, 5, 5, C] sound-metal background patch of Condition B
+        ref_a:   [B, 5, 5, C] sound-metal background patch of Condition A (optional)
         scan_id: [B] scan pair identifier for within-scan centered regularization
-        inv_scale/xcov_scale: P0-1 curriculum multipliers in [0, 1] supplied by
-            the trainer from the epoch schedule (default 1.0 = legacy path).
+        inv_scale: curriculum multiplier in [0, 1] for L_inv (default 1.0)
         """
         B = x_a.shape[0]
         device = x_a.device
 
-        # 1. Dual-domain tokenization
-        tokens_a, pos_a = self.tokenizer(x_a)  # [B, 25, D]
-        tokens_b, pos_b = self.tokenizer(x_b)  # [B, 25, D]
+        # 1. Dual-domain tokenization (global background anchor from ref patches)
+        bg_ref = None
+        if getattr(self.config, "global_bg_energy_anchor", False):
+            bg_ref = self._bg_ref_energy(ref_a if ref_a is not None else ref_b)
+        tokens_a, pos_a = self.tokenizer(x_a, bg_ref_energy=bg_ref)  # [B, 25, D]
+        tokens_b, pos_b = self.tokenizer(x_b, bg_ref_energy=bg_ref)
 
-        # 2. Extract self-supervised condition token and domain transfer operator
+        # 2. Self-supervised condition token
         c_b = self.extract_condition_token(ref_b) if self.config.use_condition_token else None
-        cond_transfer = None
-        if self.config.use_condition_token and c_b is not None:
-            if (
-                getattr(self.config, "relative_condition_operator", False)
-                and ref_a is not None
-                and self.transfer_proj is not None
-            ):
-                c_a = self.extract_condition_token(ref_a)
-                norm_a = torch.norm(c_a, p=2, dim=-1, keepdim=True) + 1e-6
-                norm_b = torch.norm(c_b, p=2, dim=-1, keepdim=True) + 1e-6
-                delta_u = (c_b / norm_b) - (c_a / norm_a)  # [B, 1, D]
-                rho = torch.log(norm_b / norm_a)  # [B, 1, 1]
-                op_in = torch.cat([delta_u, rho], dim=-1)  # [B, 1, D + 1]
-                cond_transfer = self.transfer_proj(op_in)  # [B, 1, D]
-            else:
-                cond_transfer = c_b
 
-        # 3. Partition tokens:
-        # - If contiguous_masking=True: sample from 16 spatially contiguous, non-enclosing
-        #   wedge partitions (neither context inside target nor target surrounded by context),
-        #   ensuring all 25 probes (including Center 0) are trained in ContextEncoder.
-        # - Else (legacy default): fixed 16 outer context (9..24) vs 9 inner target (0..8).
+        # 3. Partition tokens: contiguous non-enclosing wedges (default) or the
+        #    fixed 16 outer context / 9 inner target split (ablation).
         batch_arange = torch.arange(B, device=device).unsqueeze(1)
-        if getattr(self.config, "contiguous_masking", False):
+        if getattr(self.config, "contiguous_masking", True):
             num_masks = self.target_idx_bank.shape[0]
             if self.training:
                 mask_sel = torch.randint(0, num_masks, (B,), device=device)
@@ -367,540 +327,104 @@ class CrossConditionJEPA(nn.Module):
             ctx_idx = self.context_idx_bank[mask_sel]  # [B, 16]
             tgt_idx = self.target_idx_bank[mask_sel]   # [B, 9]
         else:
-            ctx_idx = self.context_idx.unsqueeze(0).expand(B, -1)  # [B, 16]
-            tgt_idx = self.target_idx.unsqueeze(0).expand(B, -1)   # [B, 9]
+            ctx_idx = self.context_idx.unsqueeze(0).expand(B, -1)
+            tgt_idx = self.target_idx.unsqueeze(0).expand(B, -1)
 
-        ctx_tokens_a = tokens_a[batch_arange, ctx_idx]  # [B, 16, D]
+        ctx_tokens_a = tokens_a[batch_arange, ctx_idx]
         ctx_pos_a = pos_a[batch_arange, ctx_idx]
-
-        tgt_tokens_b = tokens_b[batch_arange, tgt_idx]  # [B, 9, D]
+        tgt_tokens_b = tokens_b[batch_arange, tgt_idx]
         tgt_pos_b = pos_b[batch_arange, tgt_idx]
 
-        # Extract 2D probe coordinates for Green's diffusion attention
-        diff_attn = bool(getattr(self.config, "diffusion_attention", False))
-        norm_coords_all = self.tokenizer.norm_coords.expand(B, -1, -1)  # [B, 25, 2]
-        ctx_coords_a = norm_coords_all[batch_arange, ctx_idx] if diff_attn else None
-        tgt_coords_b = norm_coords_all[batch_arange, tgt_idx] if diff_attn else None
+        # 4. Context encoder encodes visible context from Condition A
+        H_ctx_a = self.context_encoder(ctx_tokens_a, ctx_pos_a)  # [B, 16, D]
 
-        # 4. Context Encoder encodes visible context from Condition A
-        H_ctx_a = self.context_encoder(ctx_tokens_a, ctx_pos_a, coords=ctx_coords_a)  # [B, 16, D]
-
-        # 5. Target Encoder encodes masked core from Condition B (stop-gradient)
+        # 5. Target encoder encodes masked core from Condition B (stop-gradient)
         with torch.no_grad():
-            H_tgt_b = self.target_encoder(tgt_tokens_b, tgt_pos_b, coords=tgt_coords_b)  # [B, 9, D]
+            H_tgt_b = self.target_encoder(tgt_tokens_b, tgt_pos_b)  # [B, 9, D]
 
-        # Target relative perturbation: Delta H_tgt = H_tgt - c_b
-        use_relative = getattr(self.config, "relative_target", True)
-        if use_relative and c_b is not None:
-            target_signal = H_tgt_b - c_b  # [B, 9, D] centered around Condition B sound metal
+        if getattr(self.config, "relative_target", False) and c_b is not None:
+            target_signal = H_tgt_b - c_b
         else:
             target_signal = H_tgt_b
 
-        # Expand scan_id across the N_ctx context tokens if provided: [B] -> [B * N_ctx]
-        # (N_ctx is read from the tensor, not hardcoded: masking splits vary)
         scan_id_expanded = None
         if scan_id is not None and getattr(self.config, "scan_centered_vicreg", True):
             scan_id_expanded = scan_id.unsqueeze(1).expand(-1, H_ctx_a.shape[1]).reshape(-1)
 
-        # 6. Branch selection: Unified Latent (EXP-68) vs Disentangled vs Standard
-        if getattr(self.config, "unified_latent", False):
-            # EXP-68: Single Unified 64D Representation (No Subspace Fragmentation)
-            diff_attn = bool(getattr(self.config, "diffusion_attention", False))
-            # L2-normalize the condition token: AdaLN applies norm*(1+gamma)+beta with
-            # UNBOUNDED gamma/beta, so an unnormalized token (spec_cond_proj has no norm)
-            # turns c_B into a per-scan bias bank that inflates as its weight grows --
-            # the "c_B learns extremely fast" symptom. Matches the grounded branch (:496).
-            cond_in = F.normalize(cond_transfer, p=2.0, dim=-1) if cond_transfer is not None else None
-            H_pred_b = self.predictor(
-                H_ctx_a,
-                tgt_pos_b,
-                condition_token=cond_in,
-                tgt_coords=tgt_coords_b if diff_attn else None,
-                ctx_coords=ctx_coords_a if diff_attn else None,
-            )
+        # 6. Prediction: L2-normalize c_B so an unbounded projector cannot turn the
+        #    condition token into a per-scan bias bank (AdaLN has no output norm).
+        cond_in = F.normalize(c_b, p=2.0, dim=-1) if c_b is not None else None
+        H_pred_b = self.predictor(H_ctx_a, tgt_pos_b, condition_token=cond_in)
 
-            # 1. Prediction Loss (Normalized Space L1, Raw L1, or Standard L1)
-            pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
-            focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
-            if pred_loss_type == "normalized_l1":
-                # EXP-68: scale-invariant probe-wise normalized L1 (no shrinkage incentive)
-                pred_loss = normalized_probe_l1(H_pred_b, target_signal, focus_gamma)
-            elif pred_loss_type == "raw_l1":
-                sample_loss = (H_pred_b - target_signal).abs().mean(dim=(-2, -1))
-                if focus_gamma > 0:
-                    tgt_dev = torch.norm(target_signal.detach(), p=2, dim=-1).mean(dim=-1)
-                    weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-                    weights = weights / (weights.mean() + 1e-8)
-                    weights = torch.clamp(weights, min=0.2, max=5.0)
-                    weights = weights / (weights.mean() + 1e-8)
-                    pred_loss = (weights * sample_loss).mean()
-                else:
-                    pred_loss = sample_loss.mean()
-            else:
-                pred_loss = F.l1_loss(H_pred_b, target_signal)
+        pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
+        if pred_loss_type == "normalized_l1":
+            pred_loss = normalized_probe_l1(H_pred_b, target_signal)
+        else:
+            pred_loss = F.l1_loss(H_pred_b, target_signal)
 
-            # 2. VICReg on full 64D Context Representation
-            flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
-            if self.config.var_weight > 0 or self.config.cov_weight > 0:
-                vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
-                    flat_ctx,
-                    var_weight=self.config.var_weight,
-                    cov_weight=self.config.cov_weight,
-                    gamma=self.config.var_gamma,
-                    scan_id=scan_id_expanded,
-                )
-            else:
-                vicreg_loss = torch.tensor(0.0, device=device)
-                var_loss = torch.tensor(0.0, device=device)
-                cov_loss = torch.tensor(0.0, device=device)
-
-            # 3. Cross-Condition Invariance Loss (Scheduled L_inv)
-            inv_weight = getattr(self.config, "inv_weight", 0.0)
-            eff_inv = inv_weight * inv_scale
-            if eff_inv > 0:
-                ctx_tokens_b = tokens_b[batch_arange, ctx_idx]
-                ctx_pos_b = pos_b[batch_arange, ctx_idx]
-                ctx_coords_b = norm_coords_all[batch_arange, ctx_idx] if diff_attn else None
-                with torch.no_grad():
-                    H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b, coords=ctx_coords_b)
-
-                flat_ctx_b = H_ctx_b.reshape(B * H_ctx_b.shape[1], -1)
-                if getattr(self.config, "scan_centered_inv", True) and scan_id_expanded is not None:
-                    z_a_cent = center_by_group(flat_ctx, scan_id_expanded)
-                    z_b_cent = center_by_group(flat_ctx_b, scan_id_expanded)
-                    inv_loss = 1.0 - F.cosine_similarity(z_a_cent, z_b_cent, dim=-1).mean()
-                elif getattr(self.config, "inv_cosine", True):
-                    inv_loss = 1.0 - F.cosine_similarity(flat_ctx, flat_ctx_b, dim=-1).mean()
-                else:
-                    inv_loss = F.mse_loss(flat_ctx, flat_ctx_b)
-                inv_sound_frac = torch.tensor(1.0, device=device)
-            else:
-                inv_loss = torch.tensor(0.0, device=device)
-                inv_sound_frac = torch.tensor(1.0, device=device)
-
-            # Pure 3-loss formulation: no anti-hijack bottleneck on VICReg, no decorative auxiliary losses
-            total_loss = pred_loss + vicreg_loss + eff_inv * inv_loss
-            carrier_loss = torch.tensor(0.0, device=device)
-            xcov_loss = torch.tensor(0.0, device=device)
-            zc_cond_loss = torch.tensor(0.0, device=device)
-            offset_loss = torch.tensor(0.0, device=device)
-            pool_var_loss = torch.tensor(0.0, device=device)
-        elif getattr(self.config, "latent_disentanglement", False):
-            # Split Context and Target into Carrier z_c and Scattering z_s
-            # D = D_c + D_s
-            D_c = getattr(self.config, "carrier_dim", self.config.embed_dim // 2)
-            D_s = getattr(self.config, "scattering_dim", self.config.embed_dim - D_c)
-
-            H_ctx_c = H_ctx_a[..., :D_c]  # [B, 16, D_c] Carrier background
-            H_ctx_s = H_ctx_a[..., D_c:]  # [B, 16, D_s] Scattering flaw perturbation
-
-            H_tgt_c = target_signal[..., :D_c]  # [B, 9, D_c]
-            H_tgt_s = target_signal[..., D_c:]  # [B, 9, D_s]
-
-            # A) Scattering Prediction
-            # If predictor_scattering_only=True, zero out H_ctx_c before predictor so predictor
-            # cannot use Condition A's carrier subspace as a domain-translation shortcut.
-            if getattr(self.config, "predictor_scattering_only", False):
-                H_ctx_for_pred = torch.cat([torch.zeros_like(H_ctx_c), H_ctx_s], dim=-1)
-            else:
-                H_ctx_for_pred = H_ctx_a
-
-            if getattr(self.config, "grounded_condition_pred", False):
-                # Direction C: Grounded Condition Transfer Function Prediction
-                # Normalize condition token to unit sphere: extracts condition transfer orientation/angle
-                # without passing DC magnitude (blocks identity shortcut and instant collapse!)
-                cond_in = F.normalize(cond_transfer, p=2.0, dim=-1) if cond_transfer is not None else None
-                H_pred_b = self.predictor(
-                    H_ctx_for_pred,
-                    tgt_pos_b,
-                    condition_token=cond_in,
-                    tgt_coords=tgt_coords_b,
-                    ctx_coords=ctx_coords_a,
-                )
-                H_pred_s = H_pred_b[..., D_c:]
-                pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
-                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
-                if pred_loss_type == "raw_l1":
-                    # EXP-67: Unnormalized physical Raw L1 loss in feature space
-                    sample_loss = (H_pred_s - H_tgt_s).abs().mean(dim=(-2, -1))
-                    if focus_gamma > 0:
-                        tgt_dev = torch.norm(H_tgt_s.detach(), p=2, dim=-1).mean(dim=-1)
-                        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-                        weights = weights / (weights.mean() + 1e-8)
-                        weights = torch.clamp(weights, min=0.2, max=5.0)
-                        weights = weights / (weights.mean() + 1e-8)
-                        pred_loss = (weights * sample_loss).mean()
-                    else:
-                        pred_loss = sample_loss.mean()
-                elif focus_gamma > 0:
-                    cos_per_probe = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1)
-                    h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
-                    h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
-                    shape_per_probe = (h_pred_norm - h_tgt_norm).abs().mean(dim=-1)
-                    sample_loss = cos_per_probe.mean(dim=-1) + shape_per_probe.mean(dim=-1)
-                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
-                    if mag_weight > 0:
-                        pred_mag = torch.norm(H_pred_s, p=2, dim=-1)
-                        tgt_mag = torch.norm(H_tgt_s, p=2, dim=-1)
-                        mag_per_probe = (torch.log(pred_mag + 1e-4) - torch.log(tgt_mag + 1e-4)).abs().mean(dim=-1)
-                        sample_loss = sample_loss + mag_weight * mag_per_probe
-                    tgt_dev = torch.norm(H_tgt_s.detach(), p=2, dim=-1).mean(dim=-1)
-                    weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-                    weights = weights / (weights.mean() + 1e-8)
-                    weights = torch.clamp(weights, min=0.2, max=5.0)
-                    weights = weights / (weights.mean() + 1e-8)
-                    pred_loss = (weights * sample_loss).mean()
-                else:
-                    pred_cos = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1).mean()
-                    h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
-                    h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
-                    pred_shape = F.l1_loss(h_pred_norm, h_tgt_norm)
-                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
-                    if mag_weight > 0:
-                        pred_mag = torch.norm(H_pred_s, p=2, dim=-1)
-                        tgt_mag = torch.norm(H_tgt_s, p=2, dim=-1)
-                        mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
-                        pred_loss = pred_cos + pred_shape + mag_weight * mag_loss
-                    else:
-                        pred_loss = pred_cos + pred_shape
-            else:
-                cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
-                H_pred_b = self.predictor(
-                    H_ctx_for_pred,
-                    tgt_pos_b,
-                    condition_token=cond_in,
-                    tgt_coords=tgt_coords_b,
-                    ctx_coords=ctx_coords_a,
-                )
-                H_pred_s = H_pred_b[..., D_c:]
-                pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
-                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
-                if pred_loss_type == "raw_l1":
-                    sample_loss = (H_pred_s - H_tgt_s).abs().mean(dim=(-2, -1))
-                    if focus_gamma > 0:
-                        tgt_dev = torch.norm(H_tgt_s.detach(), p=2, dim=-1).mean(dim=-1)
-                        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-                        weights = weights / (weights.mean() + 1e-8)
-                        weights = torch.clamp(weights, min=0.2, max=5.0)
-                        weights = weights / (weights.mean() + 1e-8)
-                        pred_loss = (weights * sample_loss).mean()
-                    else:
-                        pred_loss = sample_loss.mean()
-                elif pred_loss_type == "smooth_l1":
-                    pred_loss = F.smooth_l1_loss(H_pred_s, H_tgt_s)
-                elif pred_loss_type == "cosine_normalized_l1":
-                    pred_cos = 1.0 - F.cosine_similarity(H_pred_s, H_tgt_s, dim=-1).mean()
-                    h_pred_norm = F.normalize(H_pred_s, p=2.0, dim=-1)
-                    h_tgt_norm = F.normalize(H_tgt_s, p=2.0, dim=-1)
-                    pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
-                elif pred_loss_type == "normalized_l1":
-                    # EXP-68a: same probe-wise normalized L1, applied to the scattering subspace
-                    pred_loss = normalized_probe_l1(H_pred_s, H_tgt_s, focus_gamma)
-                else:
-                    pred_loss = F.l1_loss(H_pred_s, H_tgt_s)
-
-            # B) Spatial Flatness on Carrier z_c: In a local 5x5 patch and across the scan, z_c should be spatially flat
-            # Penalize variance across the 16 context probes for each patch
-            flat_carrier_loss = torch.mean(torch.var(H_ctx_c, dim=1, unbiased=False))
-            carrier_loss = self.config.carrier_flat_weight * flat_carrier_loss
-
-            # C) VICReg on Scattering z_s: Preserve multi-dimensional rank and prevent 1D collapse
-            flat_ctx_s = H_ctx_s.reshape(B * H_ctx_s.shape[1], -1)
+        # 7. VICReg on the full 64D context representation
+        flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
+        if self.config.var_weight > 0 or self.config.cov_weight > 0:
             vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
-                flat_ctx_s,
-                var_weight=self.config.scattering_var_weight,
-                cov_weight=self.config.scattering_cov_weight,
+                flat_ctx,
+                var_weight=self.config.var_weight,
+                cov_weight=self.config.cov_weight,
                 gamma=self.config.var_gamma,
                 scan_id=scan_id_expanded,
             )
-
-            # C2) Fix 4: var-hinge on the POOLED scattering vector itself
-            # ([center, mean-rest] = the actual downstream readout quantity).
-            # Token-level VICReg above does not protect the pooled features,
-            # where needle collapse still happens. scan_id used per-patch
-            # (NOT token-expanded): correct grouping at this granularity.
-            pool_var_weight = getattr(self.config, "pool_var_weight", 0.0)
-            if pool_var_weight > 0:
-                H_pool_s = torch.cat([H_ctx_s[:, 0, :], H_ctx_s[:, 1:, :].mean(dim=1)], dim=-1)  # [B, 2*D_s]
-                pool_var_loss, _, _ = compute_vicreg_loss(
-                    H_pool_s,
-                    var_weight=1.0,
-                    cov_weight=0.0,
-                    gamma=self.config.var_gamma,
-                    scan_id=scan_id,
-                )
-            else:
-                pool_var_loss = torch.tensor(0.0, device=device)
-
-            # D) EXP-49 L_inv: Cross-condition invariance on z_s.
-            # Same physical coordinate seen under condition A (context encoder,
-            # grad ON) vs condition B (target encoder, stop-grad/EMA target).
-            # Penalizes any condition drift left inside z_s.
-            inv_weight = getattr(self.config, "inv_weight", 0.0)
-            eff_inv = inv_weight * inv_scale
-            if eff_inv > 0:
-                # z_s of condition B from the EMA target encoder over the SAME
-                # context probes (context geometry matches H_ctx_a).
-                with torch.no_grad():
-                    ctx_tokens_b = tokens_b[batch_arange, ctx_idx]  # [B, 16, D]
-                    ctx_pos_b = pos_b[batch_arange, ctx_idx]
-                    H_ctx_b = self.target_encoder(ctx_tokens_b, ctx_pos_b, coords=ctx_coords_a)  # [B, 16, D]
-                H_ctx_b_s = H_ctx_b[..., D_c:]  # [B, N_ctx, D_s] fixed target
-                H_inv_online = self.inv_head(H_ctx_s) if self.inv_head is not None else H_ctx_s
-
-                # If scan_centered_inv=True, remove per-scan (or batch) DC offset before cosine L_inv
-                # so LayerNorm bias and condition centroids cannot trivially satisfy 1 - cos(mu + dA, mu + dB) -> 0.
-                if getattr(self.config, "scan_centered_inv", False):
-                    _grp = (
-                        scan_id.unsqueeze(1).expand(-1, H_inv_online.shape[1]).reshape(-1)
-                        if scan_id is not None
-                        else None
-                    )
-                    H_inv_online = center_by_group(
-                        H_inv_online.reshape(-1, H_inv_online.shape[-1]).float(), _grp
-                    ).reshape_as(H_inv_online)
-                    H_ctx_b_s = center_by_group(
-                        H_ctx_b_s.reshape(-1, H_ctx_b_s.shape[-1]).float(), _grp
-                    ).reshape_as(H_ctx_b_s)
-
-                use_oracle = bool(getattr(self.config, "inv_oracle_mask", False))
-                snd_frac = torch.tensor(1.0, device=device)
-                if use_oracle and inv_sound_mask is not None:
-                    if inv_sound_mask.ndim == 2 and inv_sound_mask.shape[1] == 25:
-                        m_selected = inv_sound_mask[batch_arange, ctx_idx]
-                    elif getattr(self.config, "contiguous_masking", False):
-                        raise ValueError(
-                            f"inv_oracle_mask=True with contiguous_masking=True requires "
-                            f"inv_sound_mask of shape [B, 25], got {tuple(inv_sound_mask.shape)}."
-                        )
-                    else:
-                        m_selected = inv_sound_mask
-                    m = m_selected.reshape(-1).to(dtype=torch.bool)
-                    frac = m.float().mean()
-                    snd_frac = frac.detach()
-                    if m.sum() >= max(1, int(0.05 * m.numel())):
-                        zo = H_inv_online.reshape(-1, H_inv_online.shape[-1])[m]
-                        zt = H_ctx_b_s.reshape(-1, H_ctx_b_s.shape[-1])[m]
-                        if getattr(self.config, "inv_cosine", False):
-                            inv_loss = 1.0 - F.cosine_similarity(zo, zt, dim=-1).mean()
-                        else:
-                            inv_loss = F.mse_loss(zo, zt)
-                    else:
-                        if getattr(self.config, "inv_cosine", False):
-                            inv_loss = 1.0 - F.cosine_similarity(H_inv_online, H_ctx_b_s, dim=-1).mean()
-                        else:
-                            inv_loss = F.mse_loss(H_inv_online, H_ctx_b_s)
-                elif getattr(self.config, "inv_cosine", False):
-                    inv_loss = 1.0 - F.cosine_similarity(H_inv_online, H_ctx_b_s, dim=-1).mean()
-                else:
-                    inv_loss = F.mse_loss(H_inv_online, H_ctx_b_s)
-                inv_sound_frac = snd_frac
-            else:
-                # Skipped by schedule: avoid the extra EMA forward entirely.
-                inv_loss = torch.tensor(0.0, device=device)
-                inv_sound_frac = torch.tensor(1.0, device=device)
-
-            # E) EXP-49 L_xcov: Cross-subspace decorrelation lock.
-            # ||XCov(z_c, z_s)||^2 over the N = B*16 context tokens.
-            # Purely unsupervised; prevents z_c from copying defect info back
-            # from z_s, forcing it to pick up the remainder (condition drift).
-            # NOTE: this term alone cannot create the split (it is symmetric);
-            # L_inv above creates the role asymmetry, L_xcov locks it in.
-            xcov_weight = getattr(self.config, "xcov_weight", 0.0)
-            eff_xcov = xcov_weight * xcov_scale
-            if eff_xcov > 0:
-                flat_ctx_c = H_ctx_c.reshape(B * H_ctx_c.shape[1], -1).float()  # [N, D_c]
-                flat_ctx_s_f = flat_ctx_s.float()
-                N = flat_ctx_c.shape[0]
-                zc_cent = flat_ctx_c - flat_ctx_c.mean(dim=0, keepdim=True)
-                zs_cent = flat_ctx_s_f - flat_ctx_s_f.mean(dim=0, keepdim=True)
-                xcov = (zc_cent.T @ zs_cent) / max(N - 1, 1)  # [D_c, D_s]
-                xcov_loss = (xcov ** 2).sum() / (D_c * D_s)
-            else:
-                xcov_loss = torch.tensor(0.0, device=device)
-
-            # F) z_c grounding job: predict the Condition-B token from pooled
-            # z_c. Gives the carrier subspace an explicit condition-carrying
-            # role (target detached: gradient shapes z_c + head, never the
-            # condition path). Inactive when weight is 0 or c_b is disabled.
-            zc_cond_weight = getattr(self.config, "zc_cond_weight", 0.0)
-            if zc_cond_weight > 0 and self.zc_cond_head is not None and c_b is not None:
-                zc_pred = self.zc_cond_head(H_ctx_c.mean(dim=1))  # [B, D]
-                if getattr(self.config, "subspace_norm", False) or getattr(self.config, "clean_phasor_token", False):
-                    # Self-consistent carrier grounding (fixes FM19):
-                    # 1. H_ctx_c (Condition A) reconstructs Condition A's own dual-domain token mean
-                    #    instead of predicting an independent randomly-paired Condition B.
-                    # 2. cond_proj (c_b from Condition B) aligns with Condition B's target carrier H_tgt_c,
-                    #    restoring non-zero gradient flow to cond_proj.
-                    cond_a_target = tokens_a.mean(dim=1).detach()  # [B, D]
-                    cond_b_target = H_tgt_c.mean(dim=1).detach()   # [B, D_c]
-                    zc_cond_loss = F.mse_loss(zc_pred, cond_a_target) + F.mse_loss(
-                        c_b.squeeze(1)[..., :D_c], cond_b_target
-                    )
-                else:
-                    zc_cond_loss = F.mse_loss(zc_pred, c_b.squeeze(1).detach())
-            else:
-                zc_cond_loss = torch.tensor(0.0, device=device)
-
-            # G) Fix 1: kill the shared DC offset (needle geometry). The offset
-            # is in the null space of every other term (cancels in branch
-            # differences; VICReg/xcov center first), so it random-walks via
-            # LN gain/bias and makes all cosine reasoning vacuous. Penalize
-            # GLOBAL batch-token mean-square per subspace: per-scan condition
-            # bias in z_c is legitimate and survives, only the shared giant
-            # bias is removed.
-            offset_weight = getattr(self.config, "offset_weight", 0.0)
-            if offset_weight > 0:
-                m_c = H_ctx_c.reshape(-1, H_ctx_c.shape[-1]).mean(dim=0)
-                m_s = H_ctx_s.reshape(-1, H_ctx_s.shape[-1]).mean(dim=0)
-                offset_loss = (m_c.pow(2).mean() + m_s.pow(2).mean())
-            else:
-                offset_loss = torch.tensor(0.0, device=device)
-
-            anti_hijack_ratio = getattr(self.config, "anti_hijack_ratio", 0.0)
-            if anti_hijack_ratio > 0 and pred_loss.detach() > 0:
-                aux_loss = (
-                    carrier_loss
-                    + vicreg_loss
-                    + eff_inv * inv_loss
-                    + eff_xcov * xcov_loss
-                    + zc_cond_weight * zc_cond_loss
-                    + offset_weight * offset_loss
-                    + pool_var_weight * pool_var_loss
-                )
-                max_aux = anti_hijack_ratio * pred_loss.detach()
-                if aux_loss > max_aux:
-                    aux_scale = max_aux / (aux_loss + 1e-8)
-                    aux_loss = aux_loss * aux_scale
-                total_loss = pred_loss + aux_loss
-            else:
-                total_loss = (
-                    pred_loss
-                    + carrier_loss
-                    + vicreg_loss
-                    + eff_inv * inv_loss
-                    + eff_xcov * xcov_loss
-                    + zc_cond_weight * zc_cond_loss
-                    + offset_weight * offset_loss
-                    + pool_var_weight * pool_var_loss
-                )
         else:
-            # Standard single-space prediction
-            diff_attn = bool(getattr(self.config, "diffusion_attention", False))
-            if getattr(self.config, "grounded_condition_pred", False):
-                cond_in = F.normalize(cond_transfer, p=2.0, dim=-1) if cond_transfer is not None else None
-                H_pred_b = self.predictor(
-                    H_ctx_a,
-                    tgt_pos_b,
-                    condition_token=cond_in,
-                    tgt_coords=tgt_coords_b if diff_attn else None,
-                    ctx_coords=ctx_coords_a if diff_attn else None,
-                )
-                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
-                if focus_gamma > 0:
-                    cos_per_probe = 1.0 - F.cosine_similarity(H_pred_b, target_signal, dim=-1)
-                    h_pred_norm = F.normalize(H_pred_b, p=2.0, dim=-1)
-                    h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
-                    shape_per_probe = (h_pred_norm - h_tgt_norm).abs().mean(dim=-1)
-                    sample_loss = cos_per_probe.mean(dim=-1) + shape_per_probe.mean(dim=-1)
-                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
-                    if mag_weight > 0:
-                        pred_mag = torch.norm(H_pred_b, p=2, dim=-1)
-                        tgt_mag = torch.norm(target_signal, p=2, dim=-1)
-                        mag_per_probe = (torch.log(pred_mag + 1e-4) - torch.log(tgt_mag + 1e-4)).abs().mean(dim=-1)
-                        sample_loss = sample_loss + mag_weight * mag_per_probe
-                    tgt_dev = torch.norm(target_signal.detach(), p=2, dim=-1).mean(dim=-1)
-                    weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-                    weights = weights / (weights.mean() + 1e-8)
-                    weights = torch.clamp(weights, min=0.2, max=5.0)
-                    weights = weights / (weights.mean() + 1e-8)
-                    pred_loss = (weights * sample_loss).mean()
-                else:
-                    pred_cos = 1.0 - F.cosine_similarity(H_pred_b, target_signal, dim=-1).mean()
-                    h_pred_norm = F.normalize(H_pred_b, p=2.0, dim=-1)
-                    h_tgt_norm = F.normalize(target_signal, p=2.0, dim=-1)
-                    mag_weight = getattr(self.config, "pred_magnitude_weight", 0.0)
-                    if mag_weight > 0:
-                        pred_mag = torch.norm(H_pred_b, p=2, dim=-1)
-                        tgt_mag = torch.norm(target_signal, p=2, dim=-1)
-                        mag_loss = F.l1_loss(torch.log(pred_mag + 1e-4), torch.log(tgt_mag + 1e-4))
-                        pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm) + mag_weight * mag_loss
-                    else:
-                        pred_loss = pred_cos + F.l1_loss(h_pred_norm, h_tgt_norm)
-            else:
-                cond_in = cond_transfer if getattr(self.config, "use_condition_token", False) else None
-                H_pred_b = self.predictor(
-                    H_ctx_a,
-                    tgt_pos_b,
-                    condition_token=cond_in,
-                    tgt_coords=tgt_coords_b if diff_attn else None,
-                    ctx_coords=ctx_coords_a if diff_attn else None,
-                )
-                pred_loss_type = getattr(self.config, "pred_loss_type", "l1")
-                focus_gamma = getattr(self.config, "self_focus_gamma", 0.0)
-                if pred_loss_type == "raw_l1":
-                    sample_loss = (H_pred_b - target_signal).abs().mean(dim=(-2, -1))
-                    if focus_gamma > 0:
-                        tgt_dev = torch.norm(target_signal.detach(), p=2, dim=-1).mean(dim=-1)
-                        weights = torch.pow(tgt_dev + 1e-4, focus_gamma)
-                        weights = weights / (weights.mean() + 1e-8)
-                        weights = torch.clamp(weights, min=0.2, max=5.0)
-                        weights = weights / (weights.mean() + 1e-8)
-                        pred_loss = (weights * sample_loss).mean()
-                    else:
-                        pred_loss = sample_loss.mean()
-                else:
-                    pred_loss = F.l1_loss(H_pred_b, target_signal)
+            vicreg_loss = torch.tensor(0.0, device=device)
+            var_loss = torch.tensor(0.0, device=device)
+            cov_loss = torch.tensor(0.0, device=device)
 
-            flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
-            if self.config.var_weight > 0 or self.config.cov_weight > 0:
-                vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
-                    flat_ctx,
-                    var_weight=self.config.var_weight,
-                    cov_weight=self.config.cov_weight,
-                    gamma=self.config.var_gamma,
-                    scan_id=scan_id_expanded,
+        # 8. Background-gated cross-condition invariance L_inv
+        inv_weight = getattr(self.config, "inv_weight", 0.0)
+        eff_inv = inv_weight * inv_scale
+        if eff_inv > 0:
+            with torch.no_grad():
+                H_ctx_b = self.target_encoder(
+                    tokens_b[batch_arange, ctx_idx], pos_b[batch_arange, ctx_idx]
                 )
-            else:
-                vicreg_loss = torch.tensor(0.0, device=device)
-                var_loss = torch.tensor(0.0, device=device)
-                cov_loss = torch.tensor(0.0, device=device)
+            z_a = flat_ctx
+            z_b = H_ctx_b.reshape(B * H_ctx_b.shape[1], -1)
+            if getattr(self.config, "scan_centered_inv", True) and scan_id_expanded is not None:
+                z_a = center_by_group(z_a, scan_id_expanded)
+                z_b = center_by_group(z_b, scan_id_expanded)
+            if self.inv_head is not None:
+                z_a = self.inv_head(z_a)
 
-            carrier_loss = torch.tensor(0.0, device=device)
-            total_loss = pred_loss + vicreg_loss
+            keep, keep_frac = self._background_gate(
+                x_a, ctx_idx, batch_arange, float(getattr(self.config, "inv_trim_q", 0.75))
+            )
+            if keep is not None:
+                z_a = z_a[keep]
+                z_b = z_b[keep]
+            if getattr(self.config, "inv_cosine", True):
+                inv_loss = 1.0 - F.cosine_similarity(z_a, z_b, dim=-1).mean()
+            else:
+                inv_loss = F.mse_loss(z_a, z_b)
+        else:
             inv_loss = torch.tensor(0.0, device=device)
-            inv_sound_frac = torch.tensor(1.0, device=device)
-            xcov_loss = torch.tensor(0.0, device=device)
-            zc_cond_loss = torch.tensor(0.0, device=device)
-            offset_loss = torch.tensor(0.0, device=device)
+            keep_frac = 1.0
 
-            # Fix 4 (standard branch): pooled hinge on the readout quantity.
-            pool_var_weight = getattr(self.config, "pool_var_weight", 0.0)
-            if pool_var_weight > 0:
-                H_pool = torch.cat([H_ctx_a[:, 0, :], H_ctx_a[:, 1:, :].mean(dim=1)], dim=-1)
-                pool_var_loss, _, _ = compute_vicreg_loss(
-                    H_pool,
-                    var_weight=1.0,
-                    cov_weight=0.0,
-                    gamma=self.config.var_gamma,
-                    scan_id=scan_id,
-                )
-                total_loss = total_loss + pool_var_weight * pool_var_loss
-            else:
-                pool_var_loss = torch.tensor(0.0, device=device)
+        # 9. Total loss: prediction + (optionally capped) auxiliary terms. The cap
+        #    guarantees JEPA prediction keeps >= 1/(1+ratio) of the gradient budget.
+        aux_loss = vicreg_loss + eff_inv * inv_loss
+        anti_hijack_ratio = getattr(self.config, "anti_hijack_ratio", 0.0)
+        if anti_hijack_ratio > 0 and pred_loss.detach() > 0:
+            max_aux = anti_hijack_ratio * pred_loss.detach()
+            if aux_loss > max_aux:
+                aux_loss = aux_loss * (max_aux / (aux_loss + 1e-8))
+        total_loss = pred_loss + aux_loss
 
         return {
             "total_loss": total_loss,
             "pred_loss": pred_loss,
-            "carrier_loss": carrier_loss,
             "var_loss": var_loss,
             "cov_loss": cov_loss,
+            "aux_loss": aux_loss,
             "inv_loss": inv_loss,
-            "inv_sound_frac": inv_sound_frac,
-            "xcov_loss": xcov_loss,
-            "zc_cond_loss": zc_cond_loss,
-            "offset_loss": offset_loss,
-            "pool_var_loss": pool_var_loss,
+            "inv_keep_frac": torch.tensor(keep_frac, device=device),
             "H_ctx_a": H_ctx_a,
             "H_tgt_b": H_tgt_b,
             "H_pred_b": H_pred_b,
@@ -908,41 +432,20 @@ class CrossConditionJEPA(nn.Module):
         }
 
     @torch.no_grad()
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_features(
+        self,
+        x: torch.Tensor,
+        bg_ref_energy: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Extracts the unified downstream representation [h_center, mean(h_context)] [B, 2*D].
+
+        Args:
+            x: [B, 5, 5, C] patches of a single inspection scan.
+            bg_ref_energy: optional per-sample sound-metal background energy for the
+                global Delta E anchor (identical definition as in training).
         """
-        Extracts unified downstream representation for inspection C-scan:
-        If latent_disentanglement is True:
-          - 'scattering': Extracts scattering perturbation z_s = [h_center_s, h_context_s] in R^{2*D_s} (drift-free).
-          - 'carrier': Extracts carrier baseline z_c in R^{2*D_c}.
-          - 'full': Extracts full concatenated vector [z_c, z_s] in R^{2*D}.
-        Default: Concatenated [B, 2*D] vector [h_center, h_context_pool].
-        """
-        tokens, pos = self.tokenizer(x)  # [B, 25, D]
-        diff_attn = bool(getattr(self.config, "diffusion_attention", False))
-        coords = self.tokenizer.norm_coords.expand(tokens.shape[0], -1, -1) if diff_attn else None
-        h_all = self.context_encoder(tokens, pos, coords=coords)  # [B, 25, D]
-
-        if getattr(self.config, "unified_latent", False):
-            # EXP-68: Single Unified 64D Representation -> Concatenated [B, 2*D] = [B, 128]
-            h_center = h_all[:, 0, :]
-            h_context = torch.mean(h_all[:, 1:, :], dim=1)
-            return torch.cat([h_center, h_context], dim=-1)
-
-        if getattr(self.config, "latent_disentanglement", False):
-            D_c = getattr(self.config, "carrier_dim", self.config.embed_dim // 2)
-            latent_type = getattr(self.config, "downstream_latent_type", "scattering")
-
-            if latent_type == "scattering":
-                h_all_s = h_all[..., D_c:]  # [B, 25, D_s]
-                h_center = h_all_s[:, 0, :]
-                h_context = torch.mean(h_all_s[:, 1:, :], dim=1)
-                return torch.cat([h_center, h_context], dim=-1)  # [B, 2*D_s]
-            elif latent_type == "carrier":
-                h_all_c = h_all[..., :D_c]  # [B, 25, D_c]
-                h_center = h_all_c[:, 0, :]
-                h_context = torch.mean(h_all_c[:, 1:, :], dim=1)
-                return torch.cat([h_center, h_context], dim=-1)  # [B, 2*D_c]
-
-        h_center = h_all[:, 0, :]  # [B, D] Center probe
-        h_context = torch.mean(h_all[:, 1:, :], dim=1)  # [B, D] Outer context pool
-        return torch.cat([h_center, h_context], dim=-1)  # [B, 2*D]
+        tokens, pos = self.tokenizer(x, bg_ref_energy=bg_ref_energy)
+        h_all = self.context_encoder(tokens, pos)  # [B, 25, D]
+        h_center = h_all[:, 0, :]
+        h_context = torch.mean(h_all[:, 1:, :], dim=1)
+        return torch.cat([h_center, h_context], dim=-1)
