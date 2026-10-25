@@ -853,9 +853,27 @@ def main():
             is_ood_regime = regime_flag(E_feat, ref_energy)
 
             # TASK 1: Anomaly Detection
-            # A) Supervised Trained Linear Probe
+            # A) Supervised Trained Linear Probe (raw latents)
             det_res = suite.evaluate_global_detection(readouts=global_readouts, features=latents, labels=gt_mask)
             prob_map = det_res["prob_map"]
+
+            # A2) TTA Calibrated Linear Probe (P1u_trim_s2 whitened + P2h hard-negative mined).
+            #     Unsupervised per-scan background whitening removes the feature-energy
+            #     shift between specimens (Rivet_v2 is ~10x lower energy than Rivet_v1),
+            #     which otherwise hides the probe's real detection power.
+            flat_z = latents.reshape(-1, latents.shape[-1]).astype(np.float32)
+            mu_bg, W_bg = unsup_trimmed_bg_stats(
+                flat_z, keep_q=args.tta_trim_ratio, eps=args.tta_shrinkage
+            )
+            latents_tta = (flat_z - mu_bg).dot(W_bg).astype(np.float32).reshape(latents.shape)
+            tta_readouts_view = {
+                "scaler_det": global_readouts.get("tta_scaler_det") or global_readouts["scaler_det"],
+                "lr_probe": global_readouts.get("tta_lr_probe") or global_readouts["lr_probe"],
+                "mlp_probe": global_readouts.get("tta_mlp_probe") or global_readouts.get("mlp_probe"),
+            }
+            det_tta_res = suite.evaluate_global_detection(
+                readouts=tta_readouts_view, features=latents_tta, labels=gt_mask
+            )
 
             # B) Unsupervised Mahalanobis Distance
             anom_res = suite.compute_anomaly_detection_metrics(latents=latents, ground_truth_mask=gt_mask)
@@ -912,6 +930,8 @@ def main():
                 "linear_probe_ap": det_res["average_precision"],
                 "linear_probe_f1": det_res["f1_score"],
                 "linear_probe_acc": det_res["accuracy"],
+                "tta_lp_auc": det_tta_res["auc_roc"],
+                "tta_lp_ap": det_tta_res["average_precision"],
                 "mlp_probe_auc": det_res["mlp_auc_roc"],
                 "mlp_probe_ap": det_res["mlp_average_precision"],
                 "mahalanobis_auc": anom_res["auc_roc"],
@@ -1112,6 +1132,8 @@ def main():
             return {}
         lp_auc = [r["linear_probe_auc"] for r in rows]
         lp_ap = [r["linear_probe_ap"] for r in rows]
+        tta_lp_auc = [r.get("tta_lp_auc", 0.0) for r in rows]
+        tta_lp_ap = [r.get("tta_lp_ap", 0.0) for r in rows]
         mahal_auc = [r["mahalanobis_auc"] for r in rows]
         cnr = [r["cnr"] for r in rows]
         pod_05 = [r.get("pod_rate_05", 0.0) for r in rows]
@@ -1131,6 +1153,9 @@ def main():
             "linear_probe_auc_std": float(np.std(lp_auc)),
             "linear_probe_ap_mean": float(np.mean(lp_ap)),
             "linear_probe_ap_std": float(np.std(lp_ap)),
+            "tta_lp_auc_mean": float(np.mean(tta_lp_auc)),
+            "tta_lp_auc_std": float(np.std(tta_lp_auc)),
+            "tta_lp_ap_mean": float(np.mean(tta_lp_ap)),
             "mahalanobis_auc_mean": float(np.mean(mahal_auc)),
             "cnr_mean": float(np.mean(cnr)),
             "pod_rate_05_mean": float(np.mean(pod_05)),
@@ -1220,12 +1245,12 @@ def main():
         f.write(f"- **Total Files Evaluated**: {len(master_results)}\n\n")
 
         f.write("## 1. Split Performance Breakdown\n\n")
-        f.write("| Split | Files | Linear Probe AUC | Linear Probe AP | CNR | Mahalanobis AUC | POD (Otsu) | Seg IoU (Otsu) | Sound FPR | Sizing R² |\n")
-        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
+        f.write("| Split | Files | Linear Probe AUC | TTA LP AUC (P1u_trim_s2 + P2h) | Linear Probe AP | CNR | Mahalanobis AUC | POD (Otsu) | Seg IoU (Otsu) | Sound FPR | Sizing R² |\n")
+        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for sp in args.eval_splits:
             st = master_summary["by_split"].get(sp, {})
             if st:
-                f.write(f"| **{sp.upper()}** | {st['count']} | {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['mahalanobis_auc_mean']:.4f} | {st.get('pod_rate_otsu_mean', 0.0):.4f} | {st.get('segmentation_iou_otsu_mean', 0.0):.4f} | {st.get('sound_fpr_otsu_mean', 0.0):.4f} | {st['sizing_r2_mean']:.4f} |\n")
+                f.write(f"| **{sp.upper()}** | {st['count']} | {st['linear_probe_auc_mean']:.4f} ± {st['linear_probe_auc_std']:.4f} | {st.get('tta_lp_auc_mean', 0.0):.4f} ± {st.get('tta_lp_auc_std', 0.0):.4f} | {st['linear_probe_ap_mean']:.4f} | {st['cnr_mean']:.2f} | {st['mahalanobis_auc_mean']:.4f} | {st.get('pod_rate_otsu_mean', 0.0):.4f} | {st.get('segmentation_iou_otsu_mean', 0.0):.4f} | {st.get('sound_fpr_otsu_mean', 0.0):.4f} | {st['sizing_r2_mean']:.4f} |\n")
 
         f.write("\n## 2. Generalization Disaggregation\n\n")
         f.write("> AUDIT-2026-10-23: these tables are **test-only** (`by_*_test`). The "
@@ -1286,7 +1311,7 @@ def main():
     for sp in args.eval_splits:
         st = master_summary["by_split"].get(sp, {})
         if st:
-            print(f"[{sp.upper():5s}] ({st['count']} files) -> LP AUC: {st['linear_probe_auc_mean']:.4f} +/- {st['linear_probe_auc_std']:.4f} | LP AP: {st['linear_probe_ap_mean']:.4f} | CNR: {st['cnr_mean']:.2f} | Seg IoU: {st['segmentation_iou_mean']:.4f} | Sizing R2: {st['sizing_r2_mean']:.4f}")
+            print(f"[{sp.upper():5s}] ({st['count']} files) -> LP AUC: {st['linear_probe_auc_mean']:.4f} +/- {st['linear_probe_auc_std']:.4f} | TTA LP AUC: {st.get('tta_lp_auc_mean', 0.0):.4f} | LP AP: {st['linear_probe_ap_mean']:.4f} | CNR: {st['cnr_mean']:.2f} | Seg IoU: {st['segmentation_iou_mean']:.4f} | Sizing R2: {st['sizing_r2_mean']:.4f}")
     print("-" * 80)
     ov = master_summary["overall"]
     print(f"[OVERALL] ({ov['count']} files) -> LP AUC: {ov['linear_probe_auc_mean']:.4f} +/- {ov['linear_probe_auc_std']:.4f} | LP AP: {ov['linear_probe_ap_mean']:.4f} | CNR: {ov['cnr_mean']:.2f} | Seg IoU: {ov['segmentation_iou_mean']:.4f}")

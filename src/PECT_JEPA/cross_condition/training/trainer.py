@@ -386,6 +386,9 @@ class CrossConditionTrainer:
             scan_id = batch.get("scan_id")
             if scan_id is not None:
                 scan_id = scan_id.to(self.device, non_blocking=True)
+            scan_id_b = batch.get("scan_id_b")
+            if scan_id_b is not None:
+                scan_id_b = scan_id_b.to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -396,6 +399,7 @@ class CrossConditionTrainer:
                     ref_b,
                     ref_a=ref_a,
                     scan_id=scan_id,
+                    scan_id_b=scan_id_b,
                     inv_scale=inv_scale,
                 )
                 loss = outputs["total_loss"]

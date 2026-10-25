@@ -123,7 +123,12 @@ class PairedPECTDataset(Dataset):
                                desc="Loading canonical C-scans",
                                dynamic_ncols=True))
 
-        for fpath, meta, entry in loaded:
+        # Stable per-FILE identity (0..len(loaded)-1), NOT the directed-pair index.
+        # The pair index (0..2105) is ~unique per batch sample, so using it as the
+        # VICReg group id made every group a singleton once the 16 probes of a
+        # window were expanded (exp71: val_sound_var -> 1.6e-5).
+        for scan_idx, (fpath, meta, entry) in enumerate(loaded):
+            entry["scan_id"] = scan_idx
             spec = meta["specimen"]
             if spec not in self.scans_by_specimen:
                 self.scans_by_specimen[spec] = []
@@ -234,5 +239,6 @@ class PairedPECTDataset(Dataset):
             "ref_a": torch.from_numpy(scan_a["ref_patch"]).float(),
             "ref_b": torch.from_numpy(scan_b["ref_patch"]).float(),
             "coord": torch.tensor([r, c], dtype=torch.long),
-            "scan_id": torch.tensor(pair_idx, dtype=torch.long),
+            "scan_id": torch.tensor(scan_a["scan_id"], dtype=torch.long),
+            "scan_id_b": torch.tensor(scan_b["scan_id"], dtype=torch.long),
         }

@@ -37,6 +37,7 @@ if REPO_ROOT not in sys.path:
 from src.PECT_JEPA.cross_condition.configs.config import CrossConditionConfig
 from src.PECT_JEPA.cross_condition.models.cross_condition_jepa import (
     CrossConditionJEPA,
+    compute_vicreg_loss,
     corner_background_energy,
     spectral_token_dim,
 )
@@ -268,6 +269,48 @@ class TestUnifiedForwardContract(unittest.TestCase):
         self.assertLess(frac, 1.0, "background gate kept every token (no gating applied)")
         self.assertGreaterEqual(frac, 0.25)
         self.assertLessEqual(frac, 0.75)
+
+    def test_singleton_patch_does_not_center_against_own_16_probes(self):
+        """A single window (16 probes) must never be its own VICReg group.
+
+        exp71 passed `pair_idx` (0..2105) as scan_id and expanded it over the 16
+        probes of each window. Every group then had >= 16 elements, so the
+        `singleton` guard never fired and the window was centered against its own
+        probe mean: static positional offsets pos[0..15] satisfied the hinge while
+        the per-pixel representation (r, c) collapsed (val_sound_var -> 1.6e-5).
+        """
+        B, P, D = 4, 16, 8
+        pos = torch.arange(P, dtype=torch.float32).unsqueeze(1).expand(P, D)
+        H_ctx = pos.unsqueeze(0).expand(B, P, D).clone()  # identical windows
+        scan_id = torch.arange(B, dtype=torch.long)
+
+        flat_ctx = H_ctx.reshape(B * P, D)
+        patch_ctx = H_ctx.mean(dim=1)  # [B, D] -> all rows identical
+        scan_id_expanded = scan_id.unsqueeze(1).expand(-1, P).reshape(-1)
+
+        _, var_probe, _ = compute_vicreg_loss(
+            flat_ctx, scan_id=scan_id_expanded, min_group_size=2 * P,
+        )
+        _, var_patch, _ = compute_vicreg_loss(
+            patch_ctx, scan_id=scan_id, min_group_size=2,
+        )
+
+        self.assertLess(var_probe.item(), 0.1,
+                        "probe-level VICReg is satisfied by static positional offsets")
+        self.assertGreater(var_patch.item(), 0.9,
+                           "patch-level VICReg failed to penalize a collapsed per-pixel representation")
+
+    def test_separate_bg_ref_for_a_and_b(self):
+        """Changing ref_a must not change the target branch H_tgt_b (no A->B leak)."""
+        cfg = CrossConditionConfig(global_bg_energy_anchor=True)
+        model = CrossConditionJEPA(cfg).eval()
+        ref_a = torch.randn(self.B, 5, 5, self.C)
+        with torch.no_grad():
+            out_ref = model(x_a=self.x_a, x_b=self.x_b, ref_b=self.ref_b, ref_a=ref_a)
+            out_other = model(x_a=self.x_a, x_b=self.x_b, ref_b=self.ref_b,
+                              ref_a=ref_a + 25.0)
+        self.assertTrue(torch.allclose(out_ref["H_tgt_b"], out_other["H_tgt_b"], atol=1e-6),
+                        "ref_a leaked into the Condition-B target branch")
 
     def test_anti_hijack_never_caps_vicreg(self):
         """FM22: VICReg keeps full strength; only the optional L_inv term may be capped.

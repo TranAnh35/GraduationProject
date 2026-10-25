@@ -47,12 +47,13 @@ class TestFullPairingDataset(unittest.TestCase):
 
         # Group mock scans by specimen
         ds.scans_by_specimen = {"Corrosion": [], "Rivet_v1": [], "Rivet_v2": []}
-        for f in mock_files:
+        for file_idx, f in enumerate(mock_files):
             meta = extract_file_metadata(f)
             spec = meta["specimen"]
             ds.scans_by_specimen[spec].append({
                 "file_path": f,
                 "meta": meta,
+                "scan_id": file_idx,
                 "sY": 270,
                 "sX": 270,
                 "C": 128,
@@ -109,6 +110,9 @@ class TestFullPairingDataset(unittest.TestCase):
         self.assertIn("ref_b", sample)
         self.assertEqual(sample["x_a"].shape, (5, 5, 128))
         self.assertEqual(sample["x_b"].shape, (5, 5, 128))
+        # scan_id identifies the FILE (0..80), never the directed pair (0..2105)
+        self.assertTrue(0 <= int(sample["scan_id"]) < 81)
+        self.assertTrue(0 <= int(sample["scan_id_b"]) < 81)
 
 
 if __name__ == "__main__":

@@ -68,10 +68,19 @@ def normalized_probe_l1(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     return (h_pred_norm - h_tgt_norm).abs().mean(dim=(-2, -1)).mean()
 
 
-def center_by_group(z_f: torch.Tensor, group_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+def center_by_group(
+    z_f: torch.Tensor,
+    group_id: Optional[torch.Tensor] = None,
+    min_group_size: int = 2,
+) -> torch.Tensor:
     """Center a 2D tensor z_f [N, D] per group_id [N] (global mean if None).
 
-    Singletons fall back to the global mean so no sample remains uncentered.
+    Groups with fewer than `min_group_size` elements in the batch fall back to
+    the global batch mean. This is critical for the probe-level VICReg: a single
+    patch contributes 16 probes, so a group of `counts <= 16` is one window and
+    subtracting its own probe mean would erase the spatial (r, c) variance that
+    VICReg is supposed to protect (exp71: val_sound_var -> 1.6e-5 while R_eff
+    stayed at 61.9D on static positional offsets).
     """
     if group_id is None:
         return z_f - z_f.mean(dim=0, keepdim=True)
@@ -82,9 +91,9 @@ def center_by_group(z_f: torch.Tensor, group_id: Optional[torch.Tensor] = None) 
     sums.index_add_(0, inv, z_f)
     means = sums / counts.clamp_min(1).unsqueeze(1).float()  # [S, D]
     m = means[inv]  # [N, D] float32
-    singleton = (counts[inv] <= 1).unsqueeze(1)  # [N, 1]
+    small_group = (counts[inv] < int(min_group_size)).unsqueeze(1)  # [N, 1]
     global_mean = z_f.mean(dim=0, keepdim=True)
-    return torch.where(singleton, z_f - global_mean, z_f - m)
+    return torch.where(small_group, z_f - global_mean, z_f - m)
 
 
 def compute_vicreg_loss(
@@ -94,29 +103,20 @@ def compute_vicreg_loss(
     gamma: float = 1.0,
     eps: float = 1e-4,
     scan_id: Optional[torch.Tensor] = None,
+    min_group_size: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """VICReg coordinate-wise variance hinge and covariance decorrelation penalty.
 
     If scan_id is provided, z is centered per scan before computing variance and
     covariance, so between-scan drift cannot falsely satisfy the variance
     regularizer; the model must amplify true within-scan flaw variance.
-    Vectorized via index_add_ (one pass instead of one masked pass per scan).
+    Groups smaller than `min_group_size` fall back to the global mean instead of
+    being left uncentered (a singleton group must never satisfy the hinge by
+    keeping its own mean).
     """
     z_f = z.float()
-    if scan_id is not None:
-        uniq, inv = torch.unique(scan_id, return_inverse=True)
-        n_groups = uniq.numel()
-        counts = torch.bincount(inv, minlength=n_groups)
-        sums = torch.zeros(n_groups, z_f.shape[1], device=z_f.device, dtype=torch.float32)
-        sums.index_add_(0, inv, z_f)
-        means = sums / counts.clamp_min(1).unsqueeze(1).float()
-        m = means[inv]
-        singleton = (counts[inv] <= 1).unsqueeze(1)
-        z_cent = torch.where(singleton, z_f, z_f - m)
-        std = torch.sqrt(z_cent.var(dim=0, unbiased=False) + eps)
-    else:
-        std = torch.sqrt(z_f.var(dim=0, unbiased=False) + eps)
-        z_cent = z_f - z_f.mean(dim=0, keepdim=True)
+    z_cent = center_by_group(z_f, scan_id, min_group_size=min_group_size)
+    std = torch.sqrt(z_cent.var(dim=0, unbiased=False) + eps)
 
     var_loss = torch.mean(F.relu(gamma - std))
 
@@ -291,6 +291,7 @@ class CrossConditionJEPA(nn.Module):
         ref_b: torch.Tensor,
         ref_a: Optional[torch.Tensor] = None,
         scan_id: Optional[torch.Tensor] = None,
+        scan_id_b: Optional[torch.Tensor] = None,
         inv_scale: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -299,18 +300,23 @@ class CrossConditionJEPA(nn.Module):
         x_b:     [B, 5, 5, C] measurement patch from Condition B (same physical coordinate)
         ref_b:   [B, 5, 5, C] sound-metal background patch of Condition B
         ref_a:   [B, 5, 5, C] sound-metal background patch of Condition A (optional)
-        scan_id: [B] scan pair identifier for within-scan centered regularization
+        scan_id: [B] file id of Condition A for within-scan centered regularization
+        scan_id_b: [B] file id of Condition B (defaults to scan_id)
         inv_scale: curriculum multiplier in [0, 1] for L_inv (default 1.0)
         """
         B = x_a.shape[0]
         device = x_a.device
 
-        # 1. Dual-domain tokenization (global background anchor from ref patches)
-        bg_ref = None
+        # 1. Dual-domain tokenization: each condition gets its OWN background
+        #    anchor. Passing A's anchor into the B branch leaked A's background
+        #    energy into the target side and made H_tgt_b depend on ref_a.
+        bg_ref_a = None
+        bg_ref_b = None
         if getattr(self.config, "global_bg_energy_anchor", False):
-            bg_ref = self._bg_ref_energy(ref_a if ref_a is not None else ref_b)
-        tokens_a, pos_a = self.tokenizer(x_a, bg_ref_energy=bg_ref)  # [B, 25, D]
-        tokens_b, pos_b = self.tokenizer(x_b, bg_ref_energy=bg_ref)
+            bg_ref_a = self._bg_ref_energy(ref_a if ref_a is not None else ref_b)
+            bg_ref_b = self._bg_ref_energy(ref_b if ref_b is not None else ref_a)
+        tokens_a, pos_a = self.tokenizer(x_a, bg_ref_energy=bg_ref_a)  # [B, 25, D]
+        tokens_b, pos_b = self.tokenizer(x_b, bg_ref_energy=bg_ref_b)
 
         # 2. Self-supervised condition token
         c_b = self.extract_condition_token(ref_b) if self.config.use_condition_token else None
@@ -347,9 +353,13 @@ class CrossConditionJEPA(nn.Module):
         else:
             target_signal = H_tgt_b
 
+        n_ctx = H_ctx_a.shape[1]
         scan_id_expanded = None
-        if scan_id is not None and getattr(self.config, "scan_centered_vicreg", True):
-            scan_id_expanded = scan_id.unsqueeze(1).expand(-1, H_ctx_a.shape[1]).reshape(-1)
+        scan_id_b_expanded = None
+        if scan_id is not None:
+            scan_id_expanded = scan_id.unsqueeze(1).expand(-1, n_ctx).reshape(-1)
+            _sid_b = scan_id_b if scan_id_b is not None else scan_id
+            scan_id_b_expanded = _sid_b.unsqueeze(1).expand(-1, n_ctx).reshape(-1)
 
         # 6. Prediction: L2-normalize c_B so an unbounded projector cannot turn the
         #    condition token into a per-scan bias bank (AdaLN has no output norm).
@@ -362,16 +372,35 @@ class CrossConditionJEPA(nn.Module):
         else:
             pred_loss = F.l1_loss(H_pred_b, target_signal)
 
-        # 7. VICReg on the full 64D context representation
-        flat_ctx = H_ctx_a.reshape(B * H_ctx_a.shape[1], -1)
+        # 7. VICReg on BOTH probe-level [B*16, D] and patch-level [B, D].
+        #    Probe-level alone can be satisfied by static positional offsets
+        #    pos[0..15] inside each window, while the per-pixel representation
+        #    (r, c) collapses to a constant. Patch-level averaging removes those
+        #    offsets, so the encoder must keep true spatial variance across the
+        #    C-scan plane.
+        flat_ctx = H_ctx_a.reshape(B * n_ctx, -1)
+        patch_ctx = H_ctx_a.mean(dim=1)  # [B, D]
         if self.config.var_weight > 0 or self.config.cov_weight > 0:
-            vicreg_loss, var_loss, cov_loss = compute_vicreg_loss(
+            _use_sc = getattr(self.config, "scan_centered_vicreg", True)
+            vic_probe, var_probe, cov_probe = compute_vicreg_loss(
                 flat_ctx,
                 var_weight=self.config.var_weight,
                 cov_weight=self.config.cov_weight,
                 gamma=self.config.var_gamma,
-                scan_id=scan_id_expanded,
+                scan_id=scan_id_expanded if _use_sc else None,
+                min_group_size=2 * n_ctx,  # require >= 2 patches of the same scan
             )
+            vic_patch, var_patch, cov_patch = compute_vicreg_loss(
+                patch_ctx,
+                var_weight=self.config.var_weight,
+                cov_weight=self.config.cov_weight,
+                gamma=self.config.var_gamma,
+                scan_id=scan_id if _use_sc else None,
+                min_group_size=2,          # require >= 2 patches of the same scan
+            )
+            vicreg_loss = 0.5 * (vic_probe + vic_patch)
+            var_loss = 0.5 * (var_probe + var_patch)
+            cov_loss = 0.5 * (cov_probe + cov_patch)
         else:
             vicreg_loss = torch.tensor(0.0, device=device)
             var_loss = torch.tensor(0.0, device=device)
@@ -388,8 +417,8 @@ class CrossConditionJEPA(nn.Module):
             z_a = flat_ctx
             z_b = H_ctx_b.reshape(B * H_ctx_b.shape[1], -1)
             if getattr(self.config, "scan_centered_inv", True) and scan_id_expanded is not None:
-                z_a = center_by_group(z_a, scan_id_expanded)
-                z_b = center_by_group(z_b, scan_id_expanded)
+                z_a = center_by_group(z_a, scan_id_expanded, min_group_size=2 * n_ctx)
+                z_b = center_by_group(z_b, scan_id_b_expanded, min_group_size=2 * n_ctx)
             if self.inv_head is not None:
                 z_a = self.inv_head(z_a)
 
