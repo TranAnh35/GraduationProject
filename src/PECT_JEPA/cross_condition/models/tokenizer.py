@@ -27,8 +27,21 @@ waveform is mapped to a fused dual-domain token:
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ..configs.config import CrossConditionConfig
 from ..data.topologies import get_spatial_topology_offsets
+
+
+def continuous_phasor(theta: torch.Tensor, saliency: torch.Tensor):
+    """Continuous saliency-weighted phasor (sqrt(s)cos(theta), sqrt(s)sin(theta)).
+
+    `theta/pi` jumps by +-2 across the +-pi branch cut, and a low-energy bin has an
+    arbitrary (noise-driven) phase, so the legacy phase feature is discontinuous
+    exactly where the Dodd-Deeds signal is absent (FM16). The phasor is continuous
+    and its amplitude vanishes with the bin energy.
+    """
+    root_sal = torch.sqrt(saliency.clamp_min(1e-8))
+    return root_sal * torch.cos(theta), root_sal * torch.sin(theta)
 
 
 class DualDomainTokenizer(nn.Module):
@@ -52,13 +65,42 @@ class DualDomainTokenizer(nn.Module):
         self.time_dim = config.embed_dim // 2
         self.freq_dim = config.embed_dim - self.time_dim
 
-        # 1. Time branch: x_norm [C] + t_peak + V_pp + energy + Delta E_local
-        #    + |Delta E_local| (+ Delta E_global)
-        time_input_dim = self.temporal_samples + 5 + int(self.global_bg_energy_anchor)
+        # EXP-72B: multi-scale continuous 1D temporal conv stem. 'linear' keeps the
+        # legacy parameter surface byte-identical (no conv modules created).
+        self.tokenizer_arch = str(getattr(config, "tokenizer_arch", "linear"))
+        if self.tokenizer_arch == "multiscale_conv":
+            stem_ch = 8
+            # Shift-invariant sliding kernels over the whole 128-sample trace:
+            # k=3 -> slope/edge, k=7 -> peak morphology, k=15 (dilation 2, receptive
+            # field 29) -> eddy-current decay envelope. No discrete time slicing.
+            self.conv_k3 = nn.Conv1d(1, stem_ch, kernel_size=3, padding=1, bias=False)
+            self.conv_k7 = nn.Conv1d(1, stem_ch, kernel_size=7, padding=3, bias=False)
+            self.conv_k15 = nn.Conv1d(1, stem_ch, kernel_size=15, padding=14, dilation=2, bias=False)
+            self.stem_norm = nn.GroupNorm(num_groups=3, num_channels=stem_ch * 3)
+            self.stem_pw = nn.Conv1d(stem_ch * 3, 16, kernel_size=1, bias=True)
+            # x_norm [C] + (avg_pool 16 + max_pool 16) + t_peak + V_pp + energy
+            # + Delta E_local + |Delta E_local| (+ Delta E_global)
+            time_input_dim = self.temporal_samples + 32 + 5 + int(self.global_bg_energy_anchor)
+            # cos_phasor [K] + sin_phasor [K] + log-mag [K] + phase_gated [K]
+            # + centroid + spread
+            freq_input_dim = self.num_harmonics * 4 + 2
+        else:
+            self.conv_k3 = None
+            self.conv_k7 = None
+            self.conv_k15 = None
+            self.stem_norm = None
+            self.stem_pw = None
+
+            # 1. Time branch: x_norm [C] + t_peak + V_pp + energy + Delta E_local
+            #    + |Delta E_local| (+ Delta E_global)
+            time_input_dim = self.temporal_samples + 5 + int(self.global_bg_energy_anchor)
+
+            # 2. Spectral branch: phase [K] + log-mag [K] + phase_gated [K] + centroid + spread
+            freq_input_dim = self.num_harmonics * 3 + 2
+
         self.time_proj = nn.Linear(time_input_dim, self.time_dim)
 
-        # 2. Spectral branch: phase [K] + log-mag [K] + phase_gated [K] + centroid + spread
-        self.freq_proj = nn.Linear(self.num_harmonics * 3 + 2, self.freq_dim)
+        self.freq_proj = nn.Linear(freq_input_dim, self.freq_dim)
 
         # 3. Layer normalization and dropout
         self.norm = nn.LayerNorm(config.embed_dim)
@@ -140,6 +182,17 @@ class DualDomainTokenizer(nn.Module):
         rel_energy = torch.log1p(e_probe) - torch.log1p(e_context)  # [B, 25, 1]
 
         time_feats = [x_norm, t_peak, v_pp, energy_t, rel_energy, torch.abs(rel_energy)]
+        if self.tokenizer_arch == "multiscale_conv" and self.conv_k3 is not None:
+            x_1d = x_norm.reshape(B * self.num_tokens, 1, C)
+            b3 = self.conv_k3(x_1d)
+            b7 = self.conv_k7(x_1d)
+            b15 = self.conv_k15(x_1d)
+            h_stem = F.gelu(self.stem_norm(torch.cat([b3, b7, b15], dim=1)))
+            h_stem = F.gelu(self.stem_pw(h_stem))   # [B*25, 16, C]
+            conv_avg = h_stem.mean(dim=-1).reshape(B, self.num_tokens, 16)
+            conv_max = h_stem.amax(dim=-1).reshape(B, self.num_tokens, 16)
+            time_feats = [x_norm, conv_avg, conv_max, t_peak, v_pp, energy_t,
+                          rel_energy, torch.abs(rel_energy)]
         if self.global_bg_energy_anchor:
             if bg_ref_energy is None:
                 e_bg_ref = torch.median(e_probe, dim=1, keepdim=True).values
@@ -154,7 +207,8 @@ class DualDomainTokenizer(nn.Module):
         x_fft = torch.fft.rfft(x_fp32, dim=-1)                    # [B, 25, C//2 + 1]
         x_harmonics = x_fft[..., 1:self.num_harmonics + 1]        # drop DC bin 0
 
-        phase = torch.angle(x_harmonics) / torch.pi               # [-1, 1]
+        theta = torch.angle(x_harmonics)                          # [B, 25, K] in [-pi, pi]
+        phase = theta / torch.pi                                  # [-1, 1]
         mag_linear = torch.abs(x_harmonics)
         mag = torch.log1p(mag_linear)
 
@@ -166,7 +220,15 @@ class DualDomainTokenizer(nn.Module):
         f_c = torch.sum(k_idx * saliency, dim=-1, keepdim=True)
         f_spread = torch.sqrt(torch.sum(((k_idx - f_c) ** 2) * saliency, dim=-1, keepdim=True) + 1e-8)
 
-        spectral_feat = torch.cat([phase, mag, phase_gated, f_c, f_spread], dim=-1).to(x_flat.dtype)
+        if self.tokenizer_arch == "multiscale_conv":
+            # Continuous saliency-weighted phasor: no +-pi branch cut (FM16) and
+            # low-energy bins contribute ~0 amplitude instead of an arbitrary phase.
+            cos_phasor, sin_phasor = continuous_phasor(theta, saliency)
+            spectral_feat = torch.cat(
+                [cos_phasor, sin_phasor, mag, phase_gated, f_c, f_spread], dim=-1
+            ).to(x_flat.dtype)
+        else:
+            spectral_feat = torch.cat([phase, mag, phase_gated, f_c, f_spread], dim=-1).to(x_flat.dtype)
         z_freq = self.freq_proj(spectral_feat)                    # [B, 25, freq_dim]
 
         # --- 4. Dual-domain fusion ------------------------------------------

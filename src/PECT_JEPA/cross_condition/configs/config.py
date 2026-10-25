@@ -46,6 +46,13 @@ class CrossConditionConfig:
     # falls inside the defect; the corner anchor does not.
     global_bg_energy_anchor: bool = False
 
+    # Tokenizer & spatial aggregation architecture options (EXP-72).
+    # 'linear' + 'mean' reproduce the exp70/exp71 checkpoint surface exactly
+    # (no extra parameters), so legacy checkpoints still load with strict=True.
+    tokenizer_arch: str = "linear"        # 'linear' (legacy) | 'multiscale_conv' (EXP-72B)
+    spatial_pool_mode: str = "mean"       # 'mean' (legacy) | 'radial' (EXP-72A Green radial-decay + center attention)
+    radial_decay_init: float = 2.5        # Initial Green spatial decay alpha in w(r) ~ exp(-alpha * (r/r_max)^2)
+
     # Masking specification (concentric star topology)
     num_target_probes: int = 9
     num_context_probes: int = 16

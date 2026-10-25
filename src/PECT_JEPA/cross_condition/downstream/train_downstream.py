@@ -84,8 +84,11 @@ def parse_args():
     # Test-Time Adaptation (TTA) Hyperparameters
     parser.add_argument("--tta_trim_ratio", type=float, default=0.75, help="Trim ratio for robust background estimation (default 0.75)")
     parser.add_argument("--tta_shrinkage", type=float, default=1e-2, help="Diagonal loading shrinkage eps for whitening matrix (default 1e-2)")
-    # P2h hard-negative mining
-    parser.add_argument("--hard_neg_mining", type=lambda v: v.lower() == "true", default=True, help="P2h: add the top P0 false alarms per scan (halo ring excluded) as negatives")
+    # P2h hard-negative mining. Default OFF (EXP-72): the 14 mm rivet-hole
+    # scattering field spans 5-8 px, so "top P0 false alarms outside halo r=3"
+    # are real rivet edge response. Labelling them y=0 taught the probe to
+    # suppress the defect signal (exp71a: auc_p1u_s2 0.9163 but TTA LP 0.8471).
+    parser.add_argument("--hard_neg_mining", type=lambda v: v.lower() == "true", default=False, help="P2h: add the top P0 false alarms per scan (halo ring excluded) as negatives")
     parser.add_argument("--hard_neg_per_scan", type=int, default=HARD_NEG_PER_SCAN, help="Hard negatives mined per scan")
     parser.add_argument("--halo_radius", type=int, default=HALO_RADIUS_PX, help="Halo ring radius (px) excluded from fitting/mining")
     # Sizing target

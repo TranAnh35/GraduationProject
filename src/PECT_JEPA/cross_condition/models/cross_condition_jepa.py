@@ -57,14 +57,20 @@ def normalized_probe_l1(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     Invariant to any per-probe rescaling of the representation, so shrinking the
     latent cannot reduce the loss (removes the death-spiral descent direction of
     raw L1), while a position-blind / constant prediction is still penalized.
-    """
-    pred_m = pred.mean(dim=-1, keepdim=True)
-    pred_s = pred.std(dim=-1, keepdim=True).clamp_min(1e-8)
-    h_pred_norm = (pred - pred_m) / pred_s
 
-    tgt_m = tgt.mean(dim=-1, keepdim=True)
-    tgt_s = tgt.std(dim=-1, keepdim=True).clamp_min(1e-8)
-    h_tgt_norm = (tgt - tgt_m) / tgt_s
+    Computed in float32: under AMP the std can be a float16 value small enough
+    that `clamp_min(1e-8)` rounds to 0.0, producing inf/NaN and skipped steps
+    (exp71a epoch 35-52). `clamp_min(1e-6)` is also representable in fp16.
+    """
+    pred_f = pred.float()
+    tgt_f = tgt.float()
+    pred_m = pred_f.mean(dim=-1, keepdim=True)
+    pred_s = pred_f.std(dim=-1, keepdim=True).clamp_min(1e-6)
+    h_pred_norm = (pred_f - pred_m) / pred_s
+
+    tgt_m = tgt_f.mean(dim=-1, keepdim=True)
+    tgt_s = tgt_f.std(dim=-1, keepdim=True).clamp_min(1e-6)
+    h_tgt_norm = (tgt_f - tgt_m) / tgt_s
     return (h_pred_norm - h_tgt_norm).abs().mean(dim=(-2, -1)).mean()
 
 
@@ -81,7 +87,12 @@ def center_by_group(
     subtracting its own probe mean would erase the spatial (r, c) variance that
     VICReg is supposed to protect (exp71: val_sound_var -> 1.6e-5 while R_eff
     stayed at 61.9D on static positional offsets).
+
+    Always computed in float32: the per-group mean buffer below is float32, so a
+    float16 input would silently upcast anyway; the explicit cast also keeps the
+    group statistics out of the AMP fp16 range.
     """
+    z_f = z_f.float()
     if group_id is None:
         return z_f - z_f.mean(dim=0, keepdim=True)
     uniq, inv = torch.unique(group_id, return_inverse=True)  # inv: [N] in 0..S-1
@@ -190,6 +201,72 @@ class CrossConditionJEPA(nn.Module):
         )
         self.register_buffer("target_idx_bank", torch.from_numpy(tgt_bank_np).long(), persistent=False)
         self.register_buffer("context_idx_bank", torch.from_numpy(ctx_bank_np).long(), persistent=False)
+
+        # 7. EXP-72A: Green radial-decay / center-guided spatial aggregation.
+        #    `probe_r2` is the normalized squared physical radius of each of the 25
+        #    star probes (r1=2px -> 0.082, r2=4px -> 0.327, r3=7px -> 1.0), so the
+        #    outer ring can be down-weighted instead of leaking a 15x15px false
+        #    positive halo around every defect (FM13).
+        self.spatial_pool_mode = str(getattr(self.config, "spatial_pool_mode", "mean"))
+        _norm_coords = self.tokenizer.norm_coords.squeeze(0).float()   # [25, 2]
+        _r2_raw = (_norm_coords ** 2).sum(dim=-1)                      # [25]
+        self.register_buffer("probe_r2", _r2_raw / _r2_raw.max().clamp_min(1e-6), persistent=False)
+
+        if self.spatial_pool_mode == "radial":
+            init_alpha = float(max(0.1, getattr(self.config, "radial_decay_init", 2.5)))
+            self.radial_log_alpha = nn.Parameter(
+                torch.tensor(float(np.log(init_alpha)), dtype=torch.float32)
+            )
+            self.radial_attn_proj = nn.Linear(self.config.embed_dim, self.config.embed_dim, bias=False)
+            nn.init.normal_(self.radial_attn_proj.weight, std=1e-2)
+        else:
+            # No parameters in 'mean' mode: exp70/exp71 checkpoints load strict=True.
+            self.radial_log_alpha = None
+            self.radial_attn_proj = None
+
+    def _pool_spatial_context(
+        self,
+        h_probes: torch.Tensor,
+        probe_indices: torch.Tensor,
+        h_anchor: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Aggregates spatial context probe representations [B, N, D] -> [B, D].
+
+        - 'mean' mode: uniform average across all N probes (legacy behavior).
+        - 'radial' mode: physical Green radial-decay prior (-alpha * r_i^2) combined
+          with center-guided content attention so inner-ring probes (r1=2px) dominate
+          and far-field outer-ring probes (r3=7px) do not leak false-positive halos.
+        """
+        if self.spatial_pool_mode != "radial" or self.radial_log_alpha is None:
+            return h_probes.mean(dim=1)
+
+        B, N, D = h_probes.shape
+        # Gather normalized squared radius for each probe in the subset: [B, N]
+        if probe_indices.ndim == 1:
+            r2 = self.probe_r2[probe_indices].unsqueeze(0).expand(B, -1)
+        else:
+            r2 = self.probe_r2[probe_indices]
+        r2 = r2.to(dtype=torch.float32, device=h_probes.device)
+
+        # Clamp alpha in [0.2, 10.0] for numerical stability
+        alpha = torch.exp(self.radial_log_alpha.float()).clamp(min=0.2, max=10.0)
+        radial_logits = -alpha * r2  # [B, N]
+
+        if self.radial_attn_proj is not None:
+            if h_anchor is None:
+                # Training on 16 context probes: form the local anchor with pure
+                # Green radial weights (there is no center probe in the window).
+                w_base = torch.softmax(radial_logits, dim=-1).to(dtype=h_probes.dtype)
+                h_anchor = torch.einsum("bn,bnd->bd", w_base, h_probes)
+            q = self.radial_attn_proj(h_anchor.float()).unsqueeze(1).float()  # [B, 1, D]
+            sim_logits = (q * h_probes.float()).sum(dim=-1) / (float(D) ** 0.5)  # [B, N]
+            logits = radial_logits + torch.tanh(sim_logits)
+        else:
+            logits = radial_logits
+
+        weights = torch.softmax(logits, dim=-1).to(dtype=h_probes.dtype)  # [B, N]
+        return torch.einsum("bn,bnd->bd", weights, h_probes)
 
     def _init_target_encoder(self):
         """Initialize target encoder weights identical to the context encoder."""
@@ -379,7 +456,7 @@ class CrossConditionJEPA(nn.Module):
         #    offsets, so the encoder must keep true spatial variance across the
         #    C-scan plane.
         flat_ctx = H_ctx_a.reshape(B * n_ctx, -1)
-        patch_ctx = H_ctx_a.mean(dim=1)  # [B, D]
+        patch_ctx = self._pool_spatial_context(H_ctx_a, ctx_idx, h_anchor=None)  # [B, D]
         if self.config.var_weight > 0 or self.config.cov_weight > 0:
             _use_sc = getattr(self.config, "scan_centered_vicreg", True)
             vic_probe, var_probe, cov_probe = compute_vicreg_loss(
@@ -414,8 +491,8 @@ class CrossConditionJEPA(nn.Module):
                 H_ctx_b = self.target_encoder(
                     tokens_b[batch_arange, ctx_idx], pos_b[batch_arange, ctx_idx]
                 )
-            z_a = flat_ctx
-            z_b = H_ctx_b.reshape(B * H_ctx_b.shape[1], -1)
+            z_a = flat_ctx.float()
+            z_b = H_ctx_b.reshape(B * H_ctx_b.shape[1], -1).float()
             if getattr(self.config, "scan_centered_inv", True) and scan_id_expanded is not None:
                 z_a = center_by_group(z_a, scan_id_expanded, min_group_size=2 * n_ctx)
                 z_b = center_by_group(z_b, scan_id_b_expanded, min_group_size=2 * n_ctx)
@@ -429,9 +506,11 @@ class CrossConditionJEPA(nn.Module):
                 z_a = z_a[keep]
                 z_b = z_b[keep]
             if getattr(self.config, "inv_cosine", True):
-                inv_loss = 1.0 - F.cosine_similarity(z_a, z_b, dim=-1).mean()
+                # fp32 + eps=1e-6: eps=1e-8 is not representable in fp16 and made
+                # the cosine blow up under AMP (exp71a non-finite loss).
+                inv_loss = 1.0 - F.cosine_similarity(z_a.float(), z_b.float(), dim=-1, eps=1e-6).mean()
             else:
-                inv_loss = F.mse_loss(z_a, z_b)
+                inv_loss = F.mse_loss(z_a.float(), z_b.float())
         else:
             inv_loss = torch.tensor(0.0, device=device)
             keep_frac = 1.0
@@ -483,5 +562,7 @@ class CrossConditionJEPA(nn.Module):
         tokens, pos = self.tokenizer(x, bg_ref_energy=bg_ref_energy)
         h_all = self.context_encoder(tokens, pos)  # [B, 25, D]
         h_center = h_all[:, 0, :]
-        h_context = torch.mean(h_all[:, 1:, :], dim=1)
+        # Probe index 0 is the center; 1..24 are the r1/r2/r3 rings.
+        ring_idx = torch.arange(1, self.tokenizer.num_tokens, device=x.device)
+        h_context = self._pool_spatial_context(h_all[:, 1:, :], ring_idx, h_anchor=h_center)
         return torch.cat([h_center, h_context], dim=-1)

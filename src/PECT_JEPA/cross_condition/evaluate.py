@@ -678,13 +678,19 @@ def main():
             global_readouts["scaler_size"] = raw_size.scaler
             global_readouts["ridge_size"] = raw_size.ridge_regressor
             global_readouts["mlp_size"] = raw_size.mlp_regressor
+            # The bundle was fitted on log1p(mm); without this key
+            # `evaluate_global_sizing` never inverts, so R2 compared log-mm to mm
+            # (exp71a: sizing R2 -6.21, MAE 5.79 mm).
+            global_readouts["size_target"] = getattr(raw_size, "target_transform", "identity")
             global_readouts["raw_scaler_size"] = raw_size.scaler
             global_readouts["raw_ridge_size"] = raw_size.ridge_regressor
             global_readouts["raw_mlp_size"] = raw_size.mlp_regressor
+            global_readouts["raw_size_target"] = getattr(raw_size, "target_transform", "identity")
         if tta_size is not None:
             global_readouts["tta_scaler_size"] = tta_size.scaler
             global_readouts["tta_ridge_size"] = tta_size.ridge_regressor
             global_readouts["tta_mlp_size"] = tta_size.mlp_regressor
+            global_readouts["tta_size_target"] = getattr(tta_size, "target_transform", "identity")
 
         ref_energy = 0.0
         print("  Pre-trained standard downstream models loaded successfully!\n", flush=True)
@@ -782,15 +788,18 @@ def main():
             "scaler_size": raw_readouts.get("scaler_size"),
             "ridge_size": raw_readouts.get("ridge_size"),
             "mlp_size": raw_readouts.get("mlp_size"),
+            "size_target": raw_readouts.get("size_target", "identity"),
             "raw_scaler_size": raw_readouts.get("scaler_size"),
             "raw_ridge_size": raw_readouts.get("ridge_size"),
             "raw_mlp_size": raw_readouts.get("mlp_size"),
+            "raw_size_target": raw_readouts.get("size_target", "identity"),
             "tta_scaler_det": tta_readouts["scaler_det"],
             "tta_lr_probe": tta_readouts["lr_probe"],
             "tta_mlp_probe": tta_readouts.get("mlp_probe"),
             "tta_scaler_size": tta_readouts.get("scaler_size"),
             "tta_ridge_size": tta_readouts.get("ridge_size"),
             "tta_mlp_size": tta_readouts.get("mlp_size"),
+            "tta_size_target": tta_readouts.get("size_target", "identity"),
         }
         print("  Dual readouts successfully fitted and frozen!\n", flush=True)
         print("  Global readouts successfully fitted and frozen!\n", flush=True)

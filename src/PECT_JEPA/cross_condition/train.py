@@ -55,6 +55,9 @@ def parse_args():
     parser.add_argument("--use_condition_token", type=lambda v: v.lower() == "true", default=True, help="Use condition token c_B in predictor")
     parser.add_argument("--condition_modulation", type=str, default="cross_attention", choices=["cross_attention", "adaln"], help="Condition-token routing: c_B joins the predictor KV memory, or AdaLN-modulates the predictor blocks")
     parser.add_argument("--global_bg_energy_anchor", type=lambda v: v.lower() == "true", default=False, help="Append Delta E_global = log(1+E_probe) - log(1+E_corner_bg) to the time branch (wide defects: Rivet_v2)")
+    parser.add_argument("--tokenizer_arch", type=str, default="linear", choices=["linear", "multiscale_conv"], help="Tokenizer architecture: 'linear' (legacy flat projection) or 'multiscale_conv' (multi-scale 1D temporal conv stem + continuous phasor)")
+    parser.add_argument("--spatial_pool_mode", type=str, default="mean", choices=["mean", "radial"], help="Spatial context aggregation mode: 'mean' (uniform 24-probe average) or 'radial' (Green radial-decay + center-guided attention)")
+    parser.add_argument("--radial_decay_init", type=float, default=2.5, help="Initial radial decay alpha for spatial_pool_mode='radial'")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of warmup epochs (defaults to K partitions = 1 full macro-cycle)")
     parser.add_argument("--early_stopping_patience", type=int, default=15, help="Patience in epochs for early stopping post-warmup (0 to disable)")
     parser.add_argument("--diverge_patience", type=int, default=3, help="Stop when val recon exceeds factor*best for N consecutive evals (0 to disable)")
@@ -134,6 +137,9 @@ def main():
         scan_centered_inv=args.scan_centered_inv,
         scan_centered_vicreg=args.scan_centered_vicreg,
         global_bg_energy_anchor=args.global_bg_energy_anchor,
+        tokenizer_arch=args.tokenizer_arch,
+        spatial_pool_mode=args.spatial_pool_mode,
+        radial_decay_init=args.radial_decay_init,
         relative_target=args.relative_target,
         use_condition_token=args.use_condition_token,
         condition_modulation=args.condition_modulation,
