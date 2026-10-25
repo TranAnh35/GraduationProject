@@ -269,15 +269,41 @@ class TestUnifiedForwardContract(unittest.TestCase):
         self.assertGreaterEqual(frac, 0.25)
         self.assertLessEqual(frac, 0.75)
 
-    def test_anti_hijack_caps_aux_loss(self):
+    def test_anti_hijack_never_caps_vicreg(self):
+        """FM22: VICReg keeps full strength; only the optional L_inv term may be capped.
+
+        exp71 ran with anti_hijack_ratio=0.25 under the old cap-everything code:
+        aux was pinned at exactly 0.25*pred every epoch, VICReg was starved and the
+        representation collapsed (R_eff 1.57D-2.18D, val_auc 0.53).
+        """
+        cfg = CrossConditionConfig(inv_weight=0.0, var_weight=0.5, cov_weight=0.2,
+                                   pred_loss_type="l1", anti_hijack_ratio=0.0)
+        model = CrossConditionJEPA(cfg).eval()
+        off = model(x_a=self.x_a, x_b=self.x_b, ref_b=self.ref_b,
+                    scan_id=self.scan_id, inv_scale=1.0)
+        model.config.anti_hijack_ratio = 0.25
+        on = model(x_a=self.x_a, x_b=self.x_b, ref_b=self.ref_b,
+                   scan_id=self.scan_id, inv_scale=1.0)
+
+        ratio = on["aux_loss"].item() / off["aux_loss"].item()
+        self.assertAlmostEqual(ratio, 1.0, places=6,
+                               msg="anti_hijack_ratio scaled VICReg (FM22 death spiral)")
+        self.assertAlmostEqual(
+            on["aux_loss"].item(),
+            0.5 * on["var_loss"].item() + 0.2 * on["cov_loss"].item(), places=6,
+            msg="aux_loss is not the full-strength VICReg when L_inv is disabled")
+
+    def test_anti_hijack_caps_only_inv_term(self):
         cfg = CrossConditionConfig(inv_weight=10.0, inv_trim_q=1.0, anti_hijack_ratio=0.25,
                                    var_weight=0.5, cov_weight=0.2, pred_loss_type="l1")
         _, out = self._forward(cfg)
         pred = out["pred_loss"].detach().item()
-        aux = out["aux_loss"].item()
-        self.assertLessEqual(aux, 0.25 * pred + 1e-5,
-                             f"aux_loss {aux:.4f} exceeded 0.25 * pred_loss {pred:.4f}")
-        self.assertAlmostEqual(out["total_loss"].item(), pred + aux, places=5)
+        vic = 0.5 * out["var_loss"].item() + 0.2 * out["cov_loss"].item()
+        inv_term = out["aux_loss"].item() - vic
+        self.assertGreater(inv_term, 0.0)
+        self.assertLessEqual(inv_term, 0.25 * pred + 1e-5,
+                             f"L_inv term {inv_term:.4f} exceeded 0.25 * pred_loss {pred:.4f}")
+        self.assertAlmostEqual(out["total_loss"].item(), pred + out["aux_loss"].item(), places=5)
 
     def test_inv_predictor_head_receives_gradient(self):
         cfg = CrossConditionConfig(inv_weight=1.0, inv_predictor=True, inv_trim_q=1.0)

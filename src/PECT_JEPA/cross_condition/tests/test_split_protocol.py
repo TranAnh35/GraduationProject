@@ -96,6 +96,14 @@ class TestSplitProtocols(unittest.TestCase):
         for fp in splits["test"]:
             self.assertFalse(is_base_domain_file(extract_file_metadata(fp), "cross_condition"), fp)
 
+    def test_pretrain_scope_base_domain_is_train_plus_val_and_never_test(self):
+        """JEPA pretraining scope must be explicit: Base Domain = train+val, test unseen."""
+        splits = get_canonical_train_val_test_splits(self.files, split_mode="cross_condition", seed=42)
+        pretrain = splits["train"] + splits["val"]
+        self.assertEqual(len(pretrain), 24)
+        self.assertEqual(set(pretrain), set(filter_base_domain_files(self.files, "cross_condition")))
+        self.assertEqual(set(pretrain) & set(splits["test"]), set())
+
     def test_determinism(self):
         for mode in SPLIT_MODES:
             with self.subTest(mode=mode):

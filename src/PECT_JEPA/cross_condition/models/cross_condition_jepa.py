@@ -407,14 +407,21 @@ class CrossConditionJEPA(nn.Module):
             inv_loss = torch.tensor(0.0, device=device)
             keep_frac = 1.0
 
-        # 9. Total loss: prediction + (optionally capped) auxiliary terms. The cap
-        #    guarantees JEPA prediction keeps >= 1/(1+ratio) of the gradient budget.
-        aux_loss = vicreg_loss + eff_inv * inv_loss
+        # 9. Total loss: prediction + VICReg + (optionally capped) L_inv.
+        #    FM22: the cap must NEVER touch VICReg. Capping aux at ratio*pred makes
+        #    the variance gradient proportional to pred_loss; under a scale-invariant
+        #    prediction loss, rank collapse lowers pred_loss, which shrinks the cap,
+        #    which starves VICReg further (exp71: R_eff 1.6D-2.8D, val_auc 0.53,
+        #    aux pinned at exactly 0.25*pred every epoch, exp70 with no cap: R_eff
+        #    40-62D). VICReg is the only force against constant collapse, so it is
+        #    always applied at full strength; only the optional L_inv is capped.
+        inv_term = eff_inv * inv_loss
         anti_hijack_ratio = getattr(self.config, "anti_hijack_ratio", 0.0)
         if anti_hijack_ratio > 0 and pred_loss.detach() > 0:
-            max_aux = anti_hijack_ratio * pred_loss.detach()
-            if aux_loss > max_aux:
-                aux_loss = aux_loss * (max_aux / (aux_loss + 1e-8))
+            max_inv = anti_hijack_ratio * pred_loss.detach()
+            if inv_term > max_inv:
+                inv_term = inv_term * (max_inv / (inv_term + 1e-8))
+        aux_loss = vicreg_loss + inv_term
         total_loss = pred_loss + aux_loss
 
         return {

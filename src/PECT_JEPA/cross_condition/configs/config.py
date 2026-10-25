@@ -60,7 +60,7 @@ class CrossConditionConfig:
 
     # Loss weights
     pred_loss_type: str = "l1"            # 'l1' | 'normalized_l1' (probe-wise, scale-invariant)
-    anti_hijack_ratio: float = 0.0        # cap aux losses at ratio * pred_loss (0 = uncapped)
+    anti_hijack_ratio: float = 0.0        # cap L_inv only at ratio * pred_loss (0 = uncapped); VICReg is never capped (FM22)
     scan_centered_vicreg: bool = True     # center representations per scan before VICReg
     var_weight: float = 0.5               # VICReg variance hinge (std >= var_gamma)
     cov_weight: float = 0.2               # VICReg covariance decorrelation
@@ -85,8 +85,15 @@ class CrossConditionConfig:
     # 'cross_specimen'  : 16-file Base Domain (Corrosion, Rivet_v1) -> 12 train / 4 val, 65 test
     # 'cross_condition' : 24-file Base Domain (Corrosion, Rivet_v1, Rivet_v2) -> 18 train / 6 val, 57 test
     split_mode: str = "cross_specimen"
-    # If True, pretrains on all 81 files (transductive); if False, on the Base Domain only.
-    use_full_dataset: bool = False
+    # JEPA pretraining scope, explicit instead of the old boolean `use_full_dataset`:
+    # 'base_domain' : pretrain on the Base Domain files (train + val of `split_mode`)
+    #                 -> test files are never seen by the encoder (honest OOD).
+    # 'all'         : pretrain on every TDMS file, INCLUDING the test files
+    #                 (transductive; test metrics are then not comparable to
+    #                 'base_domain' runs).
+    # Downstream data is always the train/val/test partition of `split_mode`
+    # (fit on train, telemetry on val, score on test) regardless of this scope.
+    pretrain_scope: str = "base_domain"
     batch_size: int = 256
     num_partitions: int = 10    # K partitions per macro-cycle
     samples_per_epoch: Optional[int] = None

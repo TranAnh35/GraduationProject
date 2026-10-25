@@ -38,7 +38,6 @@ class TestFullPairingDataset(unittest.TestCase):
         ds = object.__new__(PairedPECTDataset)
         ds.num_partitions = 10
         ds.seed = 42
-        ds.use_full_dataset = True
         ds.split_mode = "cross_condition"
         ds.grid_size = 5
         ds.temporal_samples = 128

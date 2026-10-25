@@ -45,7 +45,6 @@ class PairedPECTDataset(Dataset):
         self,
         file_paths: Optional[List[str]] = None,
         data_dir: Optional[str] = None,
-        use_full_dataset: bool = False,
         split_mode: str = "cross_specimen",
         grid_stride: int = 4,
         samples_per_epoch: Optional[int] = None,
@@ -60,7 +59,6 @@ class PairedPECTDataset(Dataset):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
         self.seed = seed
-        self.use_full_dataset = bool(use_full_dataset)
         self.split_mode = str(split_mode)
         import glob
 
@@ -74,10 +72,11 @@ class PairedPECTDataset(Dataset):
                 data_dir = "data"
             all_files = sorted(glob.glob(os.path.join(data_dir, "**", "*.tdms"), recursive=True))
             all_files = [f for f in all_files if not f.endswith("_index.tdms") and "checkpoint" not in f]
-            if self.use_full_dataset:
-                file_paths = all_files
-            else:
-                file_paths = filter_base_domain_files(all_files, split_mode=self.split_mode)
+            # Fallback when no explicit file list is passed (standalone use / tests):
+            # the Base Domain of `split_mode`. Training always passes `file_paths`
+            # explicitly so the pretraining scope is decided in one visible place.
+            file_paths = filter_base_domain_files(all_files, split_mode=self.split_mode)
+        self.file_paths = list(file_paths)
 
         self.grid_size = grid_size
         self.temporal_samples = temporal_samples
@@ -92,8 +91,7 @@ class PairedPECTDataset(Dataset):
         # independent; order is preserved by mapping back onto file_paths, so
         # the resulting dataset is bit-identical to sequential loading)
         self.scans_by_specimen: Dict[str, List[Dict]] = {}
-        ds_mode = "Full Cross-Condition Dataset (all 81 scans)" if self.use_full_dataset else "Base Domain"
-        print(f"\n[Loading & Standardizing {len(file_paths)} {ds_mode} C-scans into RAM...]")
+        print(f"\n[Loading & Standardizing {len(file_paths)} C-scans into RAM...]")
 
         # Pre-build the canonical transformer in the main thread (lazy global)
         get_canonical_transformer()
