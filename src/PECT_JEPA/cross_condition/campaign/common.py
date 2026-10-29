@@ -38,7 +38,18 @@ def atomic_json(path, value):
         json.dump(value, stream, indent=2, ensure_ascii=False, allow_nan=False)
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temp, path)
+    # On Windows, a concurrent reader can briefly prevent replacing the
+    # destination (sharing-delete is not guaranteed by every reader). Progress
+    # JSON is polled by the parent process while the worker publishes it, so
+    # retry transient access denials instead of failing the entire stage.
+    for attempt in range(16):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == 15:
+                raise
+            time.sleep(min(0.01 * (2 ** attempt), 0.25))
 
 
 class ProgressReporter:
