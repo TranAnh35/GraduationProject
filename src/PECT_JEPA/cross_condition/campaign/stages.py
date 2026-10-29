@@ -16,7 +16,7 @@ from ..data.split import extract_file_metadata
 from ..data.topologies import ConcentricStarTopology
 from ..downstream.domain_adaptation.da_bridge import ClosedFormCORAL
 from ..downstream.test_time_adaptation import unsup_trimmed_bg_stats
-from .common import ProgressReporter, atomic_json, digest, read_json, sha256
+from .common import MAIN_BAR_FORMAT, ProgressReporter, atomic_json, digest, read_json, sha256
 from .learning import load_model
 from .metrics import cad_objects, detection_metrics, object_descriptor, unsup_mahalanobis_scores
 
@@ -53,8 +53,16 @@ def prepare(plan, output):
             progress.update("prepare", index + 1, len(entries), "scan", detail=Path(path).name, force=True)
             continue
         # Verify raw bytes at preparation, not just path/mtime.
-        progress.update("prepare", index, len(entries), "scan", detail=f"hash raw {Path(path).name}", force=True)
-        if sha256(path) != entry["sha256"]:
+        name = Path(path).name
+        size_mib = max(1, (os.path.getsize(path) + 1024**2 - 1) // 1024**2)
+
+        def report_hash(bytes_done, bytes_total):
+            mib_done = min(size_mib, (bytes_done + 1024**2 - 1) // 1024**2)
+            progress.update("hash_raw", mib_done, size_mib, "MiB",
+                detail=f"{name} ({bytes_done / 1024**2:.1f}/{bytes_total / 1024**2:.1f} MiB)",
+                force=bytes_done == 0 or bytes_done >= bytes_total)
+
+        if sha256(path, progress_callback=report_hash) != entry["sha256"]:
             raise ValueError(f"Raw input changed: {path}")
         progress.update("prepare", index, len(entries), "scan", detail=f"canonicalize {Path(path).name}", force=True)
         array = load_canonical_cscan_from_tdms(path, temporal_samples=128,
@@ -398,8 +406,9 @@ def field_mean(rows, field):
 def aggregate(plan, root, state, verbose=True):
     rows, missing, sizing = [], [], []
     eval_jobs = [job for job in plan["jobs"] if job["kind"] == "evaluate"]
-    for job in tqdm(eval_jobs, desc="Aggregate evaluation jobs", unit="job",
-                    dynamic_ncols=True, disable=not verbose or not eval_jobs):
+    for job in tqdm(eval_jobs, desc="Aggregate", unit="jobs", position=0,
+                    dynamic_ncols=True, mininterval=0.2, bar_format=MAIN_BAR_FORMAT,
+                    disable=not verbose or not eval_jobs):
         output = Path(root) / "jobs" / job["id"] / "master_benchmark_metrics.csv"
         if state["jobs"].get(job["id"], {}).get("status") == "completed" and output.exists():
             rows.extend(csv.DictReader(output.open(encoding="utf-8")))

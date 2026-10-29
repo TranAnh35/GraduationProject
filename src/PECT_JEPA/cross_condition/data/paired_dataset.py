@@ -11,7 +11,7 @@ Features:
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -56,6 +56,7 @@ class PairedPECTDataset(Dataset):
         seed: int = 42,
         canonical_cache: Optional[Dict[str, str]] = None,
         self_pairs: bool = False,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
@@ -127,11 +128,17 @@ class PairedPECTDataset(Dataset):
             }
 
         max_workers = min(4, max(1, len(file_paths)))
+        if progress_callback is not None:
+            progress_callback(0, len(file_paths), "starting scan load")
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            loaded = list(tqdm(pool.map(_load_one, file_paths),
-                               total=len(file_paths),
-                               desc="Loading canonical C-scans",
-                               dynamic_ncols=True))
+            loaded = []
+            iterator = tqdm(pool.map(_load_one, file_paths), total=len(file_paths),
+                desc="Loading canonical C-scans", dynamic_ncols=True,
+                disable=progress_callback is not None)
+            for index, item in enumerate(iterator, start=1):
+                loaded.append(item)
+                if progress_callback is not None:
+                    progress_callback(index, len(file_paths), os.path.basename(item[0]))
 
         # Stable per-FILE identity (0..len(loaded)-1), NOT the directed-pair index.
         # The pair index (0..2105) is ~unique per batch sample, so using it as the

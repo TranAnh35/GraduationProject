@@ -12,17 +12,26 @@ import time
 PACKAGE = Path(__file__).resolve().parents[1]
 REPO = PACKAGE.parents[2]
 SCHEMA = 1
+MAIN_BAR_FORMAT = "{desc:<14} {percentage:3.0f}%|{bar:26}| {n_fmt}/{total_fmt} {unit} [{elapsed}<{remaining}, {rate_fmt}]"
+TASK_BAR_FORMAT = "{desc:<13} {percentage:3.0f}%|{bar:10}| {n_fmt}/{total_fmt} {unit} [{elapsed}<{remaining}]{postfix}"
 
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
 
 
-def sha256(path):
+def sha256(path, progress_callback=None):
     h = hashlib.sha256()
+    size = os.path.getsize(path)
+    completed = 0
+    if progress_callback is not None:
+        progress_callback(completed, size)
     with open(path, "rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(block)
+            completed += len(block)
+            if progress_callback is not None:
+                progress_callback(completed, size)
     return h.hexdigest()
 
 

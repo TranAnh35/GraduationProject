@@ -112,6 +112,7 @@ def train(job, protocol, output, settings, device, fingerprint, prepare_dir=None
     """Atomic batch checkpoints with exact RNG restoration and epoch metrics."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    progress_reporter = ProgressReporter(output)
     seed_all(job["seed"])
     parent = job.get("parent_checkpoint")
     teacher = None
@@ -147,12 +148,18 @@ def train(job, protocol, output, settings, device, fingerprint, prepare_dir=None
         atomic_json(output / "config.json", {**vars(config), "campaign_settings": settings,
             "objective": model.objective, "scope": "adapt", "seed": job["seed"],
             "parent_checkpoint": parent})
+    progress_reporter.update("dataset_load", 0, len(files), "scan",
+        detail="load canonical scans", force=True)
     dataset = PairedPECTDataset(file_paths=files, grid_stride=settings["grid_stride"],
         samples_per_epoch=settings["samples_per_epoch"], num_partitions=1,
         star_radii=config.star_radii, transform_csv=settings["transform_csv"], seed=job["seed"],
         canonical_cache={p: str(Path(prepare_dir) / (digest(str(Path(p).resolve()))[:20] + ".npy"))
                          for p in files} if prepare_dir else None,
-        self_pairs=parent is not None or job["objective"] in ("self_jepa", "spatial_mae"))
+        self_pairs=parent is not None or job["objective"] in ("self_jepa", "spatial_mae"),
+        progress_callback=lambda current, total, detail: progress_reporter.update(
+            "dataset_load", current, total, "scan", detail=detail, force=True))
+    progress_reporter.update("dataset_ready", 1, 1, "step",
+        detail=f"{len(files)} scans, {len(dataset.directed_pairs)} pairs", force=True)
     if protocol.get("spatial_holdout"):
         from .protocol import spatial_masks
         keep, _ = spatial_masks((270, 270))
@@ -178,7 +185,6 @@ def train(job, protocol, output, settings, device, fingerprint, prepare_dir=None
 
     total_steps = epochs * steps
     completed_steps = min(total_steps, max(0, (epoch - 1) * steps + step))
-    progress_reporter = ProgressReporter(output)
     progress_reporter.update("train", completed_steps, total_steps, "batch",
         detail=f"epoch {epoch}/{epochs}, batch {step}/{steps}", force=True,
         next_epoch=epoch, next_batch=step)

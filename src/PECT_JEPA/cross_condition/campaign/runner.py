@@ -9,11 +9,38 @@ import subprocess
 import sys
 import time
 
-from .common import PACKAGE, REPO, SCHEMA, atomic_json, code_identity, code_files, digest, exclusive_lock, now, read_json, sha256
+from .common import (MAIN_BAR_FORMAT, TASK_BAR_FORMAT, PACKAGE, REPO, SCHEMA,
+    atomic_json, code_identity, code_files, digest, exclusive_lock, now, read_json, sha256)
 from .protocol import SCENARIOS, inventory, matched_roles
 from tqdm import tqdm
 
 MODULE = "src.PECT_JEPA.cross_condition.campaign.worker"
+_PHASE_LABELS = {
+    "starting": "  Starting",
+    "prepare": "  Prepare",
+    "hash_raw": "  Hash raw",
+    "dataset_load": "  Load scans",
+    "dataset_ready": "  Data ready",
+    "train": "  Train",
+    "source_diagnostics": "  Val checks",
+    "extract": "  Extract",
+    "load_ground_truth": "  Load GT",
+    "sample_source_fit": "  Source fit",
+    "sample_coral_source": "  CORAL src",
+    "sample_coral_target": "  CORAL tgt",
+    "fit_coral": "  Fit CORAL",
+    "fit_logistic_readout": "  Fit logit",
+    "sample_neural_source": "  Neural src",
+    "sample_neural_target": "  Neural tgt",
+    "neural_readout": "  Neural fit",
+    "source_validation_threshold": "  Val thresh",
+    "fit_sizing": "  Fit sizing",
+    "score_target": "  Target eval",
+    "evaluation_complete": "  Eval done",
+    "knowledge_graph": "  Knowledge",
+    "finalize": "  Hash output",
+    "completed": "  Complete",
+}
 
 
 def build_plan(data_dir, transform_csv, root, profile="full", seeds=(42, 43, 44), overrides=None, verbose=True):
@@ -238,15 +265,57 @@ def assert_gpu_idle():
         raise RuntimeError("GPU already has training processes: " + "\n".join(busy))
 
 
-def _progress_label(job_id, progress):
-    if not progress:
-        return f"{job_id[:42]} | starting"
-    phase = str(progress.get("phase", "running"))
-    current, total = progress.get("current"), progress.get("total")
-    unit = str(progress.get("unit", ""))
-    count = f" {current}/{total} {unit}" if current is not None and total is not None else ""
-    detail = progress.get("detail")
-    return f"{job_id[:42]} | {phase}{count}" + (f" | {detail}" if detail else "")
+def _normalise_task_progress(progress):
+    """Return a bounded, deterministic view of a worker progress record."""
+    if not isinstance(progress, dict):
+        return None
+    phase = str(progress.get("phase") or "running")
+    unit = str(progress.get("unit") or "items")
+    try:
+        total = max(1, int(progress.get("total") or 1))
+        current = max(0, min(total, int(progress.get("current") or 0)))
+    except (TypeError, ValueError):
+        total, current = 1, 0
+    detail = str(progress.get("detail") or "")
+    return phase, current, total, unit, detail
+
+
+class _LiveTaskBar:
+    """Render worker progress as a second, phase-aware bar under the campaign bar."""
+    def __init__(self, job_id):
+        self.job_id = job_id[:20]
+        self.bar = None
+        self.phase = None
+        self.total = None
+        self.unit = None
+
+    def update(self, progress):
+        values = _normalise_task_progress(progress)
+        if values is None:
+            return
+        phase, current, total, unit, detail = values
+        label = _PHASE_LABELS.get(phase, "  " + phase.replace("_", " ")[:11])
+        if self.bar is None:
+            self.bar = tqdm(total=total, desc=label, unit=unit, position=1,
+                leave=False, dynamic_ncols=True, mininterval=0.2,
+                bar_format=TASK_BAR_FORMAT)
+        if phase != self.phase or total != self.total or unit != self.unit:
+            self.bar.reset(total=total)
+            self.bar.unit = unit
+            self.bar.desc = label
+            self.bar.n = current
+            self.phase, self.total, self.unit = phase, total, unit
+        else:
+            self.bar.n = current
+        summary = detail if detail else self.job_id
+        if len(summary) > 23:
+            summary = summary[:20] + "..."
+        self.bar.set_postfix_str(summary, refresh=False)
+        self.bar.refresh()
+
+    def close(self):
+        if self.bar is not None:
+            self.bar.close()
 
 
 def run(root, device="cuda", keep_going=False, max_jobs=None, verbose=True):
@@ -276,17 +345,17 @@ def run(root, device="cuda", keep_going=False, max_jobs=None, verbose=True):
     if shutil.disk_usage(root).free < required + 2 * 1024**3:
         raise RuntimeError(f"Insufficient disk: need about {required / 2**30:.1f} GiB plus 2 GiB reserve")
     attempted = 0
-    bar = tqdm(total=len(plan["jobs"]), desc="PECT campaign", unit="job",
-               dynamic_ncols=True, disable=not verbose)
+    bar = tqdm(total=len(plan["jobs"]), desc="Campaign", unit="jobs", position=0,
+               dynamic_ncols=True, mininterval=0.2, bar_format=MAIN_BAR_FORMAT,
+               disable=not verbose)
     with bar, exclusive_lock(PACKAGE / "experiments" / ".campaign.lock"):
         # A worker can survive an abruptly terminated parent.
         with exclusive_lock(PACKAGE / "experiments/.campaign.worker.lock"):
             pass
-        for job in plan["jobs"]:
+        for job_index, job in enumerate(plan["jobs"], start=1):
             jid = job["id"]
             output = root / "jobs" / jid
             current = state["jobs"].get(jid, {})
-            bar.set_postfix_str(f"{jid[:42]} | checking", refresh=False)
             receipt_ok = receipt_valid(output, plan["fingerprint"])
             pending_consumers = [candidate for candidate in plan["jobs"]
                 if candidate["kind"] == "evaluate" and jid in candidate["dependencies"]
@@ -323,12 +392,14 @@ def run(root, device="cuda", keep_going=False, max_jobs=None, verbose=True):
             atomic_json(state_path, state)
             atomic_json(output / "progress.json", {"phase": "starting", "current": 0,
                 "total": 1, "unit": "stage", "detail": jid, "updated": now()})
-            print(f"[{attempted + 1}] {jid} -> {log}", flush=True)
+            bar.write(f"\n[{job_index:03d}/{len(plan['jobs']):03d}] START {jid}\n  log: {log}\n")
             env = {**os.environ, "KMP_DUPLICATE_LIB_OK": "TRUE", "PYTHONUNBUFFERED": "1",
                    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
                    "OMP_NUM_THREADS": str(plan.get("settings", {}).get("cpu_threads", 2)),
                    "MKL_NUM_THREADS": str(plan.get("settings", {}).get("cpu_threads", 2))}
             child = None
+            task_bar = _LiveTaskBar(jid) if verbose else None
+            last_heartbeat = time.monotonic()
             try:
                 with log.open("w", encoding="utf-8") as stream:
                     child = subprocess.Popen([sys.executable, "-m", MODULE, "--root", str(root),
@@ -337,12 +408,22 @@ def run(root, device="cuda", keep_going=False, max_jobs=None, verbose=True):
                     state["jobs"][jid]["pid"] = child.pid
                     atomic_json(state_path, state)
                     while child.poll() is None:
-                        state["jobs"][jid]["heartbeat"] = now()
-                        atomic_json(state_path, state)
-                        if verbose:
-                            progress = read_json(output / "progress.json") if (output / "progress.json").exists() else None
-                            bar.set_postfix_str(_progress_label(jid, progress))
-                        time.sleep(2)
+                        if time.monotonic() - last_heartbeat >= 10:
+                            state["jobs"][jid]["heartbeat"] = now()
+                            atomic_json(state_path, state)
+                            last_heartbeat = time.monotonic()
+                        if task_bar is not None:
+                            try:
+                                progress = read_json(output / "progress.json")
+                            except (OSError, ValueError):
+                                progress = None
+                            task_bar.update(progress)
+                        time.sleep(1)
+                if task_bar is not None:
+                    try:
+                        task_bar.update(read_json(output / "progress.json"))
+                    except (OSError, ValueError):
+                        pass
                 success = child.returncode == 0 and receipt_valid(output, plan["fingerprint"])
                 state["jobs"][jid].update(status="completed" if success else "failed",
                     finished=now(), exit_code=child.returncode)
@@ -362,6 +443,9 @@ def run(root, device="cuda", keep_going=False, max_jobs=None, verbose=True):
                 state["jobs"][jid].update(status="interrupted", finished=now())
                 atomic_json(state_path, state)
                 raise
+            finally:
+                if task_bar is not None:
+                    task_bar.close()
         atomic_json(state_path, state)
     from .stages import aggregate
     aggregate(plan, root, state, verbose=verbose)

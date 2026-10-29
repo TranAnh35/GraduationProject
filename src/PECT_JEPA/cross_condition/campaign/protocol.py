@@ -6,7 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from ..data.split import extract_file_metadata
-from .common import digest, sha256
+from .common import MAIN_BAR_FORMAT, digest, sha256
 
 FACTORS = ("sensor", "waveform", "liftoff", "specimen")
 SCENARIOS = {
@@ -23,8 +23,9 @@ def inventory(data_dir, transform_csv, verbose=True):
     data_dir = Path(data_dir).resolve()
     files = []
     candidates = sorted(data_dir.rglob("*.tdms"))
-    iterator = tqdm(candidates, desc="Plan: hash TDMS", unit="file",
-                    dynamic_ncols=True, disable=not verbose)
+    iterator = tqdm(candidates, desc="Plan: hash TDMS", unit="files",
+                    dynamic_ncols=True, mininterval=0.2,
+                    bar_format=MAIN_BAR_FORMAT, disable=not verbose)
     for p in iterator:
         if p.name.endswith("_index.tdms") or "checkpoint" in str(p):
             continue
