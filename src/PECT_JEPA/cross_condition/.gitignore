@@ -1,2 +1,10 @@
 # Local-only Colab runners (per-tab EXP config, run outputs stay local; do not track)
-colab/
+colab/*
+_audit/*
+archive/historical_audits/*
+experiments/
+*.pt
+checkpoints/
+__pycache__/
+*.pyc
+knowledge/graph.sqlite-*

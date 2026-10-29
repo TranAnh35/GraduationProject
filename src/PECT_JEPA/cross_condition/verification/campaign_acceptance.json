@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-30",
+  "status": "passed",
+  "python": "C:\\Users\\tranl\\miniconda3\\envs\\ndt\\python.exe",
+  "deterministic_and_orchestration": {
+    "status": "passed",
+    "checks": [
+      "matched_factor_roles_and_disjoint_labels",
+      "legacy_state_dict_unchanged",
+      "no_hidden_probe_tokenizer_coupling",
+      "same_seed_same_ssl_loss_and_gradient",
+      "spatial_buffer_constant_null_object_matching_fixed_roi",
+      "exclusive_lock_and_corruption_detection",
+      "neural_checkpoint_resume_exact_all_four_arms",
+      "dag_failure_dependency_receipt_skip_and_resume"
+    ]
+  },
+  "real_data_smoke": {
+    "status": "passed",
+    "scope": "implementation smoke; not comparative research evidence",
+    "checks": [
+      "paired_jepa_one_epoch_256_real_samples",
+      "self_jepa_one_epoch_256_real_samples",
+      "spatial_mae_one_epoch_256_real_samples",
+      "real_ssl_interruption_resume_exact_model_and_metrics",
+      "adapter_one_epoch_target_unlabelled",
+      "four_representation_extraction_paths",
+      "raw_lr_real_eval_and_graph_rebuild",
+      "coral_real_eval_and_graph_rebuild",
+      "whiten_lr_real_eval_and_graph_rebuild",
+      "maha_real_eval_and_graph_rebuild",
+      "neural_control_real_eval_and_graph_rebuild",
+      "dann_real_eval_and_graph_rebuild",
+      "tf_source_real_eval_and_graph_rebuild",
+      "tf_consistency_pect_real_eval_and_graph_rebuild",
+      "adapt_fixed_head_real_eval_and_graph_rebuild"
+    ],
+    "device": "cpu"
+  },
+  "storage_and_metrics": {
+    "status": "passed",
+    "checks": [
+      "float16_cache_read_as_float32",
+      "float32_precision_arm",
+      "known_location_and_candidate_sizing",
+      "cnr_and_r2_columns",
+      "graph_rebuild_after_eval"
+    ]
+  },
+  "py_compile_touched_files": "passed",
+  "research_results": "not_run",
+  "gpu_end_to_end": "not_run_due_to_existing_GPU_process; CPU smoke authorized by user",
+  "smoke_artifacts": "temporary; deleted after validation",
+  "py_compile_file_count": 18,
+  "launcher_status": "passed: 858 pending",
+  "plan_code_identity": "matched",
+  "real_process_dag": "passed prepare/train/extract/evaluate + second-run verified skip",
+  "feature_cache_GiB_estimate": 55.6,
+  "full_campaign_job_count": 858,
+  "powershell_wrapper": "blocked by signing policy; Python launcher tested"
+}

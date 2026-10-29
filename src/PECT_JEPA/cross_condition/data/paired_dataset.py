@@ -54,6 +54,8 @@ class PairedPECTDataset(Dataset):
         temporal_samples: int = 128,
         transform_csv: str = "data/ground_truth/raw_tdms_rotate_crop.csv",
         seed: int = 42,
+        canonical_cache: Optional[Dict[str, str]] = None,
+        self_pairs: bool = False,
     ):
         super().__init__()
         self.num_partitions = max(1, int(num_partitions))
@@ -92,18 +94,26 @@ class PairedPECTDataset(Dataset):
         print(f"\n[Loading & Standardizing {len(file_paths)} C-scans into RAM...]")
 
         # Pre-build the canonical transformer in the main thread (lazy global)
-        get_canonical_transformer()
+        get_canonical_transformer(csv_path=transform_csv)
         _temporal = temporal_samples
         _pad = self.pad
 
         def _load_one(fpath: str):
             meta = extract_file_metadata(fpath)
             # Load canonical aligned C-scan (already rotated, flipped, and cropped to 270x270x128)
-            cscan = load_canonical_cscan_from_tdms(
-                file_path=fpath,
-                temporal_samples=_temporal,
-                apply_transforms=True,
-            )
+            if canonical_cache is not None:
+                # Campaign caches are checksummed by the immutable manifest.
+                # Explicit mapping avoids CWD-dependent paths and raw rereads.
+                cscan = np.load(canonical_cache[fpath], mmap_mode="r")
+                if cscan.ndim != 3 or cscan.shape[-1] != _temporal:
+                    raise ValueError(f"Invalid canonical cache shape for {fpath}: {cscan.shape}")
+            else:
+                cscan = load_canonical_cscan_from_tdms(
+                    file_path=fpath,
+                    temporal_samples=_temporal,
+                    apply_transforms=True,
+                    transform_csv=transform_csv,
+                )
             sY, sX, C = cscan.shape
             padded = np.pad(cscan, ((_pad, _pad), (_pad, _pad), (0, 0)), mode="edge")
             return fpath, meta, {
@@ -139,6 +149,9 @@ class PairedPECTDataset(Dataset):
         for spec, scan_list in self.scans_by_specimen.items():
             n = len(scan_list)
             for i in range(n):
+                if self_pairs:
+                    self.directed_pairs.append((scan_list[i], scan_list[i]))
+                    continue
                 for j in range(n):
                     if i != j:
                         self.directed_pairs.append((scan_list[i], scan_list[j]))
@@ -147,7 +160,8 @@ class PairedPECTDataset(Dataset):
         print(f"Loaded {len(self.scans_by_specimen)} specimens with total {num_pairs} directed condition pairs (A -> B != B -> A).")
         for spec in self.scans_by_specimen:
             n_scans = len(self.scans_by_specimen[spec])
-            print(f"  Specimen '{spec}': {n_scans} condition scans -> {n_scans * (n_scans - 1)} directed pairs.")
+            count = n_scans if self_pairs else n_scans * (n_scans - 1)
+            print(f"  Specimen '{spec}': {n_scans} condition scans -> {count} {'self' if self_pairs else 'directed'} pairs.")
 
         # Determine spatial coordinate grid (e.g. 270x270 with stride)
         # Find minimum common shape
